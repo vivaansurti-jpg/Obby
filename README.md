@@ -14,6 +14,10 @@ Requires macOS 13 or later. Works on Apple Silicon and Intel Macs.
 
 All releases are on the [Releases page](../../releases).
 
+## Website
+
+The static download page lives in [`website/`](website/). It is kept separate from the macOS app source and links to the latest GitHub release asset.
+
 ## Build from source
 
 Requires macOS 13 or later and Apple's Command Line Tools (`xcode-select --install`). Obby currently supports macOS only. No other dependencies.

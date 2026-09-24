@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Obby — Markdown. Folders. Your AI.</title>
+  <meta name="description" content="A tiny native macOS notes app built around ordinary Markdown files. Local-first, with your own AI.">
+  <meta name="theme-color" content="#F6F2E9">
+  <link rel="icon" type="image/png" href="obby-icon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="navigation"><nav class="container" aria-label="Main navigation">
+    <a class="brand" href="#" aria-label="Obby home"><span class="app-icon small" aria-hidden="true"><img src="obby-icon.png" alt="" width="1254" height="1254"></span>Obby</a>
+    <div class="nav-links"><a href="#demo">Demo</a><a href="#features">Features</a><a data-link="github" href="#availability">GitHub <span aria-hidden="true">↗</span></a><a class="nav-download" data-link="download" href="#availability">Download <span aria-hidden="true">↓</span></a></div>
+  </nav></header>
+  <main id="main">
+    <section class="hero container" aria-labelledby="hero-title">
+      <div class="hero-brand intro" style="--delay:0ms"><span class="app-icon" aria-hidden="true"><img src="obby-icon.png" alt="" width="1254" height="1254"></span><h1 id="hero-title">Obby</h1></div>
+      <h2 class="intro" style="--delay:70ms">Markdown. Folders. Your AI.<br><span>Nothing else.</span></h2>
+      <p class="hero-description intro" style="--delay:140ms">A tiny native macOS notes app built around ordinary Markdown files, with an AI that can read, summarize, organize and work with your notes.</p>
+      <div class="actions intro" style="--delay:210ms"><a class="button primary" data-link="download" href="#availability"><span aria-hidden="true">↓</span> Download for macOS</a><a class="source-link" data-link="github" href="#availability">View on GitHub <span aria-hidden="true">↗</span></a></div>
+      <p class="download-note intro" style="--delay:230ms">macOS 13 or later · Apple Silicon and Intel<br>First launch: in System Settings → Privacy &amp; Security, choose Open Anyway.</p>
+      <p class="hero-meta intro" style="--delay:250ms">Native Swift <span>·</span> Local-first <span>·</span> Plain <code>.md</code> files</p>
+    </section>
+    <section class="demo-section container" id="demo" aria-label="Obby demo">
+      <div class="demo-window"><div class="window-bar"><div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div><span>Obby</span><span class="window-meta">A little space to think.</span></div><div class="video-slot"><div class="placeholder"><span class="play" aria-hidden="true">▷</span><p>Demo video coming soon</p><span>Small app. See the whole thing.</span></div></div></div>
+      <div class="demo-caption"><span>Your notes. Your Mac. Your way.</span><span>Built for macOS <span aria-hidden="true">↗</span></span></div>
+    </section>
+    <section class="why container reveal" id="features" aria-labelledby="why-title">
+      <div class="section-label" id="why-title">LESS APP. MORE NOTES.</div>
+      <div class="why-columns">
+        <article><span class="feature-symbol" aria-hidden="true">.md</span><h3>Just files.</h3><p>Your notes are ordinary Markdown files and folders. No proprietary note database.</p></article>
+        <article><span class="feature-symbol" aria-hidden="true">✳</span><h3>AI that actually<br>works with them.</h3><p>Summarize notes, read documents, organize folders, create notes and answer questions about your files.</p></article>
+        <article><span class="feature-symbol" aria-hidden="true">⌘</span><h3>Local when you want it.</h3><p>Use <code>Ollama</code> locally on your Mac, or connect another supported AI provider.</p></article>
+      </div>
+    </section>
+    <section class="filesystem container reveal" aria-labelledby="files-title">
+      <div class="file-tree"><div class="tree-label"><span aria-hidden="true">⌁</span> ~/Documents/Obby</div><pre aria-label="Example notes folder structure"><span class="tree-root">Obby/</span>
+├── <span>School/</span>
+│   ├── <span>Biology/</span>
+│   │   ├── Enzymes<span class="extension">.md</span>
+│   │   └── <span>Attachments/</span>
+│   │       └── diagram.png
+│   └── <span>Psychology/</span>
+├── <span>Projects/</span>
+└── <span>Ideas/</span></pre><div class="tree-footer"><span class="file-dot" aria-hidden="true"></span> Ordinary files. Right where you left them.</div></div>
+      <div class="filesystem-copy"><div class="section-label">YOURS, ALL THE WAY DOWN.</div><h2 id="files-title">Your filesystem<br>is the database.</h2><p>No hidden document format.<br>No lock-in.<br>No complicated workspace system.</p><p>Open your notes from Finder, VS Code, Obsidian, or any Markdown editor.</p></div>
+    </section>
+    <section class="providers container reveal" aria-labelledby="model-title"><div class="section-label">BRING YOUR OWN INTELLIGENCE.</div><h2 id="model-title">Use your own model.</h2><p>Run models locally through <code>Ollama</code> or connect a cloud provider.<br class="desktop-break"> Obby only sends relevant note content when needed.</p><div class="provider-list"><div><span class="provider-kind">Local</span><span class="provider-name local-provider">Ollama <span aria-hidden="true">↳ on your Mac</span></span></div><span class="provider-divider" aria-hidden="true"></span><div><span class="provider-kind">Cloud</span><div class="cloud-providers"><span class="provider-name">Anthropic</span><span class="provider-name">Gemini</span><span class="provider-name">OpenAI Compatible</span></div></div></div></section>
+    <div class="feature-strip container reveal" aria-label="Features"><span>Markdown</span><span>Folders</span><span>Images</span><span>PDFs</span><span>Document summaries</span><span>AI file tools</span><span>Local models</span><span>Dark mode</span></div>
+    <section class="comparison container reveal" id="comparison" aria-labelledby="comparison-title">
+      <h2 id="comparison-title">Why Obby?</h2>
+      <p class="comparison-intro">Obsidian is powerful and extensible. Obby intentionally stays smaller: native macOS, plain Markdown, and AI built directly around your files.</p>
+      <table class="comparison-table" role="table" aria-labelledby="comparison-title" aria-describedby="comparison-note">
+        <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">At a glance</th><th scope="col" role="columnheader" class="obby-column">Obby</th><th scope="col" role="columnheader">Obsidian</th><th scope="col" role="columnheader">Cloud AI note apps</th></tr></thead>
+        <tbody role="rowgroup">
+          <tr role="row"><th scope="row" role="rowheader">Plain Markdown files</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">Native macOS</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span>No · Electron</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">Local AI</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span> · Ollama</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span>Via plugins</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">AI can work with files/folders</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span>Via plugins</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">No note database required</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">Cloud AI provider support</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span>Via plugins</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">PDF/document reading</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span>PDFs built in; more via plugins</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">Plugin ecosystem</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span>No</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span></span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+          <tr role="row"><th scope="row" role="rowheader">Simple by default</th><td role="cell" class="obby-column"><span class="mobile-product" aria-hidden="true">Obby</span><span><span class="comparison-check" role="img" aria-label="Supported">✓</span> · Intentionally minimal</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Obsidian</span><span>Configurable</span></td><td role="cell"><span class="mobile-product" aria-hidden="true">Cloud AI note apps</span><span>Varies</span></td></tr>
+        </tbody>
+      </table>
+      <p class="comparison-note" id="comparison-note">Cloud AI note apps are a broad category; features vary by app and plan. Obsidian’s AI capabilities depend on the plugins and models you choose. “Native macOS” refers to a native interface, not simply availability on Mac.</p>
+      <p class="comparison-sources">Obsidian references: <a href="https://obsidian.md/help/data-storage">File storage</a> · <a href="https://obsidian.md/plugins">Plugins</a> · <a href="https://obsidian.md/help/Getting+started/Update+Obsidian">Desktop framework</a></p>
+    </section>
+    <section class="closing container reveal"><span class="app-icon small" aria-hidden="true"><img src="obby-icon.png" alt="" width="1254" height="1254"></span><h2>That’s basically it.</h2><p>Obby is meant to stay small.</p><div class="actions"><a class="button primary" data-link="download" href="#availability"><span aria-hidden="true">↓</span> Download for macOS</a><a class="source-link" data-link="github" href="#availability">View source on GitHub <span aria-hidden="true">↗</span></a></div></section>
+    <footer class="container"><a class="brand" href="#"><span class="app-icon small" aria-hidden="true"><img src="obby-icon.png" alt="" width="1254" height="1254"></span>Obby</a><span>Markdown. Folders. Your AI. Nothing else.</span><a href="#main">Back to top ↑</a></footer>
+  </main>
+  <dialog id="availability"><button class="close-dialog" aria-label="Close">×</button><h2>Still getting things ready.</h2><p id="availability-message">The download link will be added here soon.</p><button class="button primary dismiss">Got it</button></dialog>
+  <script src="script.js"></script>
+</body>
+</html>

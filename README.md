@@ -6,7 +6,7 @@ A small native macOS notes app: folders, Markdown, and AI through local Ollama o
 
 **[Download Obby for Mac (Obby.dmg)](../../releases/latest/download/Obby.dmg)**
 
-Requires macOS 13 or later. Works on Apple Silicon and Intel Macs.
+Requires macOS 13 or later. The current release is for Apple Silicon Macs.
 
 1. Open `Obby.dmg` and drag **Obby** into **Applications**.
 2. Open Obby. The first time, macOS says it can't check the app, because Obby isn't signed with a paid Apple Developer ID. Go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to the Obby message. You only need to do this once.

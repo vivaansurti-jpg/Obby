@@ -1,6 +1,6 @@
 # Obby
 
-A small native macOS notes app: folders, Markdown, and AI through local Ollama or an optional cloud provider. No dependencies, database, accounts, or backend. Requires macOS 13 or later.
+A small native macOS notes app: folders, Markdown, and AI through local Ollama or an optional cloud provider. No dependencies, database, accounts, or backend. Obby is currently for macOS only and requires macOS 13 or later.
 
 ## Download
 
@@ -16,7 +16,7 @@ All releases are on the [Releases page](../../releases).
 
 ## Build from source
 
-Requires macOS 13 or later and Apple's Command Line Tools (`xcode-select --install`). No other dependencies.
+Requires macOS 13 or later and Apple's Command Line Tools (`xcode-select --install`). Obby currently supports macOS only. No other dependencies.
 
 ```sh
 git clone <this repository>
@@ -25,7 +25,7 @@ cd Obby
 open build/Obby.app
 ```
 
-If the build fails straight away with SDK or module errors, your Command Line Tools compiler is older than your macOS SDK. Update the Command Line Tools, or point the build at a matching SDK: `OBBY_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk ./scripts/build.sh`.
+The build script checks that the selected Swift compiler and macOS SDK work together, and will use another compatible installed SDK when available. If no compatible SDK is found, update Xcode or the Command Line Tools. You can also set a matching SDK explicitly: `OBBY_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk ./scripts/build.sh`.
 
 The app can then be moved to Applications. It is ad-hoc signed locally, so macOS may ask you to confirm the first launch (right-click Obby.app, then Open).
 

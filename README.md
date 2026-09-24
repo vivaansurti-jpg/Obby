@@ -122,3 +122,7 @@ Memory never copies note contents: notes are read from disk again when needed, s
 ## Hiding the AI panel
 
 The sidebar button at the top right of the window (or **View → Hide AI / Show AI**, **Shift+Cmd+A**) hides or shows the AI panel; the editor takes the freed width and the folders sidebar is unchanged. Hiding only removes the panel from view: the chat, its memory, an unsent draft, the provider and model stay as they are, a running request finishes normally, and nothing is unloaded. The hidden panel does no rendering or refresh work. When shown again it returns to the latest message of the same chat. The choice is remembered between launches.
+
+## License
+
+Obby is available under the [Apache License 2.0](LICENSE).

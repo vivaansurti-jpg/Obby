@@ -1,0 +1,399 @@
+import SwiftUI
+import AppKit
+
+// Chat presentation only. The model's reply stays raw Markdown in `ChatLine.text`; Obby renders it here.
+// Tool activity is summarised by `ActionPresentation.summary` (Swift, deterministic) and shown compactly.
+// Nothing in this file is ever sent to a model, and nothing here touches the network.
+
+enum MarkdownBlock {
+    case paragraph(String)
+    case heading(Int, String)
+    case bullet(Int, String)            // indent level, text
+    case numbered(Int, String, String)  // indent level, marker, text
+    case code(String)
+    case quote(String)
+    case table([String], [[String]])    // header, rows (padded to header width)
+    case image(String, String)          // alt text, source as written
+    case rule
+}
+
+enum ChatMarkdown {
+    /// A small block parser for what chat replies actually use; inline styling is left to Foundation's Markdown parser.
+    static func blocks(_ source: String) -> [MarkdownBlock] {
+        let lines = source.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        var blocks: [MarkdownBlock] = []
+        var paragraph: [String] = []
+        var code: [String]?
+        func flush() {
+            if !paragraph.isEmpty { blocks.append(.paragraph(paragraph.joined(separator: "\n"))); paragraph = [] }
+        }
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            index += 1
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if code != nil {
+                if trimmed.hasPrefix("```") { blocks.append(.code(code?.joined(separator: "\n") ?? "")); code = nil }
+                else { code?.append(line) }
+                continue
+            }
+            if trimmed.hasPrefix("```") { flush(); code = []; continue }
+            if trimmed.isEmpty { flush(); continue }
+            // Pipe table: a header row followed by a |---|---| separator. Anything else stays plain text.
+            if trimmed.contains("|"), index < lines.count, isTableSeparator(lines[index]) {
+                let header = tableCells(trimmed)
+                if header.count >= 2 {
+                    flush()
+                    index += 1 // Skip the separator.
+                    var rows: [[String]] = []
+                    while index < lines.count {
+                        let row = lines[index].trimmingCharacters(in: .whitespaces)
+                        guard !row.isEmpty, row.contains("|") else { break }
+                        var cells = tableCells(row)
+                        if cells.count < header.count { cells += Array(repeating: "", count: header.count - cells.count) }
+                        rows.append(Array(cells.prefix(header.count)))
+                        index += 1
+                    }
+                    blocks.append(.table(header, rows))
+                    continue
+                }
+            }
+            if let image = standaloneImage(trimmed) { flush(); blocks.append(.image(image.0, image.1)); continue }
+            let leading = line.prefix { $0 == " " || $0 == "\t" }.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) }
+            let indent = min(leading / 2, 4)
+            if let marker = trimmed.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
+                flush()
+                let level = trimmed[marker].filter { $0 == "#" }.count
+                var title = String(trimmed[marker.upperBound...])
+                if let closing = title.range(of: #"\s+#+\s*$"#, options: .regularExpression) { title.removeSubrange(closing) }
+                blocks.append(.heading(level, title))
+                continue
+            }
+            if trimmed.range(of: #"^([-*_])(\s*\1){2,}$"#, options: .regularExpression) != nil { flush(); blocks.append(.rule); continue }
+            if let marker = trimmed.range(of: #"^[-*+]\s+"#, options: .regularExpression) {
+                flush()
+                var item = String(trimmed[marker.upperBound...])
+                if item.hasPrefix("[ ] ") { item = "☐ " + String(item.dropFirst(4)) }
+                else if item.lowercased().hasPrefix("[x] ") { item = "☑ " + String(item.dropFirst(4)) }
+                blocks.append(.bullet(indent, item))
+                continue
+            }
+            if let marker = trimmed.range(of: #"^\d{1,3}[.)]\s+"#, options: .regularExpression) {
+                flush()
+                let number = String(trimmed[marker].trimmingCharacters(in: .whitespaces).dropLast())
+                blocks.append(.numbered(indent, number + ".", String(trimmed[marker.upperBound...])))
+                continue
+            }
+            if trimmed.hasPrefix(">") { flush(); blocks.append(.quote(String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces))); continue }
+            paragraph.append(trimmed)
+        }
+        if let code { blocks.append(.code(code.joined(separator: "\n"))) } // Unclosed fence: still show it as code.
+        flush()
+        return blocks
+    }
+    static func isTableSeparator(_ line: String) -> Bool {
+        let cells = tableCells(line.trimmingCharacters(in: .whitespaces))
+        return cells.count >= 2 && cells.allSatisfy { $0.range(of: #"^:?-{3,}:?$"#, options: .regularExpression) != nil }
+    }
+    static func tableCells(_ row: String) -> [String] {
+        var body = row
+        if body.hasPrefix("|") { body.removeFirst() }
+        if body.hasSuffix("|") && !body.hasSuffix("\\|") { body.removeLast() }
+        // Split on unescaped pipes; "\|" stays a literal pipe inside a cell.
+        var cells: [String] = [], current = "", escaped = false
+        for character in body {
+            if escaped { current.append(character); escaped = false }
+            else if character == "\\" { escaped = true }
+            else if character == "|" { cells.append(current); current = "" }
+            else { current.append(character) }
+        }
+        cells.append(current)
+        return cells.map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+    /// `![alt](source)` on a line of its own (an optional "title" is ignored).
+    static func standaloneImage(_ line: String) -> (String, String)? {
+        guard let regex = try? NSRegularExpression(pattern: #"^!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)$"#),
+              let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+              let alt = Range(match.range(at: 1), in: line), let source = Range(match.range(at: 2), in: line) else { return nil }
+        return (String(line[alt]), String(line[source]))
+    }
+    /// Bold, italic, inline code, strikethrough and links. Only http(s) links stay clickable; other schemes become plain text.
+    static func inline(_ text: String) -> AttributedString {
+        guard var styled = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) else { return AttributedString(text) }
+        let unsafe = styled.runs.compactMap { run -> Range<AttributedString.Index>? in
+            guard let url = run.link else { return nil }
+            return isWebLink(url) ? nil : run.range
+        }
+        for range in unsafe { styled[range].link = nil }
+        return styled
+    }
+    static func isWebLink(_ url: URL) -> Bool { ["http", "https"].contains(url.scheme?.lowercased() ?? "") }
+}
+
+// Where an image in a reply may come from. Remote images are never fetched.
+enum ChatImageSource {
+    case local(URL)
+    case remote
+    case unavailable
+    static let formats: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "tif", "bmp"]
+    static let maxBytes = 25_000_000
+    /// Resolves relative to the displayed note's folder first, then the Obby root. Every candidate goes through
+    /// `vault.resolve`, so absolute paths, "..", symlinks and anything outside the Obby root are rejected.
+    static func resolve(_ source: String, vault: Vault?, noteFolder: String = "") -> ChatImageSource {
+        let raw = source.removingPercentEncoding ?? source
+        if let scheme = URLComponents(string: source)?.scheme ?? (raw.range(of: #"^[A-Za-z][A-Za-z0-9+.-]*:"#, options: .regularExpression).map { String(raw[$0].dropLast()) }) {
+            return ["http", "https"].contains(scheme.lowercased()) ? .remote : .unavailable // file://, data:, custom schemes: never loaded.
+        }
+        guard let vault, !raw.hasPrefix("/"), formats.contains((raw as NSString).pathExtension.lowercased()) else { return .unavailable }
+        for folder in noteFolder.isEmpty ? [""] : [noteFolder, ""] { // The shared attachment resolver, note folder first.
+            guard let url = try? vault.resolveAttachment(source, inFolder: folder).url,
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, (values.fileSize ?? 0) <= maxBytes else { continue }
+            return .local(url)
+        }
+        return .unavailable
+    }
+}
+
+struct ChatMarkdownView: View {
+    let text: String
+    var vault: Vault?
+    var noteFolder = "" // Folder of the note shown in the editor; images resolve relative to it first.
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(ChatMarkdown.blocks(text).enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // Links open in the default browser; any other scheme is ignored (no custom URL handlers or commands).
+        .environment(\.openURL, OpenURLAction { url in
+            guard ChatMarkdown.isWebLink(url) else { return .discarded }
+            NSWorkspace.shared.open(url)
+            return .handled
+        })
+    }
+    @ViewBuilder func blockView(_ block: MarkdownBlock) -> some View {
+        switch block {
+        case .paragraph(let text):
+            wrapped(Text(ChatMarkdown.inline(text)))
+        case .heading(let level, let text):
+            wrapped(Text(ChatMarkdown.inline(text)))
+                .font(level == 1 ? .title3.weight(.semibold) : level == 2 ? .headline : .subheadline.weight(.semibold))
+                .padding(.top, 4)
+        case .bullet(let indent, let text):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(indent == 0 ? "•" : "◦").foregroundStyle(.secondary)
+                wrapped(Text(ChatMarkdown.inline(text)))
+            }.padding(.leading, CGFloat(indent) * 14)
+        case .numbered(let indent, let marker, let text):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(marker).monospacedDigit().foregroundStyle(.secondary)
+                wrapped(Text(ChatMarkdown.inline(text)))
+            }.padding(.leading, CGFloat(indent) * 14)
+        case .code(let code):
+            Text(code)
+                .font(.system(.callout, design: .monospaced))
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(8).padding(.trailing, 20) // Room for the copy button.
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(alignment: .topTrailing) { CopyButton(text: code, label: "Copy code").padding(4) }
+        case .quote(let text):
+            HStack(alignment: .top, spacing: 8) {
+                Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 2)
+                wrapped(Text(ChatMarkdown.inline(text))).foregroundStyle(.secondary)
+            }
+        case .table(let header, let rows):
+            ChatTableView(header: header, rows: rows)
+        case .image(let alt, let source):
+            ChatImageView(alt: alt, source: ChatImageSource.resolve(source, vault: vault, noteFolder: noteFolder))
+        case .rule:
+            Divider()
+        }
+    }
+    func wrapped(_ text: Text) -> some View { text.fixedSize(horizontal: false, vertical: true) }
+}
+
+struct ChatTableView: View {
+    let header: [String]
+    let rows: [[String]]
+    static let minColumn: CGFloat = 60, maxColumn: CGFloat = 280, cellPadding: CGFloat = 8
+    /// Column widths come from the cell text itself (clamped), so every cell gets a definite width to wrap in
+    /// and each row's height follows from its content. No GeometryReader, no fixed heights.
+    var columnWidths: [CGFloat] {
+        header.indices.map { column in
+            let widest = ([Self.displayWidth(header[column], bold: true)] + rows.map { Self.displayWidth($0.indices.contains(column) ? $0[column] : "", bold: false) }).max() ?? 0
+            return min(max(ceil(widest) + 2 * Self.cellPadding + 2, Self.minColumn), Self.maxColumn)
+        }
+    }
+    /// Width of the text as displayed: the same inline parser the cell renders with, so `**Biology**` measures as
+    /// "Biology" in bold, `read_file` in monospace and [OpenAI](url) as "OpenAI". Widest line if the cell has breaks.
+    static func displayWidth(_ markdown: String, bold: Bool) -> CGFloat {
+        let size = NSFont.systemFontSize
+        let rendered = ChatMarkdown.inline(markdown)
+        var widest: CGFloat = 0, line: CGFloat = 0
+        for run in rendered.runs {
+            let intent = run.inlinePresentationIntent ?? []
+            let strong = bold || intent.contains(.stronglyEmphasized)
+            let font: NSFont = intent.contains(.code) ? .monospacedSystemFont(ofSize: size, weight: strong ? .semibold : .regular)
+                : strong ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
+            for (index, piece) in String(rendered[run.range].characters).components(separatedBy: "\n").enumerated() {
+                if index > 0 { widest = max(widest, line); line = 0 }
+                line += (piece as NSString).size(withAttributes: [.font: font]).width
+            }
+        }
+        return max(widest, line)
+    }
+    var body: some View {
+        let widths = columnWidths
+        ScrollView(.horizontal, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                row(header, widths: widths, isHeader: true)
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, cells in
+                    Divider().opacity(0.6)
+                    row(cells, widths: widths, isHeader: false)
+                }
+            }
+            .fixedSize() // The table's natural size: total column width by the sum of row heights.
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.25)))
+            .padding(1)
+        }
+        // A horizontal ScrollView has no height of its own; take the content's so later blocks sit below the table.
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.vertical, 4)
+    }
+    func row(_ cells: [String], widths: [CGFloat], isHeader: Bool) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(Array(widths.enumerated()), id: \.offset) { column, width in
+                Text(ChatMarkdown.inline(cells.indices.contains(column) ? cells[column] : ""))
+                    .fontWeight(isHeader ? .semibold : .regular)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, Self.cellPadding).padding(.vertical, 5)
+                    .frame(width: width, alignment: .topLeading)
+            }
+        }
+        .background(isHeader ? Color.secondary.opacity(0.1) : Color.clear)
+    }
+}
+
+/// Copies exact text (the stored Markdown, or one code block) to the general pasteboard; briefly shows a checkmark.
+struct CopyButton: View {
+    let text: String
+    var label = "Copy response"
+    @State private var copied = false
+    @State private var hovering = false
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            Task { @MainActor in // One short reset, no timer.
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                copied = false
+            }
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .imageScale(.small)
+                .frame(width: 18, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .opacity(hovering || copied ? 1 : 0.55) // Subtle until hovered, always visible and keyboard-accessible.
+        .onHover { hovering = $0 }
+        .help(copied ? "Copied" : label)
+        .accessibilityLabel(copied ? "Copied" : label)
+    }
+}
+
+struct ChatImageView: View {
+    let alt: String
+    let source: ChatImageSource
+    @State private var image: NSImage?
+    @State private var failed = false
+    var body: some View {
+        switch source {
+        case .remote:
+            placeholder("Remote image not loaded")
+        case .unavailable:
+            placeholder("Image not available")
+        case .local(let url):
+            Group {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: image.size.width, maxHeight: min(image.size.height, 420), alignment: .leading)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                        .onTapGesture { NSWorkspace.shared.open(url) } // Opens in the default viewer (usually Preview).
+                        .help("Open \(url.lastPathComponent)")
+                        .accessibilityLabel(alt.isEmpty ? url.lastPathComponent : alt)
+                        .accessibilityAddTraits(.isButton)
+                } else if failed {
+                    placeholder("Image not available")
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .task(id: url) {
+                let loaded = await Task.detached(priority: .utility) { NSImage(contentsOf: url) }.value
+                if let loaded, loaded.isValid { image = loaded } else { failed = true }
+            }
+        }
+    }
+    func placeholder(_ message: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "photo").accessibilityHidden(true)
+            Text(alt.isEmpty ? message : "\(message): \(alt)")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// Consecutive tool actions are shown together as one compact list.
+struct ChatGroup: Identifiable {
+    var lines: [ChatLine]
+    var id: UUID { lines.last?.id ?? UUID() } // Last line's id, so scrolling to the newest chat line lands here.
+    var isActions: Bool { lines.first?.role == "Action" }
+    static func groups(_ chat: [ChatLine]) -> [ChatGroup] {
+        var groups: [ChatGroup] = []
+        for line in chat {
+            if line.role == "Action", let last = groups.last, last.isActions { groups[groups.count - 1].lines.append(line) }
+            else { groups.append(ChatGroup(lines: [line])) }
+        }
+        return groups
+    }
+}
+
+struct ActionGroupView: View {
+    let lines: [ChatLine]
+    let showRaw: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(lines) { line in
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Image(systemName: line.unsuccessful ? "exclamationmark.circle" : line.notice ? "info.circle" : "checkmark")
+                        .imageScale(.small)
+                        .accessibilityHidden(true)
+                    Text(line.text.hasSuffix(".") ? String(line.text.dropLast()) : line.text)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityElement(children: .combine)
+                if showRaw {
+                    Text(line.rawAction ?? "Raw details were discarded to keep session memory small.")
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}

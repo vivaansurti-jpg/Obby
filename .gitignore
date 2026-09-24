@@ -1,0 +1,35 @@
+# Build output (users build from source with ./scripts/build.sh)
+build/
+.build/
+.swiftpm/
+DerivedData/
+*.o
+*.dSYM/
+
+# Xcode per-user files
+xcuserdata/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+._*
+
+# Personal notes, if a notes folder is ever kept inside the project
+/Obby/
+/Obby Main Notes/
+*.md.bak
+
+# Local secrets or environment files (Obby itself keeps API keys only in the Keychain)
+.env
+.env.*
+*.pem
+*.p12
+*.key
+
+# Temporary scripts and logs
+*.log
+*.command
+
+# Release packages
+*.dmg

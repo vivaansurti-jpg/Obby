@@ -1,0 +1,18 @@
+# Obby
+
+> Obby is an open-source native notes app for macOS. It stores notes as ordinary Markdown files in folders and supports attachments, local Ollama models, and compatible cloud AI providers.
+
+## Official links
+
+- [Website](https://vivaansurti-jpg.github.io/Obby/): Product overview and macOS download.
+- [Source repository](https://github.com/vivaansurti-jpg/Obby): Source code, build instructions, documentation, and Apache 2.0 license.
+- [Latest macOS download](https://github.com/vivaansurti-jpg/Obby/releases/latest/download/Obby.dmg): Current Apple Silicon DMG release.
+- [Releases](https://github.com/vivaansurti-jpg/Obby/releases): Release history and downloadable assets.
+
+## Product facts
+
+- Platform: macOS 13 or later. The current release supports Apple Silicon Macs.
+- Notes: Standard UTF-8 Markdown files stored in a user-selected folder.
+- Features: folders, search, attachments, native Markdown editing, and optional AI assistance.
+- AI: local Ollama models or compatible cloud providers. AI setup is optional.
+- License: Apache License 2.0.

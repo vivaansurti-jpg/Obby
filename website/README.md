@@ -9,3 +9,7 @@ A dependency-free static website. Serve `dist/` with any static web server.
 - Replace the `.placeholder` element inside `.video-slot` in `dist/index.html` with `<video src="/demo.mp4" controls playsinline preload="metadata" aria-label="Obby demo"></video>` and place `demo.mp4` in `dist/`. No autoplay is configured.
 
 All styling lives in `dist/styles.css`. Scroll reveals use IntersectionObserver, with reduced-motion and no-JavaScript fallbacks.
+
+## Discovery files
+
+`dist/robots.txt`, `dist/sitemap.xml`, and `dist/llms.txt` provide crawl and machine-readable discovery information for the published site. The homepage also includes canonical, social, and SoftwareApplication structured metadata.

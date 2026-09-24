@@ -9,7 +9,7 @@ A small native macOS notes app: folders, Markdown, and AI through local Ollama o
 Requires macOS 13 or later. The current release is for Apple Silicon Macs.
 
 1. Open `Obby.dmg` and drag **Obby** into **Applications**.
-2. Open Obby. The first time, macOS says it can't check the app, because Obby isn't signed with a paid Apple Developer ID. Go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to the Obby message. You only need to do this once.
+2. Open Obby. The first release is not yet notarized by Apple, so macOS may ask you to confirm the first launch in **System Settings → Privacy & Security**. Future notarized releases will show the verified developer information instead.
 3. Follow the short setup: choose where your notes live, then set up AI or skip it.
 
 All releases are on the [Releases page](../../releases).
@@ -114,8 +114,11 @@ Any file can be attached and opened. The AI can read PDF (selectable text via PD
 ## Publishing a release (maintainer)
 
 1. Set the version in `Info.plist` (`CFBundleShortVersionString`, and raise `CFBundleVersion`).
-2. Run `./scripts/make_dmg.sh` (add `OBBY_SDK=…` if needed). It builds a universal app and creates `build/Obby.dmg`.
-3. On GitHub, open **Releases → Draft a new release**, create a tag such as `v1.0`, attach `build/Obby.dmg` (keep the name `Obby.dmg` so the download button always points to the latest release), and publish.
+2. Install full Xcode and create a **Developer ID Application** certificate in the Apple Developer account. The release certificate must be present in the Mac Keychain.
+3. Create a `notarytool` Keychain profile for the Apple Developer team. Keep the profile name private and do not place Apple credentials in this repository.
+4. Run `OBBY_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/make_dmg.sh` (add `OBBY_SDK=…` if needed). It builds a universal, Developer ID-signed app and creates `build/Obby.dmg`.
+5. Run `OBBY_NOTARY_PROFILE="your-notary-profile" ./scripts/notarize.sh`. This submits the DMG to Apple, waits for approval, staples the ticket, and verifies the finished artifact.
+6. On GitHub, open **Releases → Draft a new release**, create a tag such as `v1.0`, attach the notarized `build/Obby.dmg` (keep the name `Obby.dmg` so the download button always points to the latest release), and publish.
 
 ## Chat memory
 

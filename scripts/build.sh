@@ -52,4 +52,9 @@ lipo -create "${PARTS[@]}" -output "$BIN"
 rm -f "${PARTS[@]}"
 cp Info.plist build/Obby.app/Contents/Info.plist
 cp Resources/AppIcon.icns build/Obby.app/Contents/Resources/AppIcon.icns
-codesign --force --sign - build/Obby.app
+SIGN_IDENTITY="${OBBY_SIGN_IDENTITY:--}"
+SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_IDENTITY" != "-" ]]; then
+  SIGN_ARGS+=(--options runtime --timestamp)
+fi
+codesign "${SIGN_ARGS[@]}" build/Obby.app

@@ -689,6 +689,10 @@ struct SettingsView: View {
                 }
                 Text(model.modelStatus + (model.toolsAvailable || model.selectedModel.isEmpty ? "" : " (chat only)")).font(.caption).foregroundStyle(.secondary)
             }
+            Section("Confirmations") {
+                Toggle("Don't ask before AI edits", isOn: $model.skipAIConfirmations)
+                Text("Deleting notes always asks. Every AI edit can still be undone.").font(.caption).foregroundStyle(.secondary)
+            }
             Section("Context") {
                 Toggle("Include related notes automatically", isOn: model.isLocalProvider ? $model.relatedNotesLocal : $model.relatedNotesCloud)
                     .onChange(of: model.relatedNotesLocal) { _ in model.persistSettings() }

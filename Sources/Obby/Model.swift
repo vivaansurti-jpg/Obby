@@ -75,6 +75,11 @@ import AppKit
     var readThisRequest: Set<String> = [] // Notes the model has read (or was given) during the current AI request.
     var shrinkOverride: ((String) -> Bool)? // The checks answer the shrink question without a dialog.
     var planOverride: (([String]) -> Bool)? // The checks answer the change-preview question without a dialog.
+    var deleteOverride: ((String) -> Bool)? // The checks answer the delete question without a dialog.
+    /// "Don't ask before AI edits": skips the shrink and change-preview questions. Deleting always asks.
+    @Published var skipAIConfirmations = UserDefaults.standard.bool(forKey: "skipAIConfirmations") {
+        didSet { UserDefaults.standard.set(skipAIConfirmations, forKey: "skipAIConfirmations") }
+    }
     var currentTaskID: UUID? // Groups one request's changes so they can be undone together.
     @Published var backlinks: [String] = [] // Notes that link to the open note ("Linked from").
     @Published var editorFontSize = Double(RichMarkdown.baseSize) { // Display only; saved files are unchanged.
@@ -307,6 +312,7 @@ import AppKit
     /// Before the AI makes a large change (moving, renaming or deleting, or changing more than one note in a request),
     /// the user sees the plan and approves it once for the rest of the request.
     func confirmPlan(_ steps: [String]) -> Bool {
+        if skipAIConfirmations { return true } // Deletions inside the plan still ask separately.
         if let planOverride { return planOverride(steps) }
         let alert = NSAlert(); alert.alertStyle = .informational
         alert.messageText = "Apply these changes?"
@@ -493,13 +499,15 @@ import AppKit
         diskText = ""; dirty = false; saveConflict = false; backlinks = []
         UserDefaults.standard.removeObject(forKey: "lastNote")
     }
-    func confirmDelete(_ path: String) -> Bool {
+    func confirmDelete(_ path: String) -> Bool { // Always asked, whatever "Don't ask before AI edits" says.
+        if let deleteOverride { return deleteOverride(path) }
         let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "Move \(path) to Trash?"; alert.informativeText = "Folders and everything inside them will be moved to the Trash."; alert.addButton(withTitle: "Move to Trash"); alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
     func remove(_ path: String) { guard save(), confirmDelete(path) else { return }; perform { try vault?.delete(path); memoryDidDelete(path); refresh() } }
     /// Asked before the AI replaces a substantial note with something much shorter.
     func confirmShrink(_ path: String, from old: Int, to new: Int) -> Bool {
+        if skipAIConfirmations { return true } // Still undoable from the chat.
         if let shrinkOverride { return shrinkOverride(path) }
         let alert = NSAlert(); alert.alertStyle = .warning
         alert.messageText = "Replace \((path as NSString).lastPathComponent) with a much shorter version?"

@@ -81,6 +81,9 @@ import AppKit
         model.relatedNotesLocal = false; model.relatedNotesCloud = false // Related notes are checked on their own below.
         model.streamReplies = false
         model.planOverride = { _ in true } // Change previews are approved automatically; checked on their own below.
+        let savedSkip = model.skipAIConfirmations
+        model.skipAIConfirmations = false // Start from the default whatever this Mac has set.
+        defer { model.skipAIConfirmations = savedSkip }
         model.provider = .ollama; model.activeCustomID = nil; model.selectedModel = "" // Start from Ollama whatever an earlier (interrupted) run saved.
         model.openNote("School/Revision.md"); model.text = "Autosaved"; check(model.save(), "autosave")
         check(try vault.read("School/Revision.md") == "Autosaved", "autosave disk")
@@ -475,6 +478,25 @@ import AppKit
         let longNow = try vault.read("Long.md")
         check(declined.hasPrefix("User declined replacing") && longNow.count > 400 && ActionPresentation.summary("write_file", arguments: ["path": "Long.md"], result: declined, failed: false) == "Kept Long.md unchanged.", "much shorter rewrite needs confirmation")
         model.shrinkOverride = nil; model.guardWrites = false
+
+        // "Don't ask before AI edits": no shrink prompt, still undoable; stale rewrites and deletions still guarded.
+        var shrinkAsked = false, deleteAsked = false
+        model.shrinkOverride = { _ in shrinkAsked = true; return false }
+        model.deleteOverride = { _ in deleteAsked = true; return false }
+        model.skipAIConfirmations = true; model.guardWrites = true; model.readThisRequest = []; model.readVersions = [:]
+        _ = try model.executeTool("read_file", arguments: ["path": "Long.md"])
+        model.pendingUndo = nil
+        let skippedAnswer = try model.executeTool("write_file", arguments: ["path": "Long.md", "content": "short"])
+        check(!shrinkAsked && !skippedAnswer.hasPrefix("User declined") && (try vault.read("Long.md")) == "short" && (model.pendingUndo?.previous?.count ?? 0) > 400, "with the toggle on, a shrinking rewrite runs without a prompt and keeps Undo")
+        try vault.write("Long.md", content: String(repeating: "Long content. ", count: 60))
+        _ = try model.executeTool("read_file", arguments: ["path": "Long.md"])
+        try vault.write("Long.md", content: "Edited outside Obby " + String(repeating: "x", count: 500))
+        blocked("stale rewrite still rejected with the toggle on") { _ = try model.executeTool("write_file", arguments: ["path": "Long.md", "content": "short"]) }
+        let deleteAnswer = try model.executeTool("delete_path", arguments: ["path": "Long.md"])
+        check(deleteAsked && deleteAnswer.hasPrefix("User declined deletion") && (try? vault.read("Long.md")) != nil, "deleting still asks with the toggle on")
+        model.skipAIConfirmations = false
+        check(!model.confirmShrink("Long.md", from: 1_000, to: 10) && shrinkAsked, "with the toggle off, the shrink question is asked again")
+        model.shrinkOverride = nil; model.deleteOverride = nil; model.guardWrites = false
 
         // Tool routing: only the tools a request needs.
         let editTools = ToolRouting.tools(for: "add this to TOK.md", hasAttachments: false)

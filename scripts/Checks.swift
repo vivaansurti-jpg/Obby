@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 @main struct Checks {
     @MainActor static func main() async throws {
+        setbuf(stdout, nil)
         let previousNote = UserDefaults.standard.object(forKey: "lastNote")
         defer { if let previousNote { UserDefaults.standard.set(previousNote, forKey: "lastNote") } else { UserDefaults.standard.removeObject(forKey: "lastNote") } }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("obby-check-" + UUID().uuidString)
@@ -10,7 +11,7 @@ import AppKit
         let vault = Vault(root)
         ChatStore.rootOverride = root.deletingLastPathComponent().appendingPathComponent("obby-memory-" + UUID().uuidString) // Never the real memory store.
         defer { try? FileManager.default.removeItem(at: ChatStore.root) }
-        var count = 0
+        var count = try await RegressionChecks.run()
         func check(_ condition: Bool, _ name: String) { precondition(condition, name); count += 1; print("PASS \(name)") }
         func blocked(_ name: String, _ action: () throws -> Void) { do { try action(); fatalError("Not blocked: \(name)") } catch { count += 1; print("PASS \(name)") } }
         try vault.mkdir("School/Biology")
@@ -78,6 +79,7 @@ import AppKit
         check(RichMarkdown.serialize(broken) == " item" || RichMarkdown.serialize(broken) == "item", "damaged list marker leaves a plain line")
         let model = AppModel(restoreState: false); model.timer?.invalidate(); model.vault = vault
         model.relatedNotesLocal = false; model.relatedNotesCloud = false // Related notes are checked on their own below.
+        model.streamReplies = false
         model.planOverride = { _ in true } // Change previews are approved automatically; checked on their own below.
         model.provider = .ollama; model.activeCustomID = nil; model.selectedModel = "" // Start from Ollama whatever an earlier (interrupted) run saved.
         model.openNote("School/Revision.md"); model.text = "Autosaved"; check(model.save(), "autosave")
@@ -141,11 +143,11 @@ import AppKit
         let unload = requests.first { $0.0 == "/api/generate" } // A status check left over from an earlier test may come first.
         check(unload?.1?["model"] as? String == "old-model" && unload?.1?["keep_alive"] as? Int == 0, "switch unloads old model via API")
         check(requests.filter { $0.0 == "/api/generate" }.count == 1 && requests.last?.0 == "/api/ps", "switch does not preload new model")
-        check(model.modelStatus == "new-model · Loaded", "loaded status from API")
+        check(model.modelStatus == "new-model: Loaded", "loaded status from API")
         requests = []; model.unloadPrevious = false
         await model.selectModel("another-model")
         check(!requests.contains { $0.0 == "/api/generate" } && requests.last?.0 == "/api/ps", "unload toggle respected")
-        check(model.modelStatus == "another-model · Unloaded", "unloaded status from API")
+        check(model.modelStatus == "another-model: Unloaded", "unloaded status from API")
         for choice in ModelKeepAlive.allCases {
             requests = []; model.keepAlive = choice
             model.send("Check")
@@ -159,7 +161,7 @@ import AppKit
         model.requestOverride = { _, _ in throw ObbyError("Offline") }
         model.autoStartOllama = false
         await model.refreshModelStatus()
-        check(model.modelStatus == "Ollama · Offline", "offline model status")
+        check(model.modelStatus == "Ollama is offline", "offline model status")
         model.autoStartOllama = true
         let folderKeys = ["bookmark", "rootPath", "lastNote", "rootIsNotesFolder"]
         let folderSettings = Dictionary(uniqueKeysWithValues: folderKeys.map { ($0, UserDefaults.standard.object(forKey: $0)) })
@@ -174,6 +176,7 @@ import AppKit
         try FileManager.default.createDirectory(at: second.appendingPathComponent("School"), withIntermediateDirectories: true)
         try "Existing".write(to: second.appendingPathComponent("School/Existing.md"), atomically: true, encoding: .utf8)
         folderModel.openVault(second)
+        while let refresh = folderModel.refreshTask { await refresh.value }
         check(folderModel.vault?.root == second.standardizedFileURL.resolvingSymlinksInPath() && folderModel.tree.contains { $0.path == "School" }, "existing notes load immediately")
         try folderModel.vault!.write("Note.md", content: "Test", create: true)
         folderModel.refresh(); folderModel.openNote("Note.md")
@@ -270,6 +273,7 @@ import AppKit
         check(try vault.read("Rename/Enzyme Revision.md") == "Enzymes and unsaved edit", "rename renames the real file and keeps pending edits")
         check(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Rename/Biology Notes.md").path), "rename leaves no old file")
         check(model.note == "Rename/Enzyme Revision.md" && model.selection == "Rename/Enzyme Revision.md", "open note follows rename")
+        while let refresh = model.refreshTask { await refresh.value }
         check(model.tree.contains { $0.path == "Rename" && ($0.children ?? []).contains { $0.path == "Rename/Enzyme Revision.md" } }, "sidebar tree refreshed after rename")
         model.error = nil
         check(!model.renameNote("Rename/Enzyme Revision.md", to: "Taken") && model.error?.contains("already exists") == true, "rename conflict warns")
@@ -699,7 +703,7 @@ import AppKit
         model.requestOverride = { route, body in
             if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
             guard route == "/api/chat" else { return [:] }
-            repeatBodies.append(body)
+            repeatBodies.append(body ?? [:])
             return toolCall("create_file", ["path": "X", "content": "Una historia."])
         }
         model.clearChat()
@@ -773,7 +777,7 @@ import AppKit
         model.currentTaskID = undoTaskID
         _ = try model.executeTool("create_file", arguments: ["path": "TaskUndo/new.md", "content": "Made by AI"])
         model.appendAction(call: [:], name: "create_file", arguments: ["path": "TaskUndo/new.md"], response: ["content": "Created"], failed: false, undo: model.pendingUndo)
-        model.readThisRequest.insert("TaskUndo/keep.md")
+        _ = try model.executeTool("read_file", arguments: ["path": "TaskUndo/keep.md"])
         _ = try model.executeTool("write_file", arguments: ["path": "TaskUndo/keep.md", "content": "Changed by AI"])
         model.appendAction(call: [:], name: "write_file", arguments: ["path": "TaskUndo/keep.md"], response: ["content": "Updated"], failed: false, undo: model.pendingUndo)
         _ = try model.executeTool("move_path", arguments: ["oldPath": "TaskUndo/keep.md", "newPath": "TaskUndo/moved.md"])
@@ -790,9 +794,9 @@ import AppKit
         try "Dropped **text**".write(to: outside, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: outside) }
         model.selection = nil
-        let first = model.importNotes([outside]), second = model.importNotes([outside])
+        let firstImport = model.importNotes([outside]), secondImport = model.importNotes([outside])
         let stem = outside.deletingPathExtension().lastPathComponent
-        check(first == [stem + ".md"] && second == [stem + "-2.md"] && (try? vault.read(stem + ".md")) == "Dropped **text**" && FileManager.default.fileExists(atPath: outside.path), "dropped Markdown is copied in as a note without overwriting")
+        check(firstImport == [stem + ".md"] && secondImport == [stem + "-2.md"] && (try? vault.read(stem + ".md")) == "Dropped **text**" && FileManager.default.fileExists(atPath: outside.path), "dropped Markdown is copied in as a note without overwriting")
         check(model.importNotes([root.appendingPathComponent("TaskUndo/linker.md")]) == ["TaskUndo/linker.md"], "a dropped note already in the folder just opens")
 
         // Follow-ups keep the previous task's tools; "note b" finds b's only note

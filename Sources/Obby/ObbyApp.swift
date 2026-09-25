@@ -31,7 +31,10 @@ import UniformTypeIdentifiers
                 Button("Choose Notes Folder…") { model.chooseFolder() }.keyboardShortcut("o").disabled(model.busy)
             }
             CommandGroup(replacing: .appSettings) { Button("Settings…") { model.showSettings = true }.keyboardShortcut(",") }
-            CommandGroup(replacing: .saveItem) { Button("Save") { model.save() }.keyboardShortcut("s") }
+            CommandGroup(replacing: .saveItem) {
+                Button("Save") { model.save() }.keyboardShortcut("s")
+                Button("Save Recovery Copy…") { model.saveRecoveryCopy() }.disabled(!model.dirty)
+            }
             CommandGroup(after: .sidebar) {
                 Button(model.showAI ? "Hide AI" : "Show AI") { model.showAI.toggle() }.keyboardShortcut("a", modifiers: [.command, .shift])
                 Divider()
@@ -939,18 +942,31 @@ struct WindowCloseGuard: NSViewRepresentable {
         }
         engine.prepare()
         do { try engine.start() } catch { input.removeTap(onBus: 0); fallback(); return }
-        let prefix = current.isEmpty || current.hasSuffix(" ") || current.hasSuffix("\n") ? current : current + " "
+        var committed = current.isEmpty || current.hasSuffix(" ") || current.hasSuffix("\n") ? current : current + " "
+        var last = ""
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             let text = result?.bestTranscription.formattedString, finished = error != nil || result?.isFinal == true
             Task { @MainActor [weak self] in
                 guard let self, self.listening else { return }
-                if let text { update(prefix + text); self.armSilenceStop() }
+                if let text {
+                    // After a pause, on-device recognition starts a new phrase and its transcript no longer includes
+                    // the earlier words. Keep what was already said instead of replacing it.
+                    if SpeechInput.startsNewPhrase(previous: last, next: text) { committed += last + " " }
+                    last = text
+                    update(committed + text); self.armSilenceStop()
+                }
                 if finished { self.stop() }
             }
         }
         self.request = request
         listening = true
         armSilenceStop()
+    }
+    /// True when the recogniser has dropped the earlier words (a new phrase), rather than revising the current one.
+    nonisolated static func startsNewPhrase(previous: String, next: String) -> Bool {
+        guard !previous.isEmpty, !next.isEmpty else { return false }
+        let first = { (text: String) in text.split(separator: " ").first.map { $0.lowercased() } ?? "" }
+        return next.count < previous.count && first(next) != first(previous)
     }
     private func armSilenceStop() {
         silence?.cancel()

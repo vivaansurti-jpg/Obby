@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Darwin
 import ImageIO
 import UniformTypeIdentifiers
@@ -21,6 +22,10 @@ final class Vault {
     let root: URL
     let fm = FileManager.default
     private let identity: UInt64?
+    private static let temporaryLock = NSLock()
+    private static var activeTemporaryFiles: Set<String> = []
+    private static func registerTemporary(_ url: URL) { temporaryLock.lock(); defer { temporaryLock.unlock() }; activeTemporaryFiles.insert(url.path) }
+    private static func unregisterTemporary(_ url: URL) { temporaryLock.lock(); defer { temporaryLock.unlock() }; activeTemporaryFiles.remove(url.path) }
     init(_ root: URL) {
         self.root = root.standardizedFileURL.resolvingSymlinksInPath()
         self.identity = Self.directoryIdentity(self.root)
@@ -57,7 +62,8 @@ final class Vault {
         }.sorted { $0.isDirectory != $1.isDirectory ? $0.isDirectory : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
     func tree(_ path: String = "") throws -> [Entry] {
-        try entries(path).map { entry in
+        try Task.checkCancellation()
+        return try entries(path).map { entry in
             var e = entry
             if e.isDirectory { e.children = try tree(e.path) }
             return e
@@ -68,6 +74,7 @@ final class Vault {
         guard url.pathExtension.lowercased() == "md" else { throw ObbyError("Only Markdown (.md) files can be read or written.") }
         return url
     }
+    static func contentVersion(_ text: String) -> Data { Data(SHA256.hash(data: Data(text.utf8))) }
     func read(_ path: String) throws -> String { try String(contentsOf: markdown(path), encoding: .utf8) }
     func write(_ path: String, content: String, create: Bool = false) throws {
         let url = try markdown(path)
@@ -96,7 +103,8 @@ final class Vault {
     /// replace the old version). If anything fails the previous version is untouched and the temporary file is removed.
     func atomicWrite(_ data: Data, to url: URL, create: Bool) throws {
         let temp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).obby-tmp-\(UUID().uuidString)")
-        defer { try? fm.removeItem(at: temp) } // Gone already after a successful move; removed if anything failed.
+        Self.registerTemporary(temp)
+        defer { try? fm.removeItem(at: temp); Self.unregisterTemporary(temp) } // Gone already after a successful move; removed if anything failed.
         try data.write(to: temp, options: .withoutOverwriting)
         guard (try? fm.attributesOfItem(atPath: temp.path)[.size] as? NSNumber)?.intValue == data.count else {
             throw ObbyError("The note couldn’t be saved completely. The previous version was kept.")
@@ -104,13 +112,21 @@ final class Vault {
         if create { try fm.moveItem(at: temp, to: url) } // Never replaces an existing file.
         else { _ = try fm.replaceItemAt(url, withItemAt: temp) }
     }
-    /// Removes temporary files left by an interrupted save or import (for example after a crash).
-    func removeStaleTemporaryFiles() {
-        guard let walker = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsPackageDescendants]) else { return }
+    /// Removes recognized temporary files older than a day, excluding writes/imports active in this process.
+    func removeStaleTemporaryFiles(now: Date = Date()) {
+        guard rootExists, let walker = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsPackageDescendants]) else { return }
         for case let url as URL in walker {
             let name = url.lastPathComponent
-            guard name.hasPrefix("."), name.contains(".obby-tmp-") || name.hasPrefix(".obby-import-"),
-                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            let suffix: String?
+            if name.hasPrefix(".obby-import-") { suffix = String(name.dropFirst(".obby-import-".count)) }
+            else if name.hasPrefix("."), let marker = name.range(of: ".obby-tmp-", options: .backwards) { suffix = String(name[marker.upperBound...]) }
+            else { suffix = nil }
+            guard let suffix, UUID(uuidString: suffix) != nil else { continue }
+            Self.temporaryLock.lock()
+            defer { Self.temporaryLock.unlock() }
+            guard !Self.activeTemporaryFiles.contains(url.path),
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]), values.isRegularFile == true,
+                  let modified = values.contentModificationDate, modified < now.addingTimeInterval(-86_400) else { continue }
             try? fm.removeItem(at: url)
         }
     }
@@ -134,7 +150,33 @@ final class Vault {
     }
     func move(_ old: String, _ new: String) throws {
         try validateMove(old, new)
+        func moved(_ path: String) -> String { path == old || path.hasPrefix(old + "/") ? new + path.dropFirst(old.count) : path }
+        func notes(_ entries: [Entry]) -> [String] { entries.flatMap { $0.isDirectory ? notes($0.children ?? []) : [$0.path] } }
+        var paths = Set(notes(try tree()))
+        if old.lowercased().hasSuffix(".md"), (try? read(old)) != nil { paths.insert(old) } // Case-only rename's hidden intermediate.
+        var changes: [(path: String, before: String, after: String)] = []
+        for path in paths.sorted() {
+            let before = try read(path)
+            let after = rewriteLinks(before, from: path, to: moved(path), mapping: moved)
+            if before != after { changes.append((path, before, after)) }
+        }
         try fm.moveItem(at: resolve(old), to: resolve(new))
+        var written: [(path: String, before: String)] = []
+        do {
+            for change in changes {
+                let path = moved(change.path)
+                guard try read(path) == change.before else { throw ObbyError("A linked note changed during the move. Try again.") }
+                try write(path, content: change.after)
+                written.append((path, change.before))
+            }
+        } catch {
+            let failure = error
+            var rollbackFailed = false
+            for change in written.reversed() { do { try write(change.path, content: change.before) } catch { rollbackFailed = true } }
+            do { try fm.moveItem(at: resolve(new), to: resolve(old)) } catch { rollbackFailed = true }
+            if rollbackFailed { throw ObbyError("The move could not finish or be fully reversed. Check \(old) and \(new) before editing further.") }
+            throw failure
+        }
     }
     func delete(_ path: String) throws {
         let url = try resolve(path)
@@ -150,6 +192,7 @@ final class Vault {
         var matches: [Entry] = []
         var skipped = 0
         while let path = pending.popLast() {
+            try Task.checkCancellation()
             for entry in try entries(path) {
                 if entry.isDirectory { pending.append(entry.path) }
                 let match = entry.path.localizedCaseInsensitiveContains(query) || (!entry.isDirectory && ((try? read(entry.path))?.localizedCaseInsensitiveContains(query) == true))
@@ -163,7 +206,10 @@ final class Vault {
     }
     func search(_ query: String) throws -> [Entry] {
         func walk(_ entries: [Entry]) -> [Entry] { entries.flatMap { [$0] + walk($0.children ?? []) } }
-        return try walk(tree()).filter { $0.path.localizedCaseInsensitiveContains(query) || (!$0.isDirectory && ((try? read($0.path))?.localizedCaseInsensitiveContains(query) == true)) }
+        return try walk(tree()).filter { entry in
+            try Task.checkCancellation()
+            return entry.path.localizedCaseInsensitiveContains(query) || (!entry.isDirectory && ((try? read(entry.path))?.localizedCaseInsensitiveContains(query) == true))
+        }
     }
 }
 
@@ -216,7 +262,8 @@ extension Vault {
         // Copy into a temporary file first and check it, then move it to a free name. The Markdown link is only
         // inserted after this returns, and an existing attachment is never overwritten.
         let temp = try resolve(folder + "/.obby-import-\(UUID().uuidString)")
-        defer { try? fm.removeItem(at: temp) }
+        Self.registerTemporary(temp)
+        defer { try? fm.removeItem(at: temp); Self.unregisterTemporary(temp) }
         do { try write(temp) } catch { throw Self.saveError(base + (ext.isEmpty ? "" : "." + ext), error) }
         let copied = (try? fm.attributesOfItem(atPath: temp.path)[.size] as? NSNumber)?.intValue
         guard copied != nil, expected == nil || copied == expected else { throw ObbyError("The file couldn’t be copied completely. Nothing was added.") }
@@ -323,21 +370,37 @@ extension Vault {
 /// Markdown links in note text (`[title](path)` and `![alt](path)`), used for clickable attachments and for
 /// finding a note's attachments. The note file itself stays plain Markdown.
 enum NoteLinks {
-    struct Link { let isImage: Bool; let titleRange: NSRange; let destination: String }
+    struct Link { let isImage: Bool; let titleRange: NSRange; let destination: String; let destinationRange: NSRange }
     static let pattern = try! NSRegularExpression(pattern: "(!?)(\\[[^\\]\\n]*\\])\\(([^)\\n]+)\\)")
+    private static let inlineCode = try! NSRegularExpression(pattern: #"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)"#)
     static func links(in text: String, range: NSRange? = nil) -> [Link] {
         let source = text as NSString
-        return pattern.matches(in: text, range: range ?? NSRange(location: 0, length: source.length)).map { match in
-            Link(isImage: match.range(at: 1).length > 0, titleRange: match.range(at: 2), destination: source.substring(with: match.range(at: 3)))
+        var fence = MarkdownFence(), offset = 0
+        var protected: [NSRange] = []
+        for line in text.components(separatedBy: "\n") {
+            let length = (line as NSString).length
+            if fence.consume(line) { protected.append(NSRange(location: offset, length: length)) }
+            else {
+                protected += inlineCode.matches(in: line, range: NSRange(location: 0, length: length)).map {
+                    NSRange(location: offset + $0.range.location, length: $0.range.length)
+                }
+            }
+            offset += length + 1
+        }
+        return pattern.matches(in: text, range: range ?? NSRange(location: 0, length: source.length)).filter { match in
+            !protected.contains { NSIntersectionRange($0, match.range).length > 0 }
+        }.map { match in
+            Link(isImage: match.range(at: 1).length > 0, titleRange: match.range(at: 2), destination: source.substring(with: match.range(at: 3)), destinationRange: match.range(at: 3))
         }
     }
     /// A local, relative link target (percent-escapes and <…> removed), or nil for web links, anchors and absolute paths.
     static func target(_ destination: String) -> String? {
         var value = destination.trimmingCharacters(in: .whitespaces)
         if value.hasPrefix("<"), value.hasSuffix(">") { value = String(value.dropFirst().dropLast()) }
+        value = String(value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0])
         value = value.removingPercentEncoding ?? value
         guard !value.isEmpty, !value.hasPrefix("/"), !value.hasPrefix("#"), !value.hasPrefix("~"), !value.contains("://"),
-              !value.lowercased().hasPrefix("mailto:"), !value.split(separator: "/").contains("..") else { return nil }
+              value.range(of: "^[A-Za-z][A-Za-z0-9+.-]*:", options: .regularExpression) == nil else { return nil }
         let parts = value.split(separator: "/").filter { $0 != "." }
         return parts.isEmpty ? nil : parts.joined(separator: "/")
     }
@@ -346,14 +409,14 @@ enum NoteLinks {
 extension Vault {
     /// THE attachment resolver, used for AI reading (tool and chat-only), clicks, chat images and attachment lists.
     /// Resolves `link` (as written in a note) relative to `folder` (the note's parent folder, "" for the root),
-    /// through `resolve`, so absolute paths, "..", symlinks and anything outside the Obby root are rejected, and
+    /// through `resolve`, so absolute paths, symlinks and anything outside the Obby root are rejected, and
     /// confirms a file exists there. Returns the Obby-relative path and file URL.
     func resolveAttachment(_ link: String, inFolder folder: String) throws -> (path: String, url: URL) {
         guard let target = NoteLinks.target(link) else {
             throw ObbyError("\((link as NSString).lastPathComponent) isn’t a file inside the Obby folder.")
         }
         let name = (target as NSString).lastPathComponent
-        let path = folder.isEmpty ? target : folder + "/" + target
+        let path = try linkPath(link, inFolder: folder)
         let url = try resolve(path)
         var isDirectory: ObjCBool = false
         guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
@@ -381,11 +444,11 @@ extension Vault {
 enum MarkdownSections {
     struct Heading { let line: Int; let level: Int; let title: String }
     static func headings(_ lines: [String]) -> [Heading] {
-        var result: [Heading] = [], inFence = false
+        var result: [Heading] = []
+        var fence = MarkdownFence()
         for (index, line) in lines.enumerated() {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") { inFence.toggle(); continue }
-            guard !inFence, trimmed.hasPrefix("#") else { continue }
+            guard !fence.consume(line), line.prefix(while: { $0 == " " }).count <= 3, !line.hasPrefix("\t"), trimmed.hasPrefix("#") else { continue }
             let level = trimmed.prefix(while: { $0 == "#" }).count
             let rest = trimmed.dropFirst(level)
             guard level <= 6, rest.isEmpty || rest.first == " " else { continue }
@@ -446,3 +509,70 @@ enum MarkdownSections {
     }
 }
 
+
+/// Shared CommonMark fence state. A closer must match the opener's marker and length.
+struct MarkdownFence {
+    private var marker: Character?
+    private var length = 0
+    var isOpen: Bool { marker != nil }
+    mutating func consume(_ line: String) -> Bool {
+        let wasOpen = isOpen
+        let indent = line.prefix { $0 == " " }.count
+        guard indent <= 3 else { return wasOpen }
+        let value = line.dropFirst(indent)
+        guard let first = value.first, first == "`" || first == "~" else { return wasOpen }
+        let count = value.prefix { $0 == first }.count
+        let suffix = value.dropFirst(count)
+        if let marker {
+            if first == marker, count >= length, suffix.trimmingCharacters(in: .whitespaces).isEmpty {
+                self.marker = nil; length = 0
+            }
+        } else if count >= 3, first != "`" || !suffix.contains("`") {
+            marker = first; length = count
+        }
+        return wasOpen || isOpen
+    }
+}
+
+extension Vault {
+    /// Parent links are allowed only while every component stays inside the vault and avoids symlinks.
+    func linkPath(_ link: String, inFolder folder: String) throws -> String {
+        guard let target = NoteLinks.target(link) else { throw ObbyError("That link is not a file inside the notes folder.") }
+        _ = try resolve(folder, allowRoot: true)
+        var parts = folder.split(separator: "/").map(String.init)
+        for part in target.split(separator: "/") {
+            if part == ".." {
+                guard !parts.isEmpty else { throw ObbyError("Access outside the notes folder is blocked.") }
+                parts.removeLast()
+            } else if part != "." { parts.append(String(part)) }
+            _ = try resolve(parts.joined(separator: "/"), allowRoot: true)
+        }
+        let path = parts.joined(separator: "/")
+        _ = try resolve(path)
+        return path
+    }
+    func rewriteLinks(_ text: String, from source: String, to destination: String, mapping: (String) -> String) -> String {
+        let oldFolder = (source as NSString).deletingLastPathComponent
+        let newFolder = (destination as NSString).deletingLastPathComponent.split(separator: "/").map(String.init)
+        var fence = MarkdownFence()
+        return text.components(separatedBy: "\n").map { line in
+            guard !fence.consume(line) else { return line }
+            let result = NSMutableString(string: line)
+            for link in NoteLinks.links(in: line).reversed() {
+                guard let target = try? linkPath(link.destination, inFolder: oldFolder) else { continue }
+                let mapped = mapping(target)
+                guard source != destination || mapped != target else { continue }
+                let targetParts = mapped.split(separator: "/").map(String.init)
+                var common = 0
+                while common < min(newFolder.count, targetParts.count), newFolder[common] == targetParts[common] { common += 1 }
+                let relative = (Array(repeating: "..", count: newFolder.count - common) + targetParts.dropFirst(common)).joined(separator: "/")
+                let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "[]()#%?:"))
+                var replacement = relative.addingPercentEncoding(withAllowedCharacters: allowed) ?? relative
+                let raw = link.destination.trimmingCharacters(in: CharacterSet(charactersIn: "<> "))
+                if let fragment = raw.firstIndex(of: "#") { replacement += raw[fragment...] }
+                result.replaceCharacters(in: link.destinationRange, with: replacement)
+            }
+            return result as String
+        }.joined(separator: "\n")
+    }
+}

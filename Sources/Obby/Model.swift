@@ -70,6 +70,8 @@ import AppKit
     }
     var aiDraft = "" // Unsent text in the AI prompt field, kept while the panel is hidden (not published: no redraws).
     var pendingUndo: UndoEdit? // Set by executeTool for the action line it is about to produce.
+    var readVersions: [String: Data] = [:]
+    var requestNoteFolder: String?
     var readThisRequest: Set<String> = [] // Notes the model has read (or was given) during the current AI request.
     var shrinkOverride: ((String) -> Bool)? // The checks answer the shrink question without a dialog.
     var planOverride: (([String]) -> Bool)? // The checks answer the change-preview question without a dialog.
@@ -97,6 +99,11 @@ import AppKit
     var diskText = ""
     var saveTask: Task<Void, Never>?
     var aiTask: Task<Void, Never>?
+    var rootUnavailable = false
+    var refreshAgain = false
+    var refreshTask: Task<Void, Never>?
+    var searchTask: Task<Void, Never>?
+    var storageObserver: NSObjectProtocol?
     var timer: Timer?
     var sidebarDrag: SidebarDrag?
     var scopedURL: URL?
@@ -105,11 +112,16 @@ import AppKit
     var history: [[String: Any]] = []
     var directoryResults: [String: (Date?, String)] = [:]
     init(restoreState: Bool = true) {
+        storageObserver = NotificationCenter.default.addObserver(forName: .init("ObbyStorageError"), object: nil, queue: .main) { [weak self] notification in
+            let message = notification.userInfo?["message"] as? String ?? "AI memory could not be saved."
+            Task { @MainActor [weak self] in self?.error = message }
+        }
         guard restoreState else { return }
         restoreSavedFolder()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } }
+        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in Task { @MainActor in if self?.refreshTask == nil { self?.refresh() } } }
         Task { await connect() } // One read-only status check at launch; no repeating AI timers (the 1.5 s timer above only watches note files).
     }
+    deinit { if let storageObserver { NotificationCenter.default.removeObserver(storageObserver) } }
     func restoreSavedFolder() {
         guard let data = UserDefaults.standard.data(forKey: "bookmark") else { clearVault(); return }
         var stale = false
@@ -123,11 +135,22 @@ import AppKit
         openVault(url)
     }
     @discardableResult func validateRoot() -> Bool {
-        if vault?.rootExists == true { return true }
-        if vault != nil { clearVault() } // The notes folder disappeared: forget it rather than recreate it.
+        if vault?.rootExists == true { rootUnavailable = false; return true }
+        if vault != nil {
+            if dirty {
+                saveTask?.cancel(); saveTask = nil
+                aiTask?.cancel()
+                status = "Notes folder unavailable. Your unsaved edits are still in the editor."
+                if !rootUnavailable { error = "Reconnect the notes folder, or use File → Save Recovery Copy to keep your edits elsewhere." }
+                rootUnavailable = true
+            } else { clearVault() }
+        }
         return false
     }
     func clearVault() {
+        rootUnavailable = false; refreshAgain = false
+        refreshTask?.cancel(); refreshTask = nil
+        searchTask?.cancel(); searchTask = nil
         sidebarDrag = nil
         rootWatcher?.cancel(); rootWatcher = nil
         saveTask?.cancel(); saveTask = nil
@@ -170,6 +193,8 @@ import AppKit
         }
         let chosen = Vault(url)
         guard chosen.rootExists else { clearVault(); self.error = "That folder can’t be used for notes."; return }
+        refreshTask?.cancel(); refreshTask = nil
+        searchTask?.cancel(); searchTask = nil
         vault = chosen
         note = nil; selection = nil; loading = true; text = ""; loading = false; dirty = false
         clearChat()
@@ -185,15 +210,40 @@ import AppKit
     }
     func refresh() {
         guard validateRoot(), let vault else { return }
-        do {
-            let fresh = try vault.tree(); if fresh != tree { tree = fresh }
-            if !query.isEmpty { results = try vault.search(query) }
-            if let note, !dirty {
-                if let freshText = try? vault.read(note) {
-                    if freshText != diskText { loading = true; text = freshText; loading = false; diskText = freshText; status = "Updated from disk" }
-                } else { self.note = nil; loading = true; text = ""; loading = false; status = "Note moved or removed outside Obby" }
+        guard refreshTask == nil else { refreshAgain = true; return }
+        let open = note, baseline = diskText
+        refreshTask = Task { [weak self] in
+            let worker = Task.detached(priority: .utility) { () throws -> ([Entry], String?) in
+                (try vault.tree(), open.flatMap { try? vault.read($0) })
             }
-        } catch { status = error.localizedDescription }
+            let result = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
+            guard !Task.isCancelled, let self, self.vault === vault else { return }
+            self.refreshTask = nil
+            if self.refreshAgain { self.refreshAgain = false; self.refresh(); return }
+            switch result {
+            case .success(let (fresh, freshText)):
+                if fresh != self.tree { self.tree = fresh }
+                if let open, self.note == open, !self.dirty, self.diskText == baseline {
+                    if let freshText {
+                        if freshText != baseline { self.loading = true; self.text = freshText; self.loading = false; self.diskText = freshText; self.status = "Updated from disk" }
+                    } else { self.closeNote(); self.status = "Note moved or removed outside Obby" }
+                }
+                if !self.query.isEmpty, self.searchTask == nil { self.search() }
+            case .failure(let error): self.status = error.localizedDescription
+            }
+        }
+    }
+    /// Export the only unsaved copy before changing folders or quitting after a disconnect.
+    func saveRecoveryCopy() {
+        guard dirty else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = note.map { ($0 as NSString).lastPathComponent } ?? "Recovered Note.md"
+        panel.allowedContentTypes = [.plainText]
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        perform {
+            try Data(text.utf8).write(to: destination, options: .atomic)
+            if vault?.rootExists != true { dirty = false; error = nil; status = "Recovery copy saved" }
+        }
     }
     func openNote(_ path: String) {
         guard path != note, save(), let vault else { return }
@@ -249,8 +299,8 @@ import AppKit
             guard let text = try? vault.read(source), text.contains("](") else { return false }
             let folder = (source as NSString).deletingLastPathComponent
             return NoteLinks.links(in: text).contains { link in
-                guard !link.isImage, let destination = NoteLinks.target(link.destination) else { return false }
-                return destination == target || (folder.isEmpty ? destination : folder + "/" + destination) == target
+                guard !link.isImage else { return false }
+                return (try? vault.linkPath(link.destination, inFolder: folder)) == target
             }
         }.sorted()
     }
@@ -272,7 +322,7 @@ import AppKit
     @discardableResult func save(overwriteConflict: Bool = false) -> Bool {
         saveTask?.cancel()
         saveTask = nil
-        guard validateRoot() else { return true }
+        guard validateRoot() else { return !dirty }
         guard dirty, let note, let vault else { return true }
         do {
             let current = try vault.read(note)
@@ -342,6 +392,19 @@ import AppKit
     func didMove(_ old: String, _ new: String) {
         if let note, note == old || note.hasPrefix(old + "/") { self.note = new + note.dropFirst(old.count); UserDefaults.standard.set(self.note, forKey: "lastNote") }
         selection = new
+        func moved(_ path: String) -> String { path == old || path.hasPrefix(old + "/") ? new + path.dropFirst(old.count) : path }
+        for index in chat.indices {
+            if var edit = chat[index].undo {
+                let destination = moved(edit.path)
+                if let vault {
+                    edit.previous = edit.previous.map { vault.rewriteLinks($0, from: edit.path, to: destination, mapping: moved) }
+                    edit.after = vault.rewriteLinks(edit.after, from: edit.path, to: destination, mapping: moved)
+                }
+                edit.path = destination; chat[index].undo = edit
+            }
+        }
+        if let folder = requestNoteFolder { requestNoteFolder = moved(folder) }
+        readVersions.removeAll(); readThisRequest.removeAll()
         memoryDidMove(old, new) // Task memories and folder context follow the note or folder.
     }
     /// Drop/paste/toolbar attachments for the open note: copies files into the note's Attachments folder and returns
@@ -479,7 +542,8 @@ import AppKit
         var undone = 0
         for line in lines.reversed() {
             do {
-                try applyUndo(line.undo!, vault: vault); undone += 1
+                guard let edit = chat.first(where: { $0.id == line.id })?.undo else { continue }
+                try applyUndo(edit, vault: vault); undone += 1
                 if let index = chat.firstIndex(where: { $0.id == line.id }) { chat[index].undo = nil }
             } catch { appendNotice("Couldn’t undo the change to \((line.undo!.path as NSString).lastPathComponent): \(error.localizedDescription)", failed: true) }
         }
@@ -506,11 +570,26 @@ import AppKit
         if let previous = edit.previous { try vault.write(edit.path, content: previous, create: current == nil) }
         else if current != nil { try vault.delete(edit.path) }
     }
-    func search() { perform { results = try vault?.search(query) ?? [] } }
+    func search() {
+        searchTask?.cancel(); searchTask = nil
+        let term = query
+        guard let vault, !term.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { results = []; return }
+        searchTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+            let worker = Task.detached(priority: .utility) { try vault.search(term) }
+            let result = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
+            guard !Task.isCancelled, let self, self.vault === vault, self.query == term else { return }
+            self.searchTask = nil
+            switch result {
+            case .success(let entries): self.results = entries
+            case .failure(let error): self.status = error.localizedDescription
+            }
+        }
+    }
     func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: activeModelKey); UserDefaults.standard.set(activeCustom?.id.uuidString, forKey: "activeCustomProvider"); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe"); UserDefaults.standard.set(streamReplies, forKey: "streamReplies") }
 }
 struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil; var base = ""; var repeats = 1; var taskID: UUID? = nil }
 /// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.
 /// `previous == nil` means the AI created the note, so undo moves it to the Trash.
 /// `movedFrom` set: the AI moved or renamed `movedFrom` to `path`, so undo moves it back.
-struct UndoEdit { let path: String; let previous: String?; let after: String; var movedFrom: String? = nil }
+struct UndoEdit { var path: String; var previous: String?; var after: String; var movedFrom: String? = nil }

@@ -72,6 +72,7 @@ extension AppModel {
         contextUsage = nil; lastWorkPrompt = ""
         chatSession = UUID()
         aiTask?.cancel(); aiTask = nil
+        requestNoteFolder = nil; readVersions.removeAll(); readThisRequest.removeAll(); guardWrites = false
         directoryResults.removeAll(keepingCapacity: false)
         history.removeAll(keepingCapacity: false)
         chat.removeAll(keepingCapacity: false)
@@ -371,12 +372,11 @@ struct GlobalMemory: Codable, Equatable {
     }
     static var file: URL { ChatStore.root.appendingPathComponent("Memory.json") }
     static func load() -> GlobalMemory { (try? JSONDecoder().decode(GlobalMemory.self, from: Data(contentsOf: file))) ?? GlobalMemory() }
-    func save() {
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(self) else { return }
-        try? FileManager.default.createDirectory(at: ChatStore.root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try? data.write(to: Self.file, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.file.path)
+    @discardableResult func save() -> Bool {
+        MemoryStorage.perform("save personal memory") {
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try MemoryStorage.write(encoder.encode(self), to: Self.file)
+        }
     }
     /// Only phrasing that states a lasting preference can add to global memory; other details stay with the task.
     static func statesLastingPreference(_ text: String) -> Bool {
@@ -392,12 +392,11 @@ enum ChatStore {
     static var root: URL { rootOverride ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Obby", isDirectory: true) }
     static var directory: URL { root.appendingPathComponent("Chats", isDirectory: true) }
     static func file(_ id: UUID) -> URL { directory.appendingPathComponent(id.uuidString + ".json") }
-    static func save(_ record: ChatRecord) {
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(record) else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try? data.write(to: file(record.id), options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file(record.id).path)
+    @discardableResult static func save(_ record: ChatRecord) -> Bool {
+        MemoryStorage.perform("save this task's memory") {
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try MemoryStorage.write(encoder.encode(record), to: file(record.id))
+        }
     }
     static func files() -> [URL] {
         ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []).filter { $0.pathExtension == "json" }
@@ -408,8 +407,16 @@ enum ChatStore {
             .filter { $0.notesRoot == root && !$0.isEmpty }.sorted { $0.updatedAt > $1.updatedAt }
     }
     /// Removes chat memory files only; notes and attachments live elsewhere and are never touched.
-    static func delete(_ id: UUID) { try? FileManager.default.removeItem(at: file(id)) }
-    static func deleteAll() { for url in files() { try? FileManager.default.removeItem(at: url) } }
+    @discardableResult static func delete(_ id: UUID) -> Bool {
+        MemoryStorage.perform("delete this task's memory") { try MemoryStorage.remove(file(id)) }
+    }
+    @discardableResult static func deleteAll() -> Bool {
+        MemoryStorage.perform("delete all task memory") {
+            guard FileManager.default.fileExists(atPath: directory.path) else { return }
+            let urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            for url in urls where url.pathExtension == "json" { try MemoryStorage.remove(url) }
+        }
+    }
 }
 
 extension AppModel {
@@ -440,10 +447,10 @@ extension AppModel {
         if let latest = savedChats.first { openChat(latest) }
     }
     /// Settings: forget this chat's memory (starts a new chat). Notes and attachments are untouched.
-    func clearCurrentChatMemory() { ChatStore.delete(memory.id); clearChat(); reloadSavedChats() }
+    func clearCurrentChatMemory() { guard ChatStore.delete(memory.id) else { return }; clearChat(); reloadSavedChats() }
     /// Settings: forget every remembered chat. Notes and attachments are untouched.
     func clearAllChatMemory() {
-        ChatStore.deleteAll(); try? FileManager.default.removeItem(at: GlobalMemory.file)
+        guard ChatStore.deleteAll(), MemoryStorage.perform("delete personal memory", { try MemoryStorage.remove(GlobalMemory.file) }) else { reloadSavedChats(); return }
         globalMemory = GlobalMemory(); clearChat(); reloadSavedChats()
     }
     func forgetGlobalPreference(_ item: String) { globalMemory.preferences.removeAll { $0 == item }; globalMemory.save() }
@@ -625,14 +632,14 @@ extension AppModel {
         guard !stated.isEmpty else { return }
         let before = globalMemory.aboutMe
         globalMemory.aboutMe = GlobalMemory.merge(before, stated)
-        if globalMemory.aboutMe != before { globalMemory.save(); appendNotice("Updated what Obby knows about you.") }
+        if globalMemory.aboutMe != before { if globalMemory.save() { appendNotice("Updated what Obby knows about you.") } }
     }
     /// Explicit additions ("Remember that I…", Settings → Add…). Sensitive facts are still refused.
     func addAboutMe(_ facts: [String]) {
         let before = globalMemory.aboutMe
         globalMemory.aboutMe = GlobalMemory.merge(before, facts)
         guard globalMemory.aboutMe != before else { appendNotice("That wasn’t saved (it may be sensitive or already known).", failed: true); return }
-        globalMemory.save(); appendNotice("Added to About me.")
+        if globalMemory.save() { appendNotice("Added to About me.") }
     }
     /// Pins a fact to this task's memory (never condensed away).
     func pin(_ text: String) {
@@ -899,3 +906,24 @@ enum ToolRouting {
     }
 }
 
+
+/// All memory mutations report failures instead of claiming a save or deletion succeeded.
+enum MemoryStorage {
+    @discardableResult static func perform(_ action: String, _ operation: () throws -> Void) -> Bool {
+        do { try operation(); return true }
+        catch {
+            NotificationCenter.default.post(name: .init("ObbyStorageError"), object: nil,
+                userInfo: ["message": "Couldn’t \(action). \(error.localizedDescription) Your notes are unaffected; retry when storage is available."])
+            return false
+        }
+    }
+    static func write(_ data: Data, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+    static func remove(_ url: URL) throws {
+        do { try FileManager.default.removeItem(at: url) }
+        catch let error as CocoaError where error.code == .fileNoSuchFile { return }
+    }
+}

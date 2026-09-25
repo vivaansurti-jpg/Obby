@@ -107,7 +107,7 @@ Normal use never needs Terminal. When Ollama is the provider and an AI request i
 
 ## Attachments
 
-Drag files into a note, paste them, or use the toolbar buttons (**Insert image**, **Attach document**; both are disabled with no note open). Every attachment goes through one import path: the file is copied (never linked or referenced in place) into `Attachments/` next to the note, and a normal Markdown link is inserted at the cursor or drop point: `![name](Attachments/name.png)` for images, `[Biology Paper](Attachments/Biology Paper.pdf)` for documents. Name collisions get `-2`, `-3`, …; nothing is ever overwritten. Paths stay inside the notes folder under the same rules as notes (no absolute paths, `..`, or symlinks). Folders and packages (such as `.pages`) are not attached. Document names keep their spaces; characters that would break a Markdown link are removed.
+Drag files into a note, paste them, or use the toolbar buttons (**Insert image**, **Attach document**; both are disabled with no note open). Every attachment goes through one import path: the file is copied (never linked or referenced in place) into `Attachments/` next to the note, and a normal Markdown link is inserted at the cursor or drop point: `![name](Attachments/name.png)` for images, `[Biology Paper](Attachments/Biology Paper.pdf)` for documents. Name collisions get `-2`, `-3`, …; nothing is ever overwritten. Paths stay inside the notes folder; absolute paths and symlinks are blocked. Parent-relative attachment links are accepted only when they remain inside the notes folder. Folders and packages (such as `.pages`) are not attached. Document names keep their spaces; characters that would break a Markdown link are removed.
 
 In the editor, link titles are shown in the link colour. Click a title to open it: notes open in Obby, other files in their default macOS app. Hold Option while clicking to place the cursor inside a link instead. The `.md` file stays plain Markdown.
 
@@ -203,3 +203,12 @@ The microphone button in the AI prompt field turns your speech into text using A
 ## Task titles
 
 A task's title and starting goal come from its first real request (the first line, up to 60 characters), never from small talk or a question about memory. After real work, the memory update may replace the title with a better one of up to six words. Chats that contain only small talk are not saved to the chat history. Older tasks whose title was a greeting ("hi there", "how are you") have that title and goal cleared when loaded, so the next real request sets them.
+
+### Reliability safeguards
+
+- If the notes folder disconnects or moves while there are unsaved edits, the editor retains them and blocks closing until they are saved. Reconnect the folder or choose **File → Save Recovery Copy…**.
+- Native and text-based AI tool calls are checked against the actions permitted for that request. Whole-note AI rewrites are rejected if the note changed after the model read it. Attachment reads remain tied to the originating note when you navigate elsewhere.
+- Moving or renaming a note/folder updates ordinary Markdown links throughout the vault. Attachments stay in place; relative links are rewritten to keep pointing at the same files. Parent-relative links are allowed only inside the vault, with symlink and outside-folder access still blocked. AI tool file paths still reject `..`.
+- Undo records follow moves, including the relative links in their saved versions. The editor, section tools, table tools, search index and chat renderer share code-fence rules for backticks and tildes.
+- Folder scans and debounced searches run off the main thread. Temporary-file cleanup removes only recognized files older than 24 hours and skips active writes/imports. Memory save and deletion failures are reported instead of silently ignored.
+- `scripts/test.sh` includes the targeted reliability regression checks in `scripts/RegressionChecks.swift`.

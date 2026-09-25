@@ -99,21 +99,11 @@ actor NoteIndex {
     private func makeChunks(path: String, content: String) -> [Chunk] {
         var sections: [(heading: String, body: String)] = []
         var headings: [(level: Int, text: String)] = [], body: [String] = []
-        var fence: (marker: Character, count: Int)?
+        var fence = MarkdownFence()
         func finish() { if !body.isEmpty { sections.append((headings.map(\.text).joined(separator: " › "), body.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))); body = [] } }
         for line in content.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if let marker = trimmed.first, marker == "`" || marker == "~" {
-                let count = trimmed.prefix { $0 == marker }.count
-                if let open = fence {
-                    if marker == open.marker, count >= open.count,
-                       trimmed.dropFirst(count).trimmingCharacters(in: .whitespaces).isEmpty { fence = nil }
-                } else if count >= 3, line.prefix(while: { $0 == " " }).count <= 3 {
-                    fence = (marker, count)
-                }
-                body.append(line); continue
-            }
-            if fence == nil, let heading = headingLine(line) {
+            if fence.consume(line) { body.append(line); continue }
+            if let heading = headingLine(line) {
                 finish(); while let last = headings.last, last.level >= heading.level { headings.removeLast() }; headings.append(heading); body.append(line); continue
             }
             body.append(line)

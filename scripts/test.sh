@@ -27,7 +27,7 @@ resolve_sdk() {
   fi
 
   for candidate in "${candidates[@]}"; do
-    if printf 'import Foundation\n' | swiftc -sdk "$candidate" -target "$(uname -m)-apple-macosx13.0" -typecheck - >/dev/null 2>&1; then
+    if printf 'import Foundation\n' | swiftc -sdk "$candidate" -target "$(uname -m)-apple-macosx13.0" -module-cache-path /tmp/obby-swift-cache -typecheck - >/dev/null 2>&1; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -40,5 +40,5 @@ resolve_sdk() {
 
 SDK="$(resolve_sdk)"
 mkdir -p build
-swiftc -sdk "$SDK" -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/Obby/Vault.swift Sources/Obby/Editor.swift Sources/Obby/RichMarkdown.swift Sources/Obby/Model.swift Sources/Obby/Ollama.swift Sources/Obby/ChatMemory.swift Sources/Obby/ModelSettings.swift Sources/Obby/SidebarDrag.swift Sources/Obby/AIProvider.swift Sources/Obby/Keychain.swift Sources/Obby/ContextBudget.swift Sources/Obby/NoteIndex.swift scripts/Checks.swift -o build/ObbyChecks -framework SwiftUI -framework AppKit -framework Security -module-cache-path /tmp/obby-swift-cache
+swiftc -sdk "$SDK" -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/Obby/Vault.swift Sources/Obby/Editor.swift Sources/Obby/RichMarkdown.swift Sources/Obby/Model.swift Sources/Obby/Ollama.swift Sources/Obby/ChatMemory.swift Sources/Obby/ModelSettings.swift Sources/Obby/SidebarDrag.swift Sources/Obby/AIProvider.swift Sources/Obby/Keychain.swift Sources/Obby/ContextBudget.swift Sources/Obby/NoteIndex.swift scripts/Checks.swift scripts/RegressionChecks.swift -o build/ObbyChecks -framework SwiftUI -framework AppKit -framework Security -module-cache-path /tmp/obby-swift-cache
 build/ObbyChecks

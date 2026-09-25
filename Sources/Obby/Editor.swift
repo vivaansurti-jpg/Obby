@@ -55,7 +55,9 @@ enum MarkdownTable {
         isRow(line) && cells(line).allSatisfy { $0.range(of: "^:?-{3,}:?$", options: .regularExpression) != nil }
     }
     static func insideFence(_ lines: [String], _ index: Int) -> Bool {
-        lines[..<index].filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("```") }.count % 2 == 1
+        var fence = MarkdownFence()
+        for line in lines[..<index] { _ = fence.consume(line) }
+        return fence.isOpen
     }
     /// The lines of the valid table containing line `index` (header, separator, body), or nil.
     static func table(in lines: [String], at index: Int) -> Range<Int>? {
@@ -249,9 +251,11 @@ final class PlainTextView: NSTextView {
         let fromEnd = ns.length - selectedRange().location
         var paragraphs: [NSRange] = []
         ns.enumerateSubstrings(in: ns.paragraphRange(for: safe), options: [.byParagraphs, .substringNotRequired]) { _, content, _, _ in paragraphs.append(content) }
-        let fenced = Self.insideFence(ns, before: paragraphs.first?.location ?? 0)
+        var fence = MarkdownFence()
+        for line in ns.substring(to: paragraphs.first?.location ?? 0).components(separatedBy: "\n").dropLast() { _ = fence.consume(line) }
+        let editable = paragraphs.filter { !fence.consume(ns.substring(with: $0)) }
         var changed = false
-        for paragraph in paragraphs.reversed() where !fenced && !ns.substring(with: paragraph).hasPrefix("```") {
+        for paragraph in editable.reversed() {
             let current = storage.attributedSubstring(from: paragraph)
             let fresh = RichMarkdown.parse(RichMarkdown.serialize(current))
             guard fresh.string != current.string, shouldChangeText(in: paragraph, replacementString: fresh.string) else { continue }
@@ -265,7 +269,9 @@ final class PlainTextView: NSTextView {
         if changed { setSelectedRange(NSRange(location: max(0, storage.length - fromEnd), length: 0)) }
     }
     static func insideFence(_ text: NSString, before location: Int) -> Bool {
-        text.substring(to: location).components(separatedBy: "\n").filter { $0.hasPrefix("```") }.count % 2 == 1
+        var fence = MarkdownFence()
+        for line in text.substring(to: location).components(separatedBy: "\n").dropLast() { _ = fence.consume(line) }
+        return fence.isOpen
     }
     /// Return in a list continues it (numbers count up, done items continue as open ones); Return on an empty item
     /// ends the list; Return after a heading continues in normal text.

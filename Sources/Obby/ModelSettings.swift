@@ -291,8 +291,8 @@ extension AppModel {
     /// Checks (once per session and model) whether the model supports native tool calling.
     func refreshToolSupport() async {
         let kind = provider, model = selectedModel
-        guard !model.isEmpty else { toolsAvailable = true; return }
         if kind == .openAI { toolsAvailable = activeTools; return }
+        guard !model.isEmpty else { toolsAvailable = true; return }
         let key = kind.rawValue + "/" + model
         if let cached = toolSupport[key] { toolsAvailable = cached; return }
         guard let current = try? makeProvider() else { return }

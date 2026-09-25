@@ -28,10 +28,10 @@ enum RichMarkdown {
     }
     /// Heading levels for every line of a note, tracking ``` fences.
     static func headingLevels(_ markdown: String) -> [Int?] {
-        var inFence = false
+        var fence = MarkdownFence()
         return markdown.components(separatedBy: "\n").map { line in
-            if line.hasPrefix("```") { inFence.toggle(); return nil }
-            return headingLevel(line, inFence: inFence)
+            if fence.consume(line) { return nil }
+            return headingLevel(line, inFence: false)
         }
     }
     static var baseAttributes: [NSAttributedString.Key: Any] { visual([:], block: nil) }
@@ -40,11 +40,10 @@ enum RichMarkdown {
 
     static func parse(_ markdown: String) -> NSMutableAttributedString {
         let out = NSMutableAttributedString()
-        var inFence = false
+        var fence = MarkdownFence()
         for (index, line) in markdown.components(separatedBy: "\n").enumerated() {
             if index > 0 { out.append(NSAttributedString(string: "\n")) }
-            if line.hasPrefix("```") { inFence.toggle(); out.append(NSAttributedString(string: line)); continue }
-            out.append(inFence ? NSAttributedString(string: line) : parseLine(line))
+            out.append(fence.consume(line) ? NSAttributedString(string: line) : parseLine(line))
         }
         style(out, range: NSRange(location: 0, length: out.length))
         return out

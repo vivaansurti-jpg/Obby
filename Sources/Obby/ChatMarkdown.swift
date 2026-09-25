@@ -24,6 +24,7 @@ enum ChatMarkdown {
         var blocks: [MarkdownBlock] = []
         var paragraph: [String] = []
         var code: [String]?
+        var fence = MarkdownFence()
         func flush() {
             if !paragraph.isEmpty { blocks.append(.paragraph(paragraph.joined(separator: "\n"))); paragraph = [] }
         }
@@ -33,11 +34,12 @@ enum ChatMarkdown {
             index += 1
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if code != nil {
-                if trimmed.hasPrefix("```") { blocks.append(.code(code?.joined(separator: "\n") ?? "")); code = nil }
+                _ = fence.consume(line)
+                if !fence.isOpen { blocks.append(.code(code?.joined(separator: "\n") ?? "")); code = nil }
                 else { code?.append(line) }
                 continue
             }
-            if trimmed.hasPrefix("```") { flush(); code = []; continue }
+            if fence.consume(line) { flush(); code = []; continue }
             if trimmed.isEmpty { flush(); continue }
             // Pipe table: a header row followed by a |---|---| separator. Anything else stays plain text.
             if trimmed.contains("|"), index < lines.count, isTableSeparator(lines[index]) {
@@ -565,7 +567,7 @@ struct MemorySettingsSheet: View {
                         }
                         ForEach(tasks) { task in
                             ConfirmRemovalButton(title: "Forget task: \(task.title.isEmpty ? "Untitled task" : task.title)", warning: "Deletes this task's saved conversation and memory. Your notes are kept.") {
-                                ChatStore.delete(task.id); reloadTasks()
+                                if ChatStore.delete(task.id) { reloadTasks() }
                             }
                         }
                         MemoryDangerZone(includeAll: true, showHeading: false) { reloadTasks() }
@@ -606,7 +608,7 @@ struct MemorySettingsSheet: View {
     func rename(_ id: UUID, _ title: String) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
         tasks[index].title = String(title.prefix(80))
-        ChatStore.save(tasks[index])
+        guard ChatStore.save(tasks[index]) else { return }
         if model.memory.id == id { model.memory.title = tasks[index].title }
     }
 }

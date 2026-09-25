@@ -181,3 +181,15 @@ Obby keeps a short "About me" list (up to 15 lines of at most 120 characters) in
 - **Merging**: near-duplicates are merged, a newer fact replaces an older one on the same subject ("my exam is in June" replaces "my exam is in May"), and when the list is full the oldest fact is dropped.
 - **"Remember that I…"** or **"Remember I…"** goes straight to About me; other "Remember that…" requests stay pinned to the current task.
 - **Settings → Memory**: "Obby knows N things about you · View" opens a viewer for About me, lasting preferences, folder contexts and saved tasks. Every item can be edited or removed, and About me and preferences have an Add field. **Learn about me from chats** (on by default) turns learning off; explicit "Remember that I…" still works. **Clear all AI memory** also clears About me.
+
+## Keeping memory small
+
+Each task's memory stays around 150 to 250 tokens over time:
+
+- A completed action that matches an open next step (same note name or distinctive word, for example "Created Synapses Flashcards.md" and "Generate flashcards for Synapses") removes that next step.
+- Only the last 8 completed actions are kept word for word; older ones become a count ("12 earlier actions").
+- Decisions are capped at 8, pins at 20; the oldest non-pinned items go first.
+- Files that no longer exist are marked as such, and drop out of the task after 7 days.
+- Pins and About me are never cleaned up automatically.
+
+The instructions sent to tool-capable models were also shortened (about 310 to about 150 tokens) without dropping any rule: use tools to actually do things, never claim an action that didn't succeed, read before editing, don't invent contents, find notes with search, only use tools when asked.

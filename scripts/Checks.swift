@@ -515,6 +515,31 @@ import AppKit
         check(oldMemory.preferences == ["Bullet points"] && oldMemory.aboutMe.isEmpty, "old Memory.json files still load")
         model.clearAllChatMemory()
 
+        // Trimmed tool prompt keeps every essential instruction.
+        let toolPrompt = AppModel.toolSystemPrompt(isLocal: true, note: "School/TOK.md", folder: "School")
+        for sentence in ["Use the provided tools to actually perform requested file operations.", "Never claim an action happened unless its tool succeeded.",
+                         "Read notes before editing them. Do not invent note contents.", "Only use tools when the user asks you to find, read or change notes. For greetings or general conversation, just reply.",
+                         "All paths are relative to the selected notes folder.", "Current note path: School/TOK.md.", "Selected folder: School."] {
+            check(toolPrompt.contains(sentence), "tool prompt keeps: \(sentence)")
+        }
+        check(ContextBudget.tokens(toolPrompt) <= 190, "tool prompt trimmed")
+
+        // Memory cleanup: finished next steps drop, old actions fold into a count, long-missing files expire, pins stay.
+        model.clearChat()
+        model.memory.openQuestions = ["Generate flashcards for Synapses", "Revise TOK.md introduction", "Book a library slot"]
+        model.memory.pin("Exam on 12 May")
+        model.memory.remember(action: "Created Synapses Flashcards.md.")
+        model.memory.remember(action: "Updated TOK.md.")
+        check(model.memory.openQuestions == ["Book a library slot"], "next steps cleared by matching actions")
+        for number in 1...10 { model.memory.remember(action: "Moved Note\(number).md to Archive.") }
+        check(model.memory.completedActions.count == 8 && model.memory.earlierActionCount == 4 && model.memory.packet.contains("4 earlier actions"), "older actions folded into a count")
+        model.memory.relevantFiles = ["Gone-old.md", "Gone-new.md"]
+        model.memory.missingSince = ["Gone-old.md": Date().addingTimeInterval(-8 * 24 * 3600)]
+        _ = model.memoryPacket()
+        check(!model.memory.relevantFiles.contains("Gone-old.md") && model.memory.relevantFiles.contains("Gone-new.md") && model.memory.missingSince["Gone-new.md"] != nil, "files missing over 7 days expire; newer ones are kept and marked")
+        check(model.memory.pinned == ["Exam on 12 May"], "pins are never cleaned up")
+        model.clearChat()
+
         // Chat memory: saved per chat, restored, kept across model switches, cleared without touching notes.
         model.clearChat()
         model.history = [["role": "user", "content": "Plan Biology revision"], ["role": "assistant", "content": "Start with enzymes."]]

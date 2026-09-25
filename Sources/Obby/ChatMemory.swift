@@ -194,6 +194,8 @@ struct ChatRecord: Codable, Identifiable, Equatable {
     var openQuestions: [String] = []
     var preferences: [String] = [] // Preferences the user stated for this task only.
     var pinned: [String] = [] // Facts the user pinned ("Pin to Memory", "Remember that…"). Never condensed away.
+    var earlierActionCount = 0 // Completed actions older than the last 8, folded into a count.
+    var missingSince: [String: Date] = [:] // When a remembered file was first found missing (dropped after 7 days).
     var isEmpty: Bool { recentMessages.isEmpty && summary.isEmpty && pinned.isEmpty }
     /// Structured memory items (for the small "Memory · N items" indicator).
     var itemCount: Int { (currentGoal.isEmpty ? 0 : 1) + (summary.isEmpty ? 0 : 1) + pinned.count + decisions.count + completedActions.count + openQuestions.count + preferences.count + relevantFiles.count }
@@ -207,7 +209,8 @@ struct ChatRecord: Codable, Identifiable, Equatable {
         if !summary.isEmpty { parts.append("Summary so far:\n" + summary) }
         func list(_ title: String, _ items: [String]) { if !items.isEmpty { parts.append(title + ":\n" + items.map { "- " + $0 }.joined(separator: "\n")) } }
         list("Decisions", decisions)
-        list("Completed actions", Array(completedActions.suffix(12)))
+        list("Completed actions", completedActions)
+        if earlierActionCount > 0 { parts.append("(\(earlierActionCount) earlier action\(earlierActionCount == 1 ? "" : "s") not listed)") }
         list("Open questions and next steps", openQuestions)
         list("Preferences for this task", preferences)
         let present = relevantFiles.filter { !missing.contains($0) }
@@ -225,7 +228,37 @@ struct ChatRecord: Codable, Identifiable, Equatable {
         guard !file.isEmpty else { return }
         relevantFiles.removeAll { $0 == file }; relevantFiles.insert(file, at: 0); relevantFiles = Array(relevantFiles.prefix(12))
     }
-    mutating func remember(action: String) { completedActions.append(action); completedActions = Array(completedActions.suffix(30)) }
+    /// Records a completed action, clears next steps it completes, and keeps only the last 8 actions verbatim.
+    mutating func remember(action: String) {
+        completedActions.append(action)
+        let done = Self.keyTerms(action)
+        if !done.isEmpty { openQuestions.removeAll { !Self.keyTerms($0).isDisjoint(with: done) } }
+        if completedActions.count > 8 { earlierActionCount += completedActions.count - 8; completedActions = Array(completedActions.suffix(8)) }
+    }
+    /// Distinctive words for matching an action to a next step: note names and longer words that aren't generic verbs.
+    static func keyTerms(_ text: String) -> Set<String> {
+        let generic: Set<String> = ["created", "create", "updated", "update", "added", "adding", "moved", "renamed", "section", "folder", "notes",
+                                    "note", "file", "files", "trash", "generate", "write", "make", "read", "check", "checked", "their", "there", "about", "these", "those"]
+        let lowered = text.lowercased()
+        var terms = Set(lowered.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count >= 5 && !generic.contains($0) })
+        if let regex = try? NSRegularExpression(pattern: "([\\p{L}\\p{N} _-]+)\\.md") { // "TOK.md" → "tok"
+            for match in regex.matches(in: lowered, range: NSRange(lowered.startIndex..., in: lowered)) {
+                if let range = Range(match.range(at: 1), in: lowered) {
+                    terms.formUnion(lowered[range].split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { !generic.contains($0) })
+                }
+            }
+        }
+        return terms
+    }
+    /// Files missing for more than 7 days drop out of the task. Pins and About me are never touched.
+    mutating func expireMissing(_ missing: Set<String>, now: Date = Date()) {
+        for path in missing where missingSince[path] == nil { missingSince[path] = now }
+        for path in missingSince.keys where !missing.contains(path) { missingSince.removeValue(forKey: path) }
+        let expired = Set(missingSince.filter { now.timeIntervalSince($0.value) > 7 * 24 * 3600 }.keys)
+        guard !expired.isEmpty else { return }
+        relevantFiles.removeAll { expired.contains($0) }
+        for path in expired { missingSince.removeValue(forKey: path) }
+    }
 }
 
 extension ChatRecord {
@@ -247,6 +280,8 @@ extension ChatRecord {
         openQuestions = try c.decodeIfPresent([String].self, forKey: .openQuestions) ?? []
         preferences = try c.decodeIfPresent([String].self, forKey: .preferences) ?? []
         pinned = try c.decodeIfPresent([String].self, forKey: .pinned) ?? []
+        earlierActionCount = try c.decodeIfPresent(Int.self, forKey: .earlierActionCount) ?? 0
+        missingSince = try c.decodeIfPresent([String: Date].self, forKey: .missingSince) ?? [:]
     }
 }
 
@@ -420,7 +455,7 @@ extension AppModel {
         let request = """
         Update this task's memory. Reply with JSON only, using exactly these keys: \
         "summary" (at most 120 words, facts needed to continue the task), "currentGoal" (one sentence), \
-        "decisions" (array, at most 6), "openQuestions" (array, at most 6 unresolved next steps), \
+        "decisions" (array, at most 8), "openQuestions" (array, at most 6 unresolved next steps), \
         "preferences" (array, at most 5: how the user wants THIS task done, only if they said so), \
         "globalPreferences" (array, at most 3: only preferences the user explicitly said apply from now on or always; otherwise []), \
         "aboutUser" (array, at most 3 short facts the user explicitly STATED about themselves in their own messages, such as their subjects, \
@@ -444,7 +479,7 @@ extension AppModel {
             }
             if let summary = json["summary"] as? String, !summary.isEmpty { memory.summary = ChatMemory.clipped(summary, limit: 1_200); updated = true }
             if let goal = json["currentGoal"] as? String, !goal.isEmpty { memory.currentGoal = ChatMemory.clipped(goal, limit: 240) }
-            if let decisions = items("decisions", 6) { memory.decisions = decisions }
+            if let decisions = items("decisions", 8) { memory.decisions = decisions }
             if let questions = items("openQuestions", 6) { memory.openQuestions = questions }
             if let preferences = items("preferences", 5) { memory.preferences = preferences }
             if let facts = items("aboutUser", 3), !facts.isEmpty { learnAboutUser(facts, statedIn: prompt) }
@@ -602,6 +637,8 @@ extension AppModel {
         var missing: Set<String> = []
         if let vault {
             for path in memory.relevantFiles where ((try? vault.resolve(path)).map { !FileManager.default.fileExists(atPath: $0.path) } ?? true) { missing.insert(path) }
+            memory.expireMissing(missing)
+            missing.formIntersection(memory.relevantFiles)
         }
         return [globalMemory.packet, folderContextPacket(), memory.packet(missing: missing)].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }

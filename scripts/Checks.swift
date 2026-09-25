@@ -39,7 +39,7 @@ import AppKit
         check(Format.bold.apply(to: "🙂yes", range: NSRange(location: 2, length: 3)).0 == "🙂**yes**", "Unicode selection")
         let model = AppModel(restoreState: false); model.timer?.invalidate(); model.vault = vault
         model.relatedNotesLocal = false; model.relatedNotesCloud = false // Related notes are checked on their own below.
-        model.provider = .ollama; model.selectedModel = "" // Start from Ollama whatever an earlier (interrupted) run saved.
+        model.provider = .ollama; model.activeCustomID = nil; model.selectedModel = "" // Start from Ollama whatever an earlier (interrupted) run saved.
         model.openNote("School/Revision.md"); model.text = "Autosaved"; check(model.save(), "autosave")
         check(try vault.read("School/Revision.md") == "Autosaved", "autosave disk")
         model.text = "First keystroke"
@@ -652,18 +652,18 @@ import AppKit
         func toolCall(_ name: String, _ arguments: [String: Any]) -> [String: Any] {
             ["message": ["role": "assistant", "content": "", "tool_calls": [["function": ["name": name, "arguments": arguments]]]]]
         }
-        var sentBodies: [[String: Any]] = []
+        var repeatBodies: [[String: Any]] = []
         model.streamReplies = false; model.toolSupport = [:]
         model.requestOverride = { route, body in
             if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
             guard route == "/api/chat" else { return [:] }
-            sentBodies.append(body)
+            repeatBodies.append(body)
             return toolCall("create_file", ["path": "X", "content": "Una historia."])
         }
         model.clearChat()
         model.send("create five folders Z to V, each with a story note")
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
-        let toolMessages = sentBodies.last.flatMap { $0["messages"] as? [[String: Any]] }?.filter { $0["role"] as? String == "tool" }.compactMap { $0["content"] as? String } ?? []
+        let toolMessages = repeatBodies.last.flatMap { $0["messages"] as? [[String: Any]] }?.filter { $0["role"] as? String == "tool" }.compactMap { $0["content"] as? String } ?? []
         check(toolMessages.count >= 3 && toolMessages[2].contains("already failed twice") && !toolMessages[1].contains("already failed twice"), "an identical failing call is blocked on the third attempt")
         let failureLines = model.chat.filter { $0.role == "Action" && $0.unsuccessful }
         check(failureLines.count == 1 && failureLines[0].text.hasPrefix("Couldn’t create X.") && failureLines[0].text.hasSuffix("×5"), "repeated failure lines collapse into one with a count")
@@ -702,6 +702,47 @@ import AppKit
         check(ChatStore.files().isEmpty && model.globalMemory.preferences.isEmpty && !FileManager.default.fileExists(atPath: GlobalMemory.file.path) && (try? vault.read("School/Revision.md")) != nil, "clearing memory keeps notes")
         let legacy = Data(#"{"id":"\#(UUID().uuidString)","title":"Old","summary":"Earlier task"}"#.utf8)
         check((try? JSONDecoder().decode(ChatRecord.self, from: legacy))?.summary == "Earlier task", "older memory files still load")
+        // Saved OpenAI-compatible providers (network stubbed; the user's own saved providers are restored afterwards)
+        let savedKeys = ["customProviders", "activeCustomProvider", "aiProvider", "model.openai"]
+        let savedDefaults = savedKeys.map { UserDefaults.standard.object(forKey: $0) }
+        let savedList = model.customProviders, savedUnload = model.unloadPrevious
+        defer {
+            for (key, value) in zip(savedKeys, savedDefaults) { if let value { UserDefaults.standard.set(value, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) } }
+            CustomProvider.saveAll(savedList)
+        }
+        model.customProviders = []; model.unloadPrevious = false
+        model.requestOverride = { _, _ in ["models": []] } // Ollama is never contacted when switching back.
+        var customRequests: [(URL, [String: String])] = []
+        RemoteHTTP.override = { url, headers, _ in customRequests.append((url, headers)); return ["data": [["id": "listed-model"]]] }
+        check(CustomProvider.presets.allSatisfy { $0.url.isEmpty || (try? RemoteHTTP.validatedBase($0.url)) != nil }, "provider presets are valid base URLs")
+        do { try await model.addCustomProvider(name: " ", baseURL: "https://example.com/v1", key: "", tools: true); fatalError("Not blocked: saved provider without a name") } catch { count += 1; print("PASS saved provider needs a name") }
+        do { try await model.addCustomProvider(name: "Plain", baseURL: "http://example.com/v1", key: "", tools: true); fatalError("Not blocked: remote http saved provider") } catch { count += 1; print("PASS saved provider rejects remote http") }
+        check(model.customProviders.isEmpty, "rejected providers are not saved")
+        try await model.addCustomProvider(name: "Server A", baseURL: "https://a.example.com/v1/", key: "key-a", tools: true)
+        try await model.addCustomProvider(name: "Server B", baseURL: "https://b.example.com/v1", key: "key-b", tools: false)
+        let serverA = model.customProviders[0], serverB = model.customProviders[1]
+        check(model.provider == .openAI && model.activeCustom?.id == serverB.id && model.providerName == "Server B", "adding a provider switches to it")
+        check(serverA.baseURL == "https://a.example.com/v1" && !model.activeTools && !model.toolsAvailable, "saved provider URL and tool setting applied")
+        check(Keychain.read(serverA.keychainAccount) == "key-a" && Keychain.read(serverB.keychainAccount) == "key-b", "each saved provider has its own Keychain key")
+        let storedList = String(decoding: UserDefaults.standard.data(forKey: "customProviders") ?? Data(), as: UTF8.self)
+        check(storedList.contains("Server B") && !storedList.contains("key-a") && !storedList.contains("key-b"), "API keys never stored in settings")
+        let lastList = customRequests.last
+        check(lastList?.0.host == "b.example.com" && lastList?.1["Authorization"] == "Bearer key-b" && model.models == ["listed-model"], "requests use the active provider's URL and key")
+        check(CustomProvider.launchActiveID == serverB.id && CustomProvider.launchModelKey == serverB.modelKey, "active saved provider restored at launch")
+        model.selectedModel = "b-model"; model.persistSettings()
+        await model.switchProvider(.openAI, custom: serverA.id)
+        check(model.activeCustom?.id == serverA.id && model.selectedModel != "b-model" && customRequests.last?.1["Authorization"] == "Bearer key-a", "switching between saved providers")
+        model.selectedModel = "a-model"; model.persistSettings()
+        await model.switchProvider(.openAI, custom: serverB.id)
+        check(model.selectedModel == "b-model", "each saved provider keeps its own model")
+        await model.switchProvider(.openAI)
+        check(model.activeCustom == nil && model.providerName == ProviderKind.openAI.label && model.activeBaseURL == model.openAIBaseURL, "built-in OpenAI-compatible still selectable")
+        await model.removeCustomProvider(serverA)
+        await model.switchProvider(.openAI, custom: serverB.id)
+        await model.removeCustomProvider(serverB)
+        check(model.provider == .ollama && model.activeCustom == nil && model.customProviders.isEmpty, "removing the provider in use returns to Ollama")
+        check(!Keychain.exists(serverA.keychainAccount) && !Keychain.exists(serverB.keychainAccount) && UserDefaults.standard.object(forKey: serverB.modelKey) == nil, "removing a provider deletes its key and model")
+        RemoteHTTP.override = nil; model.requestOverride = nil; model.unloadPrevious = savedUnload
         print("All \(count) checks passed")
     }
     /// A one-page PDF with selectable text (Helvetica), written by hand so the checks need no fixtures.

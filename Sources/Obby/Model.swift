@@ -35,7 +35,9 @@ import AppKit
 
     @Published var endpoint: String = UserDefaults.standard.string(forKey: "ollamaURL") ?? "http://localhost:11434"
     @Published var provider = ProviderKind.stored
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: ProviderKind.stored.modelKey) ?? ""
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: CustomProvider.launchModelKey) ?? ""
+    @Published var customProviders = CustomProvider.loadAll() // Saved OpenAI-compatible endpoints (DeepSeek, a VPS…)
+    @Published var activeCustomID: UUID? = CustomProvider.launchActiveID // Set only while provider is .openAI
     @Published var openAIBaseURL = UserDefaults.standard.string(forKey: "openAIBaseURL") ?? "https://api.openai.com/v1"
     @Published var openAITools = UserDefaults.standard.object(forKey: "openAITools") as? Bool ?? true
     @Published var toolsAvailable = true
@@ -384,7 +386,7 @@ import AppKit
         } catch { self.error = error.localizedDescription }
     }
     func search() { perform { results = try vault?.search(query) ?? [] } }
-    func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: provider.modelKey); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe"); UserDefaults.standard.set(streamReplies, forKey: "streamReplies") }
+    func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: activeModelKey); UserDefaults.standard.set(activeCustom?.id.uuidString, forKey: "activeCustomProvider"); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe"); UserDefaults.standard.set(streamReplies, forKey: "streamReplies") }
 }
 struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil; var base = ""; var repeats = 1 }
 /// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.

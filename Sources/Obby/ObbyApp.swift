@@ -264,6 +264,7 @@ struct AIView: View {
     @EnvironmentObject var model: AppModel
     @State var prompt = ""
     @State var showMemory = false
+    @State private var showProviders = false
     @FocusState private var promptFocused: Bool
     @StateObject private var speech = SpeechInput()
     @State private var atBottom = true // The end of the chat is on screen; streamed text is followed only then.
@@ -273,73 +274,43 @@ struct AIView: View {
             HStack(spacing: 8) {
                 Text("Obby AI").font(.headline).fixedSize()
                 Spacer(minLength: 0)
-                Button { showMemory = true } label: {
-                    Image(systemName: "brain")
-                        .overlay(alignment: .topTrailing) {
-                            Text("\(model.memory.itemCount + model.globalMemory.preferences.count)").font(.system(size: 8, weight: .semibold))
-                                .padding(2).background(.regularMaterial, in: Capsule()).offset(x: 7, y: -7)
-                        }
-                }.buttonStyle(.plain).help("Memory").accessibilityLabel("Memory, \(model.memory.itemCount + model.globalMemory.preferences.count) items")
-                    .popover(isPresented: $showMemory, arrowEdge: .bottom) { MemoryPopover().environmentObject(model) }
-                if !model.savedChats.isEmpty {
-                    Menu {
-                        ForEach(model.savedChats) { record in
-                            Button("\(record.title.isEmpty ? "Untitled chat" : record.title) (\(record.updatedAt.formatted(date: .abbreviated, time: .shortened)))") { model.openChat(record) }
-                                .disabled(record.id == model.memory.id)
-                        }
-                    } label: { Image(systemName: "clock") }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().disabled(model.busy)
-                    .help("Chat history").accessibilityLabel("Chat history")
-                }
-                Button { model.clearChat() } label: { Image(systemName: "square.and.pencil") }.buttonStyle(.plain).help("New chat").accessibilityLabel("New chat")
                 Menu {
-                    Toggle("Show technical action details", isOn: $model.showRawActions)
+                    Button {
+                        DispatchQueue.main.async { showMemory = true } // After the menu closes, so the popover can open.
+                    } label: { Label("Memory (\(model.memory.itemCount + model.globalMemory.preferences.count) items)…", systemImage: "brain") }
+                    Button { model.clearChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
+                    if !model.savedChats.isEmpty {
+                        Menu {
+                            ForEach(model.savedChats) { record in
+                                Button("\(record.title.isEmpty ? "Untitled chat" : record.title) (\(record.updatedAt.formatted(date: .abbreviated, time: .shortened)))") { model.openChat(record) }
+                                    .disabled(record.id == model.memory.id)
+                            }
+                        } label: { Label("Chat History", systemImage: "clock.arrow.circlepath") }.disabled(model.busy)
+                    }
+                    Divider()
+                    Toggle(isOn: $model.showRawActions) { Label("Show technical action details", systemImage: "curlybraces") }
                         .help("Shows the request and result for each action. This does not change your notes or what the AI can do.")
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("More").accessibilityLabel("More")
+                    .popover(isPresented: $showMemory, arrowEdge: .bottom) { MemoryPopover().environmentObject(model) }
             }
-            HStack(spacing: 6) {
-                Circle().fill(model.connected ? Color.green : Color.secondary).frame(width: 8, height: 8)
-                    .help(model.connected ? "Provider connected" : "Provider not connected")
-                Menu {
-                    ForEach(ProviderKind.allCases) { provider in
-                        Button {
-                            Task { await model.switchProvider(provider) }
-                        } label: {
-                            if provider == model.provider { Label(provider.label, systemImage: "checkmark") }
-                            else { Text(provider.label) }
-                        }.disabled(model.busy || model.switchingModel)
-                    }
-                    Divider()
-                    Button("Refresh connection and models") { Task { await model.connect(launch: true) } }
-                        .disabled(model.busy || model.switchingModel)
-                    Text(model.connected ? "Connected" : "Not connected")
-                    if model.busy { Text("Stop the current response to switch providers.") }
-                    if model.switchingModel { Text("Switching model. Please wait.") }
-                } label: { Text(model.provider.label).lineLimit(1) }
-                    .menuStyle(.borderlessButton).menuIndicator(.visible)
-                    .help("Choose AI provider")
-                Spacer(minLength: 0)
-                Text(model.connected ? "Connected" : "Not connected").font(.caption).foregroundStyle(.secondary)
+            // Provider control: "Ollama ● Connected ▾". The whole row is one button that opens a native menu
+            // drop-down anchored under the row, so the coloured dot can be shown and every part of the row is clickable.
+            Button { showProviders.toggle() } label: {
+                HStack(spacing: 6) {
+                    Text(model.providerName).lineLimit(1)
+                    Circle().fill(model.connected ? Color.green : Color.secondary).frame(width: 7, height: 7)
+                    Text(model.startingOllama ? "Connecting…" : model.connected ? "Connected" : "Not connected")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                }.contentShape(Rectangle())
             }
-            Menu {
-                ForEach(model.modelChoices, id: \.self) { name in
-                    Button { model.modelSelection.wrappedValue = name } label: {
-                        if name == model.selectedModel { Label(name, systemImage: "checkmark") }
-                        else { Text(name) }
-                    }.disabled(model.busy || model.switchingModel)
-                }
-                if model.modelChoices.isEmpty { Text("No models found. Refresh the connection.") }
-                Divider()
-                Button("Refresh models") { Task { await model.connect(launch: true) } }
-                    .disabled(model.busy || model.switchingModel)
-                Text(model.modelStatus)
-                if model.busy { Text("Stop the current response to switch models.") }
-                if model.switchingModel { Text("Switching model. Please wait.") }
-            } label: {
-                Text(model.selectedModel.isEmpty ? "Choose a model" : model.selectedModel)
-                    .lineLimit(1).truncationMode(.middle).frame(maxWidth: .infinity, alignment: .leading)
-            }.menuStyle(.borderlessButton).menuIndicator(.visible).help("Choose AI model")
+            .buttonStyle(.plain).fixedSize()
+            .popover(isPresented: $showProviders, arrowEdge: .bottom) {
+                ProviderMenu(close: { showProviders = false }).environmentObject(model)
+            }
+            .accessibilityLabel("\(model.providerName), \(model.connected ? "connected" : "not connected")")
+            .help("Choose AI provider")
             if model.provider == .ollama, let issue = model.ollamaIssue { OllamaIssueView(issue: issue) }
             if !model.toolsAvailable && !model.selectedModel.isEmpty {
                 Text("Chat only: can work with the current note, but cannot use vault tools").font(.caption).foregroundStyle(.secondary)
@@ -364,7 +335,7 @@ struct AIView: View {
                         } else if model.chat.isEmpty, let related = model.relatedTask {
                             Button("Continue: \(related.title.isEmpty ? "earlier task" : related.title)") { model.openChat(related) }
                                 .buttonStyle(.link).font(.caption).padding(.top, 12).help("Reopen the earlier task that worked on this note")
-                        } else if model.chat.isEmpty { Text(model.isLocalProvider ? "Ask a question, summarize a note, or organize your folders. Obby uses your local \(model.provider.label) model." : "Ask a question, summarize a note, or organize your folders. Obby uses \(model.provider.label); only what a request needs is sent.").foregroundStyle(.secondary).padding(.top, 12) }
+                        } else if model.chat.isEmpty { Text(model.isLocalProvider ? "Ask a question, summarize a note, or organize your folders. Obby uses your local \(model.providerName) model." : "Ask a question, summarize a note, or organize your folders. Obby uses \(model.providerName); only what a request needs is sent.").foregroundStyle(.secondary).padding(.top, 12) }
                         // Presentation only: Obby renders the model's Markdown and its own action summaries; nothing here goes back to the model.
                         ForEach(ChatGroup.groups(model.chat)) { group in
                             if group.isActions {
@@ -406,22 +377,49 @@ struct AIView: View {
             if speech.listening {
                 Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
             }
-            HStack(alignment: .bottom, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 11) {
+                // Model picker, attached to the composer on the left (same switching logic as before).
+                Menu {
+                    ForEach(model.modelChoices, id: \.self) { name in
+                        Button { model.modelSelection.wrappedValue = name } label: {
+                            let shown = model.provider == .ollama && model.loadedModels.contains(name) ? "\(name)  (loaded)" : name
+                            if name == model.selectedModel { Label(shown, systemImage: "checkmark") }
+                            else { Text(shown) }
+                        }.disabled(model.busy || model.switchingModel)
+                    }
+                    if model.modelChoices.isEmpty { Text("No models found. Refresh the connection.") }
+                    Divider()
+                    Button("Refresh models") { Task { await model.connect(launch: true) } }
+                        .disabled(model.busy || model.switchingModel)
+                    Text(model.modelStatus)
+                    if model.busy { Text("Stop the current response to switch models.") }
+                    if model.switchingModel { Text("Switching model. Please wait.") }
+                } label: {
+                    Text(model.selectedModel.isEmpty ? "Choose a model" : model.selectedModel)
+                        .lineLimit(1).truncationMode(.middle)
+                }.menuStyle(.borderlessButton).menuIndicator(.visible).font(.caption).foregroundStyle(.secondary).frame(width: 104, alignment: .leading).fixedSize(horizontal: false, vertical: true).help("Choose AI model")
+                // Read-only status from the existing /api/ps check; updating it never loads or unloads a model.
+                if let status = modelLoadStatus {
+                    Text("· " + status).font(.caption).foregroundStyle(.secondary).lineLimit(1).fixedSize()
+                        .padding(.bottom, 2).help(status == "Offline" ? "\(model.providerName) is not reachable" : "Model is \(status.lowercased()) in memory")
+                }
+                Divider().frame(height: 18)
                 // The prompt grows to about seven lines, then scrolls; text added at the end (typing, dictation) stays in view.
                 ScrollViewReader { promptProxy in
                     ScrollView(.vertical) {
                         VStack(spacing: 0) {
                             TextField("Ask Obby…", text: $prompt, axis: .vertical).lineLimit(2...).textFieldStyle(.plain).focused($promptFocused).onSubmit { submit() }
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .background(GeometryReader { Color.clear.preference(key: PromptHeightKey.self, value: $0.size.height) })
                             Color.clear.frame(height: 1).id("promptEnd")
                         }
                     }
-                    .frame(height: min(max(promptHeight, 20), 140))
+                    .frame(maxWidth: .infinity).frame(height: min(max(promptHeight, 24), 140))
                     .onPreferenceChange(PromptHeightKey.self) { promptHeight = $0 }
                     .onChange(of: prompt) { [prompt] new in
                         if new.count > prompt.count, new.hasPrefix(prompt) { promptProxy.scrollTo("promptEnd", anchor: .bottom) }
                     }
-                }
+                }.frame(maxWidth: .infinity).layoutPriority(1) // The prompt takes all remaining width; the controls stay fixed.
                 // In-app speech input (on-device when available): live text, Obby's own indicator, no system chime.
                 // Falls back to macOS Dictation if speech or microphone access is declined or unavailable.
                 Button {
@@ -437,16 +435,24 @@ struct AIView: View {
                 }
                 .buttonStyle(.borderless).help(speech.listening ? "Stop dictation" : "Dictate")
                 .accessibilityLabel(speech.listening ? "Stop dictation" : "Dictate").disabled(model.busy && !speech.listening)
-                QuickActionsMenu()
+                .fixedSize()
+                QuickActionsMenu().fixedSize()
                 Button { submit() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
-                    .buttonStyle(.plain).help("Send").accessibilityLabel("Send")
+                    .buttonStyle(.plain).fixedSize().help("Send").accessibilityLabel("Send")
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(model.busy || model.switchingModel || model.selectedModel.isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }.padding(10).background(.background, in: RoundedRectangle(cornerRadius: 8))
-                .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.separator) }
+            }.padding(.horizontal, 14).padding(.vertical, 12).background(.background, in: RoundedRectangle(cornerRadius: 9))
+                .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(.separator) }
         }.padding(14)
-        .onAppear { prompt = model.aiDraft } // An unsent draft survives hiding the panel.
+        .onAppear { prompt = model.aiDraft; Task { await model.refreshModelStatus() } } // Draft survives hiding the panel; load state is checked once when shown.
         .onDisappear { model.aiDraft = prompt; speech.stop() }
+    }
+    /// "Loaded" / "Unloaded" for Ollama, "Offline" when the provider can't be reached; nil when there is nothing to show.
+    var modelLoadStatus: String? {
+        guard !model.selectedModel.isEmpty else { return nil }
+        if !model.connected && !model.startingOllama { return "Offline" }
+        guard model.provider == .ollama, model.connected else { return nil }
+        return model.loadedModels.contains(model.selectedModel) ? "Loaded" : "Unloaded"
     }
     func submit() {
         guard !model.busy, !model.switchingModel, !model.selectedModel.isEmpty else { return }
@@ -462,6 +468,12 @@ struct SettingsView: View {
     @State var baseURL = ""
     @State var apiKey = ""
     @State var manualModel = ""
+    @State private var presetIndex = 0
+    @State private var newName = ""
+    @State private var newURL = ""
+    @State private var newKey = ""
+    @State private var newTools = true
+    @State private var addError: String?
     var providerSelection: Binding<ProviderKind> {
         Binding(get: { model.provider }, set: { next in Task { await model.switchProvider(next); syncDrafts() } })
     }
@@ -499,9 +511,10 @@ struct SettingsView: View {
                 Picker("AI provider", selection: providerSelection) {
                     ForEach(ProviderKind.allCases) { Text($0.label).tag($0) }
                 }.disabled(model.busy || model.switchingModel)
-                Text(model.isLocalProvider ? "\(model.provider.label) runs on this Mac." : "Relevant notes may be sent to \(model.provider.label).")
+                Text(model.isLocalProvider ? "\(model.providerName) runs on this Mac." : "Relevant notes may be sent to \(model.providerName).")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            savedProvidersSection
             Section("Model") {
                 if model.provider == .ollama {
                     Picker("Selected model", selection: model.modelSelection) {
@@ -517,7 +530,7 @@ struct SettingsView: View {
                         Button("Apply") { applyModel() }.disabled(model.busy || model.switchingModel)
                     }
                 }
-                if model.provider == .openAI {
+                if model.provider == .openAI && model.activeCustom == nil {
                     Toggle("Model supports tool calling", isOn: $model.openAITools)
                         .onChange(of: model.openAITools) { _ in model.persistSettings(); Task { await model.refreshToolSupport() } }
                 }
@@ -558,7 +571,7 @@ struct SettingsView: View {
                 Text("Shows each action's request and result in the chat. This only changes the display.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if model.provider != .ollama, model.hasAPIKey {
+            if model.provider != .ollama, model.activeCustom == nil, model.hasAPIKey {
                 Section {
                     DangerZone {
                         ConfirmRemovalButton(title: "Remove API key", warning: "Removes the saved key for \(model.provider.label). You will need to add it again to use this provider.") { model.removeAPIKey() }
@@ -567,8 +580,62 @@ struct SettingsView: View {
             }
         }.formStyle(.grouped)
     }
+    /// Saved OpenAI-compatible providers: each has its own name, base URL and Keychain key, and appears in the AI panel's provider menu.
+    var savedProvidersSection: some View {
+        Section("Saved Providers") {
+            ForEach(model.customProviders) { entry in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(entry.name)
+                        Text(entry.baseURL).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer()
+                    if model.activeCustom?.id == entry.id { Text("In use").font(.caption).foregroundStyle(.secondary) }
+                    else { Button("Use") { Task { await model.switchProvider(.openAI, custom: entry.id); syncDrafts() } } }
+                    Button("Remove", role: .destructive) { Task { await model.removeCustomProvider(entry); syncDrafts() } }
+                }.disabled(model.busy || model.switchingModel)
+            }
+            Picker("Service", selection: $presetIndex) {
+                ForEach(CustomProvider.presets.indices, id: \.self) { Text(CustomProvider.presets[$0].name).tag($0) }
+            }.onChange(of: presetIndex) { index in
+                let preset = CustomProvider.presets[index]
+                newName = index == 0 ? "" : preset.name; newURL = preset.url
+            }
+            TextField("Name", text: $newName, prompt: Text("For example, My Server"))
+            TextField("Base URL", text: $newURL, prompt: Text("https://your-server.com/v1"))
+            SecureField("API key", text: $newKey, prompt: Text("Optional for servers without a key"))
+            Toggle("Model supports tool calling", isOn: $newTools)
+            HStack {
+                Spacer()
+                Button("Add Provider") { addProvider() }
+                    .disabled(model.busy || model.switchingModel || newName.trimmingCharacters(in: .whitespaces).isEmpty || newURL.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if let addError { Text(addError).foregroundStyle(.red) }
+            Text("Add any OpenAI-compatible service, such as DeepSeek, OpenRouter, Groq or Mistral, or your own server. Each provider keeps its own API key in your macOS Keychain.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+    func addProvider() {
+        let (name, url, key, tools) = (newName, newURL, newKey, newTools)
+        Task {
+            do {
+                try await model.addCustomProvider(name: name, baseURL: url, key: key, tools: tools)
+                addError = nil; presetIndex = 0; newName = ""; newURL = ""; newKey = ""; newTools = true
+                syncDrafts()
+            } catch { addError = error.localizedDescription }
+        }
+    }
     var cloudSection: some View {
-        Section(model.provider.label) {
+        Section(model.providerName) {
+            if let custom = model.activeCustom {
+                Text(custom.baseURL).font(.caption).foregroundStyle(.secondary)
+                Text("This is a saved provider. To change it, remove it and add it again under Saved Providers.").font(.caption).foregroundStyle(.secondary)
+                if let error = model.modelSettingsError { Text(error).foregroundStyle(.red) }
+            } else { builtInCloudFields }
+        }
+    }
+    @ViewBuilder var builtInCloudFields: some View {
+        Group {
             if model.provider == .openAI {
                 HStack {
                     TextField("Base URL", text: $baseURL).onSubmit { applyBaseURL() }
@@ -748,5 +815,77 @@ struct WindowCloseGuard: NSViewRepresentable {
         request?.endAudio(); task?.finish()
         request = nil; task = nil
         listening = false; level = 0
+    }
+}
+
+/// Provider drop-down: providers that are ready to use (Ollama, or a cloud provider with a saved key).
+/// Switching uses the existing switchProvider logic. With nothing else set up, it points to Settings.
+struct ProviderMenu: View {
+    @EnvironmentObject var model: AppModel
+    var close: () -> Void
+    var available: [ProviderKind] {
+        ProviderKind.allCases.filter { kind in
+            switch kind {
+            case .ollama: return true
+            case .openAI: return (model.provider == .openAI && model.activeCustom == nil) || Keychain.exists(kind.rawValue)
+                || model.openAIBaseURL != "https://api.openai.com/v1" // A keyless local server counts as set up.
+            default: return kind == model.provider || Keychain.exists(kind.rawValue)
+            }
+        }
+    }
+    /// One clearly separate action row: icon, label, and a light rounded background.
+    func actionLabel(_ title: String, systemImage: String) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: systemImage).frame(width: 14)
+            Text(title)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(RoundedRectangle(cornerRadius: 6))
+    }
+    func row(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button { close(); action() } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark").opacity(selected ? 1 : 0)
+                Text(title)
+                Spacer(minLength: 0)
+            }.contentShape(Rectangle()).padding(.vertical, 3)
+        }.buttonStyle(.plain)
+    }
+    var body: some View {
+        let locked = model.busy || model.switchingModel
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(available) { provider in
+                row(provider.label, selected: provider == model.provider && model.activeCustom == nil) {
+                    Task { await model.switchProvider(provider) }
+                }.disabled(locked)
+            }
+            ForEach(model.customProviders) { entry in
+                row(entry.name, selected: model.activeCustom?.id == entry.id) {
+                    Task { await model.switchProvider(.openAI, custom: entry.id) }
+                }.disabled(locked)
+            }
+            if available.count + model.customProviders.count <= 1 {
+                Text("No other providers are available.").font(.caption).foregroundStyle(.secondary).padding(.top, 4)
+            }
+            Divider().padding(.vertical, 4)
+            VStack(alignment: .leading, spacing: 6) {
+                Button { close(); Task { await model.connect(launch: true) } } label: {
+                    actionLabel("Refresh connection and models", systemImage: "arrow.clockwise")
+                }.buttonStyle(.plain).disabled(locked)
+                Group {
+                    if #available(macOS 14.0, *) {
+                        SettingsLink { actionLabel("Set up another provider in Settings…", systemImage: "gearshape") }
+                    } else {
+                        Button { NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) } label: {
+                            actionLabel("Set up another provider in Settings…", systemImage: "gearshape")
+                        }
+                    }
+                }.buttonStyle(.plain).simultaneousGesture(TapGesture().onEnded { close() })
+            }
+            if model.busy { Text("Stop the current response to switch providers.").font(.caption).foregroundStyle(.secondary) }
+            if model.switchingModel { Text("Switching model. Please wait.").font(.caption).foregroundStyle(.secondary) }
+        }.padding(10).frame(minWidth: 230, alignment: .leading)
     }
 }

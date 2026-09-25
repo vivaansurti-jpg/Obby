@@ -42,7 +42,7 @@ extension AppModel {
             await refreshToolSupport(); await refreshContextCap()
             return
         }
-        hasAPIKey = Keychain.exists(kind.rawValue)
+        hasAPIKey = Keychain.exists(activeKeyAccount)
         do {
             let list = try await makeProvider().listModels()
             guard kind == provider else { return }

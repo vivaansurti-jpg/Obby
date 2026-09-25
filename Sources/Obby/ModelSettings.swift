@@ -28,7 +28,67 @@ enum ModelKeepAlive: String, CaseIterable {
     }
 }
 
+/// A saved OpenAI-compatible endpoint (DeepSeek, OpenRouter, Groq, a VPS…). Only name, URL and the tools
+/// flag are stored in UserDefaults; the API key lives in the Keychain under "custom.<id>".
+struct CustomProvider: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var baseURL: String
+    var tools = true
+    var keychainAccount: String { "custom." + id.uuidString }
+    var modelKey: String { "model.custom." + id.uuidString }
+    static func loadAll() -> [CustomProvider] {
+        UserDefaults.standard.data(forKey: "customProviders").flatMap { try? JSONDecoder().decode([CustomProvider].self, from: $0) } ?? []
+    }
+    static func saveAll(_ list: [CustomProvider]) { UserDefaults.standard.set(try? JSONEncoder().encode(list), forKey: "customProviders") }
+    /// The saved provider in use at launch (only when the stored provider is OpenAI-compatible and it still exists).
+    static var launchActiveID: UUID? {
+        guard ProviderKind.stored == .openAI, let id = UserDefaults.standard.string(forKey: "activeCustomProvider").flatMap(UUID.init(uuidString:)) else { return nil }
+        return loadAll().contains { $0.id == id } ? id : nil
+    }
+    static var launchModelKey: String {
+        guard let id = launchActiveID else { return ProviderKind.stored.modelKey }
+        return "model.custom." + id.uuidString
+    }
+    /// Form presets: they only fill in the name and base URL.
+    static let presets: [(name: String, url: String)] = [
+        ("Custom or own server", ""),
+        ("DeepSeek", "https://api.deepseek.com/v1"),
+        ("OpenRouter", "https://openrouter.ai/api/v1"),
+        ("Groq", "https://api.groq.com/openai/v1"),
+        ("Mistral", "https://api.mistral.ai/v1"),
+        ("Together AI", "https://api.together.xyz/v1"),
+        ("LM Studio (this Mac)", "http://localhost:1234/v1"),
+    ]
+}
+
 extension AppModel {
+    var activeCustom: CustomProvider? { provider == .openAI ? customProviders.first { $0.id == activeCustomID } : nil }
+    /// Display name for the active provider: a saved provider's own name, otherwise the built-in label.
+    var providerName: String { activeCustom?.name ?? provider.label }
+    var activeModelKey: String { activeCustom?.modelKey ?? provider.modelKey }
+    var activeBaseURL: String { activeCustom?.baseURL ?? openAIBaseURL }
+    var activeTools: Bool { activeCustom?.tools ?? openAITools }
+    var activeKeyAccount: String { activeCustom?.keychainAccount ?? provider.rawValue }
+    /// Saves a new OpenAI-compatible provider (key to Keychain only) and switches to it.
+    func addCustomProvider(name: String, baseURL: String, key: String, tools: Bool) async throws {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw ObbyError("Enter a name for the provider.") }
+        let url = try RemoteHTTP.validatedBase(baseURL).absoluteString
+        let entry = CustomProvider(name: name, baseURL: url, tools: tools)
+        let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty { try Keychain.save(key, account: entry.keychainAccount) }
+        customProviders.append(entry); CustomProvider.saveAll(customProviders)
+        await switchProvider(.openAI, custom: entry.id)
+    }
+    /// Removes a saved provider and its Keychain key. If it is in use, Obby switches back to Ollama first.
+    func removeCustomProvider(_ entry: CustomProvider) async {
+        guard !busy, !switchingModel else { return }
+        if activeCustom?.id == entry.id { await switchProvider(.ollama) }
+        Keychain.delete(entry.keychainAccount)
+        UserDefaults.standard.removeObject(forKey: entry.modelKey)
+        customProviders.removeAll { $0.id == entry.id }; CustomProvider.saveAll(customProviders)
+    }
     var modelSelection: Binding<String> {
         Binding(get: { self.selectedModel }, set: { value in
             guard !self.busy, !self.switchingModel, value != self.selectedModel else { return }
@@ -58,7 +118,7 @@ extension AppModel {
         case .anthropic, .gemini: return hasAPIKey
         }
     }
-    var isLocalProvider: Bool { provider == .ollama || (provider == .openAI && RemoteHTTP.isLoopback(openAIBaseURL)) }
+    var isLocalProvider: Bool { provider == .ollama || (provider == .openAI && RemoteHTTP.isLoopback(activeBaseURL)) }
     /// True when quitting should unload the active Ollama model: the setting is on and this session actually used it.
     var needsUnloadOnQuit: Bool { unloadOnQuit && provider == .ollama && !selectedModel.isEmpty && usedOllamaModels.contains(selectedModel) }
     /// One unload request (keep_alive 0) when Obby terminates. Short timeout; Ollama itself keeps running.
@@ -112,7 +172,7 @@ extension AppModel {
     func describe(_ error: Error) -> String {
         if provider == .openAI, let failure = error as? URLError,
            [.cannotConnectToHost, .cannotFindHost, .timedOut, .networkConnectionLost, .notConnectedToInternet, .dnsLookupFailed].contains(failure.code) {
-            return "The server at \(openAIBaseURL) is unavailable."
+            return "The server at \(activeBaseURL) is unavailable."
         }
         return error.localizedDescription
     }
@@ -156,7 +216,9 @@ extension AppModel {
     func makeProvider() throws -> AIProvider {
         switch provider {
         case .ollama: return OllamaProvider(send: { try await self.request($0, body: $1) }, stream: { self.streamLines($0, body: $1) })
-        case .openAI: return OpenAICompatibleProvider(base: try RemoteHTTP.validatedBase(openAIBaseURL), apiKey: apiKey(for: .openAI), toolsEnabled: openAITools)
+        case .openAI:
+            if let custom = activeCustom { return OpenAICompatibleProvider(base: try RemoteHTTP.validatedBase(custom.baseURL), apiKey: Keychain.read(custom.keychainAccount), toolsEnabled: custom.tools) }
+            return OpenAICompatibleProvider(base: try RemoteHTTP.validatedBase(openAIBaseURL), apiKey: apiKey(for: .openAI), toolsEnabled: openAITools)
         case .anthropic:
             guard let key = apiKey(for: .anthropic) else { throw ObbyError("Add an Anthropic API key in Settings.") }
             return AnthropicProvider(apiKey: key)
@@ -188,7 +250,7 @@ extension AppModel {
     func refreshToolSupport() async {
         let kind = provider, model = selectedModel
         guard !model.isEmpty else { toolsAvailable = true; return }
-        if kind == .openAI { toolsAvailable = openAITools; return }
+        if kind == .openAI { toolsAvailable = activeTools; return }
         let key = kind.rawValue + "/" + model
         if let cached = toolSupport[key] { toolsAvailable = cached; return }
         guard let current = try? makeProvider() else { return }
@@ -197,18 +259,20 @@ extension AppModel {
         if kind == provider && model == selectedModel { toolsAvailable = supported }
     }
     /// Switches provider live. Leaving Ollama honours "unload previous model when switching".
-    func switchProvider(_ next: ProviderKind) async {
-        guard !busy, !switchingModel, next != provider else { return }
+    /// `custom` picks a saved OpenAI-compatible provider; nil means the built-in provider.
+    func switchProvider(_ next: ProviderKind, custom: UUID? = nil) async {
+        let customID = next == .openAI ? custom : nil
+        guard !busy, !switchingModel, next != provider || customID != activeCustom?.id else { return }
         switchingModel = true
         if provider == .ollama && unloadPrevious && !selectedModel.isEmpty {
             if (try? await request("/api/generate", body: ["model": selectedModel, "keep_alive": 0, "stream": false])) != nil { usedOllamaModels.remove(selectedModel) }
         }
         persistSettings()
-        provider = next
-        selectedModel = UserDefaults.standard.string(forKey: next.modelKey) ?? ""
+        provider = next; activeCustomID = customID
+        selectedModel = UserDefaults.standard.string(forKey: activeModelKey) ?? ""
         models = []; connected = false; loadedModels = []; modelSettingsError = nil; ollamaIssue = nil
         // The chat and its memory belong to Obby, not the model: they carry over to the new model or provider.
-        hasAPIKey = next == .ollama ? false : Keychain.exists(next.rawValue)
+        hasAPIKey = next == .ollama ? false : Keychain.exists(activeKeyAccount)
         persistSettings()
         switchingModel = false
         await connect()

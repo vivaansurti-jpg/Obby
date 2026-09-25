@@ -60,7 +60,7 @@ extension AppModel {
             chat[last].repeats += 1; chat[last].text = summary + " ×\(chat[last].repeats)"; chat[last].rawAction = raw
             return
         }
-        let line = ChatLine(role: "Action", text: summary, rawAction: raw, unsuccessful: failed || summary == "Deletion cancelled.", undo: failed ? nil : undo, base: summary)
+        let line = ChatLine(role: "Action", text: summary, rawAction: raw, unsuccessful: failed || summary == "Deletion cancelled.", undo: failed ? nil : undo, base: summary, taskID: currentTaskID)
         chat = ChatMemory.trimDisplay(chat + [line])
     }
     /// A compact informational line in the action list (not sent to the model).
@@ -69,7 +69,7 @@ extension AppModel {
     }
     func clearChat() {
         memory = ChatRecord() // A new chat starts with fresh memory; saved chats stay on disk.
-        contextUsage = nil
+        contextUsage = nil; lastWorkPrompt = ""
         chatSession = UUID()
         aiTask?.cancel(); aiTask = nil
         directoryResults.removeAll(keepingCapacity: false)
@@ -804,6 +804,20 @@ enum ToolRouting {
     static let memoryPhrases = ["what were we doing", "what was i doing", "what were we working on", "what did i decide", "what did we decide",
                                 "remind me", "what have we done", "what have i done", "what did we do", "where were we", "where did we leave",
                                 "what's the plan", "what is the plan", "catch me up", "recap"]
+    /// Short replies that continue the previous task ("yes", "go ahead", "try again", "did you do it?", "that's wrong").
+    /// After real work they keep that task's tools instead of being treated as small talk.
+    static let followUpWords: Set<String> = ["yes", "yeah", "yep", "yup", "sure", "go", "ahead", "proceed", "continue", "retry", "again", "redo",
+                                             "did", "didnt", "didn", "done", "wrong", "still", "not", "fix", "words", "please", "do"]
+    static func isFollowUp(_ prompt: String) -> Bool {
+        let words = prompt.lowercased().replacingOccurrences(of: "’", with: "'").replacingOccurrences(of: "'", with: "")
+            .split(whereSeparator: { !$0.isLetter }).map(String.init)
+        return !words.isEmpty && words.count <= 8 && words.contains(where: followUpWords.contains)
+    }
+    /// The prompt used for routing: a follow-up to real work is routed as that work, plus the follow-up itself.
+    static func routingPrompt(_ prompt: String, lastWork: String) -> String {
+        guard !lastWork.isEmpty, classify(prompt) == .chat, isFollowUp(prompt) else { return prompt }
+        return lastWork + "\n" + prompt
+    }
     static func classify(_ prompt: String) -> Kind {
         let lowered = prompt.lowercased().replacingOccurrences(of: "’", with: "'")
         if memoryPhrases.contains(where: lowered.contains) { return .memoryQuestion }

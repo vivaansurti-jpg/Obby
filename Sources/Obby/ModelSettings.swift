@@ -125,8 +125,9 @@ extension AppModel {
     func unloadForQuit() async {
         guard needsUnloadOnQuit else { return }
         let model = selectedModel
+        stopStatusTimers()
         _ = try? await request("/api/generate", body: ["model": model, "keep_alive": 0, "stream": false], timeout: 2)
-        usedOllamaModels.remove(model)
+        usedOllamaModels.remove(model); loadedModels.remove(model)
     }
     // MARK: Ollama startup (native, no shell, no polling beyond one bounded wait after a launch)
 
@@ -177,22 +178,63 @@ extension AppModel {
         return error.localizedDescription
     }
 
-    /// Event-driven only (launch check, after a request, model switch, unload, failure). Nothing polls this.
+    /// Read-only load state from /api/ps (never /api/chat or /api/generate, never loads or unloads a model).
+    /// Called on Obby's own events (launch, becoming active, menus opening, requests, switches, unloads), at the
+    /// loaded model's keep-alive expiry, and by the slow fallback check below.
     func refreshModelStatus() async {
         guard provider == .ollama else { return } // Only Ollama has load state; cloud providers are never polled.
         let address = endpoint
         do {
             let response = try await request("/api/ps")
             guard address == endpoint, provider == .ollama else { return }
-            loadedModels = Set((response["models"] as? [[String: Any]] ?? []).flatMap { item in
-                [item["name"] as? String, item["model"] as? String].compactMap { $0 }
-            })
+            let running = response["models"] as? [[String: Any]] ?? []
+            loadedModels = Set(running.flatMap { item in [item["name"] as? String, item["model"] as? String].compactMap { $0 } })
             connected = true
+            if loadedModels.contains(selectedModel) { modelLoading = false }
+            let current = running.first { ($0["name"] as? String) == selectedModel || ($0["model"] as? String) == selectedModel }
+            scheduleExpiryCheck(Self.expiry(current?["expires_at"] as? String))
         } catch {
             guard address == endpoint, provider == .ollama else { return }
-            connected = false; loadedModels = []
+            connected = false; loadedModels = []; modelLoading = false
+            expiryCheck?.cancel(); expiryCheck = nil
         }
     }
+    /// Ollama's expires_at (ISO 8601, often with more than three fractional digits).
+    static func expiry(_ text: String?) -> Date? {
+        guard let text else { return nil }
+        let trimmed = text.replacingOccurrences(of: "(\\.\\d{3})\\d+", with: "$1", options: .regularExpression)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: trimmed) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: trimmed)
+    }
+    /// One check shortly after the model is due to unload. "Keep loaded" (far-future expiry) schedules nothing.
+    func scheduleExpiryCheck(_ expiry: Date?) {
+        expiryCheck?.cancel(); expiryCheck = nil
+        guard let expiry else { return }
+        let wait = expiry.timeIntervalSinceNow + 2
+        guard wait < 24 * 3600 else { return }
+        expiryCheck = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(wait, 1) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.refreshModelStatus()
+        }
+    }
+    /// Fallback while Obby is active and the AI panel is visible: a /api/ps check every 25 seconds. Stopped when the
+    /// app goes to the background, the panel closes, or Obby quits.
+    func startStatusPoll() {
+        guard statusPoll == nil else { return }
+        statusPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 25_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                if self.provider == .ollama, NSApp?.isActive != false, !self.busy { await self.refreshModelStatus() }
+            }
+        }
+    }
+    func stopStatusPoll() { statusPoll?.cancel(); statusPoll = nil }
+    func stopStatusTimers() { stopStatusPoll(); expiryCheck?.cancel(); expiryCheck = nil }
     func selectModel(_ next: String) async {
         defer { switchingModel = false }
         guard !busy, next != selectedModel else { return }
@@ -205,7 +247,7 @@ extension AppModel {
             do {
                 // An empty generate request with keep_alive zero unloads; never preload next.
                 _ = try await request("/api/generate", body: ["model": previous, "keep_alive": 0, "stream": false])
-                usedOllamaModels.remove(previous)
+                usedOllamaModels.remove(previous); loadedModels.remove(previous) // Shown as unloaded at once.
             } catch { modelSettingsError = "Could not unload the previous model: \(error.localizedDescription)" }
         }
         await refreshModelStatus()
@@ -265,7 +307,7 @@ extension AppModel {
         guard !busy, !switchingModel, next != provider || customID != activeCustom?.id else { return }
         switchingModel = true
         if provider == .ollama && unloadPrevious && !selectedModel.isEmpty {
-            if (try? await request("/api/generate", body: ["model": selectedModel, "keep_alive": 0, "stream": false])) != nil { usedOllamaModels.remove(selectedModel) }
+            if (try? await request("/api/generate", body: ["model": selectedModel, "keep_alive": 0, "stream": false])) != nil { usedOllamaModels.remove(selectedModel); loadedModels.remove(selectedModel) }
         }
         persistSettings()
         provider = next; activeCustomID = customID

@@ -22,6 +22,10 @@ import AppKit
     @Published var busy = false
     @Published var switchingModel = false
     @Published var loadedModels: Set<String> = []
+    @Published var showSettings = false // Settings is a sheet on the main window, never a separate window.
+    @Published var modelLoading = false // A real request started and the model isn't confirmed in memory yet.
+    var expiryCheck: Task<Void, Never>? // One read-only /api/ps check when the loaded model's keep-alive runs out.
+    var statusPoll: Task<Void, Never>? // Fallback /api/ps check every 25 s, only while Obby is active and the AI panel is shown.
     @Published var modelSettingsError: String?
     @Published var unloadPrevious = UserDefaults.standard.object(forKey: "unloadPrevious") as? Bool ?? true
     @Published var keepAlive = ModelKeepAlive(rawValue: UserDefaults.standard.string(forKey: "keepAlive") ?? "5m") ?? .fiveMinutes
@@ -32,6 +36,7 @@ import AppKit
     var ollamaLaunch: Task<Bool, Never>?
     var usedOllamaModels: Set<String> = [] // Ollama models this Obby session sent chat requests to.
     var requestOverride: ((String, [String: Any]?) async throws -> [String: Any])?
+    var lastWorkPrompt = "" // The last request that was real work; short follow-ups ("yes", "try again") reuse its tools.
 
     @Published var endpoint: String = UserDefaults.standard.string(forKey: "ollamaURL") ?? "http://localhost:11434"
     @Published var provider = ProviderKind.stored
@@ -67,6 +72,20 @@ import AppKit
     var pendingUndo: UndoEdit? // Set by executeTool for the action line it is about to produce.
     var readThisRequest: Set<String> = [] // Notes the model has read (or was given) during the current AI request.
     var shrinkOverride: ((String) -> Bool)? // The checks answer the shrink question without a dialog.
+    var planOverride: (([String]) -> Bool)? // The checks answer the change-preview question without a dialog.
+    var currentTaskID: UUID? // Groups one request's changes so they can be undone together.
+    @Published var backlinks: [String] = [] // Notes that link to the open note ("Linked from").
+    @Published var editorFontSize = Double(RichMarkdown.baseSize) { // Display only; saved files are unchanged.
+        didSet {
+            let clamped = RichMarkdown.clampFontSize(editorFontSize)
+            if clamped != editorFontSize { editorFontSize = clamped; return }
+            UserDefaults.standard.set(clamped, forKey: "editorFontSize")
+            NotificationCenter.default.post(name: .init("ObbyEditorFontSize"), object: nil)
+        }
+    }
+    @Published var showTechnical = UserDefaults.standard.bool(forKey: "showTechnical") { // Model memory status, context size, raw actions.
+        didSet { UserDefaults.standard.set(showTechnical, forKey: "showTechnical"); if !showTechnical { showRawActions = false } }
+    }
     var streamOverride: ((String, [String: Any]) -> AsyncThrowingStream<[String: Any], Error>)? // The checks' fake Ollama stream.
     @Published var streamReplies = UserDefaults.standard.object(forKey: "streamReplies") as? Bool ?? true
     var guardWrites = false // True during an AI request: whole-note rewrites require the note to have been read first.
@@ -183,6 +202,68 @@ import AppKit
             loading = true; text = content; loading = false; diskText = content; note = path; dirty = false
             UserDefaults.standard.set(path, forKey: "lastNote")
         }
+        updateBacklinks()
+    }
+    /// Markdown files dropped onto Obby from Finder: copied (never moved) into the selected folder as notes, with
+    /// "-2", "-3"… when the name is taken, then opened. Files already inside the notes folder are just opened.
+    @discardableResult func importNotes(_ urls: [URL]) -> [String] {
+        guard let vault, save() else { return [] }
+        var added: [String] = [], problems: [String] = []
+        let root = vault.root.standardizedFileURL.resolvingSymlinksInPath().path
+        for url in urls where ["md", "markdown"].contains(url.pathExtension.lowercased()) {
+            let source = url.standardizedFileURL.resolvingSymlinksInPath().path
+            if source.hasPrefix(root + "/") { added.append(String(source.dropFirst(root.count + 1))); continue }
+            guard let data = try? Data(contentsOf: url), data.count <= 5_000_000, let content = String(data: data, encoding: .utf8) else {
+                problems.append("\(url.lastPathComponent) (only UTF-8 Markdown files up to 5 MB can be added)"); continue
+            }
+            let stem = Self.filenameStem(forTitle: url.deletingPathExtension().lastPathComponent)
+            guard (try? Self.validateNoteName(stem)) != nil else { problems.append(url.lastPathComponent + " (unsupported name)"); continue }
+            let text = content.replacingOccurrences(of: "\r\n", with: "\n")
+            var copied: String?
+            for number in 1...200 {
+                let name = number == 1 ? stem + ".md" : "\(stem)-\(number).md"
+                let path = folder.isEmpty ? name : folder + "/" + name
+                if let existing = try? vault.resolve(path), FileManager.default.fileExists(atPath: existing.path) { continue }
+                do { try vault.write(path, content: text, create: true); copied = path } catch { problems.append(url.lastPathComponent + " (" + error.localizedDescription + ")") }
+                break
+            }
+            if let copied { added.append(copied) }
+        }
+        if !problems.isEmpty { error = "Couldn’t add " + problems.joined(separator: ", ") + "." }
+        refresh()
+        if let last = added.last { selection = last; openNote(last) }
+        return added
+    }
+    /// "Linked from": notes whose Markdown links point at the open note (resolved relative to the linking note).
+    func updateBacklinks() {
+        guard let vault, let target = note else { backlinks = []; return }
+        Task {
+            let found = await Task.detached(priority: .utility) { Self.findBacklinks(to: target, in: vault) }.value
+            if note == target { backlinks = found }
+        }
+    }
+    nonisolated static func findBacklinks(to target: String, in vault: Vault) -> [String] {
+        func flatten(_ entries: [Entry]) -> [String] { entries.flatMap { $0.isDirectory ? flatten($0.children ?? []) : [$0.path] } }
+        let notes = flatten((try? vault.tree()) ?? []).filter { $0.lowercased().hasSuffix(".md") && $0 != target }
+        return notes.prefix(3000).filter { source in
+            guard let text = try? vault.read(source), text.contains("](") else { return false }
+            let folder = (source as NSString).deletingLastPathComponent
+            return NoteLinks.links(in: text).contains { link in
+                guard !link.isImage, let destination = NoteLinks.target(link.destination) else { return false }
+                return destination == target || (folder.isEmpty ? destination : folder + "/" + destination) == target
+            }
+        }.sorted()
+    }
+    /// Before the AI makes a large change (moving, renaming or deleting, or changing more than one note in a request),
+    /// the user sees the plan and approves it once for the rest of the request.
+    func confirmPlan(_ steps: [String]) -> Bool {
+        if let planOverride { return planOverride(steps) }
+        let alert = NSAlert(); alert.alertStyle = .informational
+        alert.messageText = "Apply these changes?"
+        alert.informativeText = steps.prefix(12).map { "• " + $0 }.joined(separator: "\n") + (steps.count > 12 ? "\n• …and \(steps.count - 12) more" : "")
+            + "\n\nLater steps of this request run without asking again. You can undo the whole task from the chat afterwards."
+        alert.addButton(withTitle: "Apply"); alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
     func scheduleSave() {
         saveTask?.cancel()
@@ -346,7 +427,7 @@ import AppKit
     func closeNote() {
         saveTask?.cancel(); saveTask = nil
         note = nil; loading = true; text = ""; loading = false
-        diskText = ""; dirty = false; saveConflict = false
+        diskText = ""; dirty = false; saveConflict = false; backlinks = []
         UserDefaults.standard.removeObject(forKey: "lastNote")
     }
     func confirmDelete(_ path: String) -> Bool {
@@ -369,26 +450,67 @@ import AppKit
         guard let edit = line.undo, let vault, !busy, save() else { return }
         let name = (edit.path as NSString).lastPathComponent
         do {
-            let current = try? vault.read(edit.path)
-            if current != edit.after {
+            if changedSince(edit, vault: vault) {
                 let alert = NSAlert(); alert.alertStyle = .warning
                 alert.messageText = "\(name) changed after the AI edit."
                 alert.informativeText = "Undoing replaces those later changes with the version from before the AI edit."
                 alert.addButton(withTitle: "Undo Anyway"); alert.addButton(withTitle: "Cancel")
                 guard alert.runModal() == .alertFirstButtonReturn else { return }
             }
-            if let previous = edit.previous { try vault.write(edit.path, content: previous, create: current == nil) }
-            else if current != nil { try vault.delete(edit.path) }
+            try applyUndo(edit, vault: vault)
             if let index = chat.firstIndex(where: { $0.id == line.id }) { chat[index].undo = nil }
             appendNotice("Undid the AI change to \(name).")
             memory.remember(action: "Undid the AI change to \(name).")
             persistChat(); refresh()
         } catch { self.error = error.localizedDescription }
     }
+    /// Undo every change one request made, newest first (moves back, edits restored, created notes to the Trash).
+    func undoTask(_ id: UUID, confirm: Bool = true) {
+        guard let vault, !busy, save() else { return }
+        let lines = chat.filter { $0.taskID == id && $0.undo != nil }
+        guard !lines.isEmpty else { return }
+        if confirm, lines.contains(where: { changedSince($0.undo!, vault: vault) }) {
+            let alert = NSAlert(); alert.alertStyle = .warning
+            alert.messageText = "Some of these notes changed after the AI task."
+            alert.informativeText = "Undoing the task replaces those later changes with the versions from before the task."
+            alert.addButton(withTitle: "Undo Anyway"); alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        var undone = 0
+        for line in lines.reversed() {
+            do {
+                try applyUndo(line.undo!, vault: vault); undone += 1
+                if let index = chat.firstIndex(where: { $0.id == line.id }) { chat[index].undo = nil }
+            } catch { appendNotice("Couldn’t undo the change to \((line.undo!.path as NSString).lastPathComponent): \(error.localizedDescription)", failed: true) }
+        }
+        appendNotice("Undid \(undone) change\(undone == 1 ? "" : "s") from this task.")
+        memory.remember(action: "Undid \(undone) AI change\(undone == 1 ? "" : "s") from one task.")
+        persistChat(); refresh()
+    }
+    /// The task a group of action lines should offer "Undo task" for: shown once, beside the task's last undoable change.
+    func taskUndo(for lines: [ChatLine]) -> (id: UUID, count: Int)? {
+        for line in lines.reversed() where line.undo != nil {
+            guard let id = line.taskID else { continue }
+            let all = chat.filter { $0.taskID == id && $0.undo != nil }
+            if all.count >= 2, all.last?.id == line.id { return (id, all.count) }
+        }
+        return nil
+    }
+    func changedSince(_ edit: UndoEdit, vault: Vault) -> Bool {
+        if edit.movedFrom != nil { return false }
+        return (try? vault.read(edit.path)) != edit.after
+    }
+    func applyUndo(_ edit: UndoEdit, vault: Vault) throws {
+        if let original = edit.movedFrom { try vault.move(edit.path, original); didMove(edit.path, original); return }
+        let current = try? vault.read(edit.path)
+        if let previous = edit.previous { try vault.write(edit.path, content: previous, create: current == nil) }
+        else if current != nil { try vault.delete(edit.path) }
+    }
     func search() { perform { results = try vault?.search(query) ?? [] } }
     func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: activeModelKey); UserDefaults.standard.set(activeCustom?.id.uuidString, forKey: "activeCustomProvider"); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe"); UserDefaults.standard.set(streamReplies, forKey: "streamReplies") }
 }
-struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil; var base = ""; var repeats = 1 }
+struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil; var base = ""; var repeats = 1; var taskID: UUID? = nil }
 /// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.
 /// `previous == nil` means the AI created the note, so undo moves it to the Trash.
-struct UndoEdit { let path: String; let previous: String?; let after: String }
+/// `movedFrom` set: the AI moved or renamed `movedFrom` to `path`, so undo moves it back.
+struct UndoEdit { let path: String; let previous: String?; let after: String; var movedFrom: String? = nil }

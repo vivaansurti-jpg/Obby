@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Speech
 import AVFoundation
+import UniformTypeIdentifiers
 
 @main struct ObbyApp: App {
     @StateObject var model = AppModel()
@@ -19,6 +20,7 @@ import AVFoundation
                     }
                 }
                 .onAppear { delegate.model = model; NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true) }
+                .sheet(isPresented: $model.showSettings) { SettingsSheet().environmentObject(model) }
         }
         .defaultSize(width: 1200, height: 760)
         .commands {
@@ -27,25 +29,61 @@ import AVFoundation
                 Button("New Folder") { model.create(directory: true) }.keyboardShortcut("n", modifiers: [.command, .shift]).disabled(model.vault == nil)
                 Button("Choose Notes Folder…") { model.chooseFolder() }.keyboardShortcut("o").disabled(model.busy)
             }
+            CommandGroup(replacing: .appSettings) { Button("Settings…") { model.showSettings = true }.keyboardShortcut(",") }
             CommandGroup(replacing: .saveItem) { Button("Save") { model.save() }.keyboardShortcut("s") }
-            CommandGroup(after: .sidebar) { Button(model.showAI ? "Hide AI" : "Show AI") { model.showAI.toggle() }.keyboardShortcut("a", modifiers: [.command, .shift]) }
+            CommandGroup(after: .sidebar) {
+                Button(model.showAI ? "Hide AI" : "Show AI") { model.showAI.toggle() }.keyboardShortcut("a", modifiers: [.command, .shift])
+                Divider()
+                // Editor text size only (not the sidebar, the AI panel, or saved files).
+                Button("Bigger") { model.editorFontSize += 1 }.keyboardShortcut("+").disabled(model.editorFontSize >= 28)
+                Button("Smaller") { model.editorFontSize -= 1 }.keyboardShortcut("-").disabled(model.editorFontSize <= 11)
+                Button("Actual Size") { model.editorFontSize = RichMarkdown.defaultFontSize }.keyboardShortcut("0")
+            }
             CommandGroup(after: .textEditing) { Button("Find in Notes") { NotificationCenter.default.post(name: .init("ObbyFind"), object: nil) }.keyboardShortcut("f") }
         }
-        Settings { SettingsView().environmentObject(model) }
+    }
+}
+/// Settings as a sheet attached to the Obby window; Done or Escape returns straight to Obby.
+struct SettingsSheet: View {
+    @EnvironmentObject var model: AppModel
+    var body: some View {
+        VStack(spacing: 0) {
+            SettingsView()
+            Divider()
+            HStack {
+                Spacer()
+                // Escape also closes; Return is left to the text fields (API key, base URL…).
+                Button("Done") { model.showSettings = false }.keyboardShortcut(.cancelAction)
+            }.padding(12)
+        }
+    }
+}
+/// Reads the file URLs of a drop; only Markdown files are accepted.
+enum MarkdownDrop {
+    static func load(_ providers: [NSItemProvider], _ done: @escaping ([URL]) -> Void) -> Bool {
+        let items = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !items.isEmpty else { return false }
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        for item in items {
+            group.enter()
+            item.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { value, _ in
+                if let data = value as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) { DispatchQueue.main.async { urls.append(url) } }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            let markdown = urls.filter { ["md", "markdown"].contains($0.pathExtension.lowercased()) }
+            if !markdown.isEmpty { done(markdown) }
+        }
+        return true
     }
 }
 struct SettingsGear: View {
+    @EnvironmentObject var model: AppModel
     var body: some View {
-        Group {
-            if #available(macOS 14.0, *) {
-                SettingsLink { Image(systemName: "gearshape") }
-            } else {
-                Button {
-                    NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-                } label: { Image(systemName: "gearshape") }
-            }
-        }
-        .help("Settings")
+        Button { model.showSettings = true } label: { Image(systemName: "gearshape") }
+        .help("Settings (⌘,)")
         .accessibilityLabel("Settings")
     }
 }
@@ -63,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let model else { return .terminateNow }
             if model.save() == false { return .terminateCancel }
             model.persistChat() // Saved only when "Remember AI tasks between launches" is on.
+            model.stopStatusTimers() // No status checks keep running once Obby quits.
             model.clearChat()
             guard model.needsUnloadOnQuit else { return .terminateNow }
             // Unload the active Ollama model once, then quit. Never hold shutdown for more than ~3 seconds.
@@ -78,6 +117,8 @@ struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @StateObject var bridge = EditorBridge()
     @FocusState var searchFocused: Bool
+    @State private var showTableSheet = false
+    @State private var tableColumns = 3, tableRows = 3
     var body: some View {
         Group {
             if model.showOnboarding {
@@ -87,6 +128,7 @@ struct ContentView: View {
             } else {
                 HSplitView {
                     sidebar.frame(minWidth: 180, idealWidth: 220, maxWidth: 400)
+                        .onDrop(of: [.fileURL], isTargeted: nil) { MarkdownDrop.load($0) { model.importNotes($0) } }
                     VStack(spacing: 0) {
                         if let note = model.note {
                             HStack { NoteTitleField(path: note); Spacer() }.padding(.horizontal).padding(.vertical, 20)
@@ -97,6 +139,10 @@ struct ContentView: View {
                                     Button("Underline") { bridge.format(.underline) }.keyboardShortcut("u")
                                     Divider()
                                     ForEach([Format.heading, .heading2, .heading3, .size], id: \.self) { style in Button(style.rawValue) { bridge.format(style) } }
+                                    Divider()
+                                    Button("Insert Table…") { showTableSheet = true }
+                                    Button("Add Row") { bridge.addTableRow() }.disabled(!bridge.cursorInTable)
+                                    Button("Add Column") { bridge.addTableColumn() }.disabled(!bridge.cursorInTable)
                                 }.fixedSize()
                                 Menu("List") {
                                     Button("Bullets") { bridge.format(.bullet) }
@@ -107,18 +153,47 @@ struct ContentView: View {
                                 Menu("Insert") {
                                     Button("Image…") { bridge.insertImage() }
                                     Button("Document…") { bridge.attachDocument() }
+                                    Button("Table…") { showTableSheet = true }
                                 }.fixedSize().disabled(model.note == nil)
+                                .sheet(isPresented: $showTableSheet) {
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        Text("Insert Table").font(.headline)
+                                        Stepper("Columns: \(tableColumns)", value: $tableColumns, in: 1...10)
+                                        Stepper("Rows: \(tableRows)", value: $tableRows, in: 1...30)
+                                        HStack {
+                                            Spacer()
+                                            Button("Cancel") { showTableSheet = false }.keyboardShortcut(.cancelAction)
+                                            Button("Insert") { showTableSheet = false; bridge.insertTable(columns: tableColumns, rows: tableRows) }.keyboardShortcut(.defaultAction)
+                                        }
+                                    }.padding(20).frame(width: 260)
+                                }
                                 Spacer()
                             }.buttonStyle(.borderless).padding(.horizontal).padding(.bottom, 10)
                             Divider()
                             MarkdownEditor(text: $model.text, bridge: bridge, importAttachments: { model.importAttachments($0) }, openLink: { model.openLink($0) }).id(note)
+                                .onReceive(NotificationCenter.default.publisher(for: .init("ObbyEditorFontSize"))) { _ in bridge.applyFontSize() }
+                            if !model.backlinks.isEmpty { // Notes that link here; click to open.
+                                Divider()
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 10) {
+                                        Label("Linked from", systemImage: "link").foregroundStyle(.secondary)
+                                        ForEach(model.backlinks, id: \.self) { path in
+                                            Button(((path as NSString).lastPathComponent as NSString).deletingPathExtension) { model.openNote(path) }
+                                                .buttonStyle(.link).help(path)
+                                        }
+                                    }.font(.caption).padding(.horizontal, 28).padding(.vertical, 6)
+                                }
+                            }
                         } else {
                             // Folder selected (or nothing/root): neutral state; nothing is created until New Note.
                             VStack(spacing: 8) {
                                 Text(model.folder.isEmpty ? "Obby" : (model.folder.split(separator: "/").last.map(String.init) ?? "Obby")).font(.title2)
                                 Text("No note selected").foregroundStyle(.secondary)
                                 Button("New Note") { model.create(directory: false) }.padding(.top, 6)
+                                Text("Or drop Markdown files here to add them.").font(.caption).foregroundStyle(.secondary)
                             }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .contentShape(Rectangle())
+                            .onDrop(of: [.fileURL], isTargeted: nil) { MarkdownDrop.load($0) { model.importNotes($0) } }
                         }
                         Divider(); HStack { Text(model.status).lineLimit(2); Spacer() }.font(.caption).foregroundStyle(.secondary).padding(8)
                     }.frame(minWidth: 380, idealWidth: 650, maxWidth: .infinity)
@@ -287,8 +362,10 @@ struct AIView: View {
                             }
                         } label: { Label("Chat History", systemImage: "clock.arrow.circlepath") }.disabled(model.busy)
                     }
-                    Divider()
-                    Toggle(isOn: $model.showRawActions) { Label("Show technical action details", systemImage: "curlybraces") }
+                    if model.showTechnical {
+                        Divider()
+                        Toggle(isOn: $model.showRawActions) { Label("Show technical action details", systemImage: "curlybraces") }
+                    }
                         .help("Shows the request and result for each action. This does not change your notes or what the AI can do.")
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("More").accessibilityLabel("More")
@@ -322,7 +399,7 @@ struct AIView: View {
                     Button("Hide details") { model.showRawActions = false }.buttonStyle(.link).font(.caption)
                 }
             }
-            if let usage = model.contextUsage {
+            if model.showTechnical, let usage = model.contextUsage {
                 Text("Context: \(ContextBudget.label(usage.used)) / \(ContextBudget.windowLabel(usage.window))").font(.caption2).foregroundStyle(.secondary)
                     .help("Estimated size of the last request. Part of the window is always kept free for the answer.")
             }
@@ -335,11 +412,23 @@ struct AIView: View {
                         } else if model.chat.isEmpty, let related = model.relatedTask {
                             Button("Continue: \(related.title.isEmpty ? "earlier task" : related.title)") { model.openChat(related) }
                                 .buttonStyle(.link).font(.caption).padding(.top, 12).help("Reopen the earlier task that worked on this note")
-                        } else if model.chat.isEmpty { Text(model.isLocalProvider ? "Ask a question, summarize a note, or organize your folders. Obby uses your local \(model.providerName) model." : "Ask a question, summarize a note, or organize your folders. Obby uses \(model.providerName); only what a request needs is sent.").foregroundStyle(.secondary).padding(.top, 12) }
+                        } else if model.chat.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(model.isLocalProvider ? "Tell Obby what to do with your notes. It uses your local \(model.providerName) model." : "Tell Obby what to do with your notes. It uses \(model.providerName); only what a request needs is sent.").foregroundStyle(.secondary)
+                                // Examples fill the message box (never send by themselves), so they can be edited first.
+                                ForEach(Self.examples, id: \.self) { example in
+                                    Button { prompt = example; promptFocused = true } label: {
+                                        Label(example.hasSuffix(" ") ? example + "…" : example, systemImage: "text.bubble").frame(maxWidth: .infinity, alignment: .leading)
+                                    }.buttonStyle(.plain).padding(.horizontal, 8).padding(.vertical, 5)
+                                    .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+                                }
+                            }.padding(.top, 12)
+                        }
                         // Presentation only: Obby renders the model's Markdown and its own action summaries; nothing here goes back to the model.
                         ForEach(ChatGroup.groups(model.chat)) { group in
                             if group.isActions {
-                                ActionGroupView(lines: group.lines, showRaw: model.showRawActions, onUndo: { model.undoAIEdit($0) }).id(group.id)
+                                ActionGroupView(lines: group.lines, showRaw: model.showRawActions, onUndo: { model.undoAIEdit($0) },
+                                                taskUndo: model.taskUndo(for: group.lines).map { task in (count: task.count, action: { model.undoTask(task.id) }) }).id(group.id)
                             } else if let line = group.lines.first {
                                 let displayed = line.role == "Obby" ? ActionPresentation.reply(line.text) : line.text
                                 if !displayed.isEmpty {
@@ -374,20 +463,18 @@ struct AIView: View {
             }
             if model.busy { HStack { ProgressView().controlSize(.small); Text(model.isLocalProvider ? "Working locally…" : "Working…").font(.caption); Spacer(); Button("Stop") { model.aiTask?.cancel() } } }
             Divider()
-            if speech.listening {
-                Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
-            }
-            HStack(alignment: .bottom, spacing: 11) {
-                // Model picker, attached to the composer on the left (same switching logic as before).
+            // Thin model row above the composer: model menu on the left, read-only load status on the right.
+            HStack(spacing: 8) {
                 Menu {
                     ForEach(model.modelChoices, id: \.self) { name in
                         Button { model.modelSelection.wrappedValue = name } label: {
-                            let shown = model.provider == .ollama && model.loadedModels.contains(name) ? "\(name)  (loaded)" : name
+                            let shown = model.showTechnical && model.provider == .ollama && model.loadedModels.contains(name) ? "\(name)  (loaded)" : name
                             if name == model.selectedModel { Label(shown, systemImage: "checkmark") }
                             else { Text(shown) }
                         }.disabled(model.busy || model.switchingModel)
                     }
                     if model.modelChoices.isEmpty { Text("No models found. Refresh the connection.") }
+                    Color.clear.frame(width: 0, height: 0).onAppear { Task { await model.refreshModelStatus() } } // Menu opened: refresh once.
                     Divider()
                     Button("Refresh models") { Task { await model.connect(launch: true) } }
                         .disabled(model.busy || model.switchingModel)
@@ -395,15 +482,25 @@ struct AIView: View {
                     if model.busy { Text("Stop the current response to switch models.") }
                     if model.switchingModel { Text("Switching model. Please wait.") }
                 } label: {
-                    Text(model.selectedModel.isEmpty ? "Choose a model" : model.selectedModel)
-                        .lineLimit(1).truncationMode(.middle)
-                }.menuStyle(.borderlessButton).menuIndicator(.visible).font(.caption).foregroundStyle(.secondary).frame(width: 104, alignment: .leading).fixedSize(horizontal: false, vertical: true).help("Choose AI model")
+                    Text(model.selectedModel.isEmpty ? "Choose a model" : shortModelName(model.selectedModel))
+                        .lineLimit(1)
+                }.menuStyle(.borderlessButton).menuIndicator(.visible).font(.caption).foregroundStyle(.secondary).fixedSize().help("Choose AI model") // Hugs the name, so the chevron sits right beside it.
+                Spacer(minLength: 8)
                 // Read-only status from the existing /api/ps check; updating it never loads or unloads a model.
                 if let status = modelLoadStatus {
-                    Text("· " + status).font(.caption).foregroundStyle(.secondary).lineLimit(1).fixedSize()
-                        .padding(.bottom, 2).help(status == "Offline" ? "\(model.providerName) is not reachable" : "Model is \(status.lowercased()) in memory")
+                    HStack(spacing: 4) {
+                        Image(systemName: status == "Loaded" ? "circle.fill" : status == "Loading" ? "circle.dotted" : status == "Offline" ? "circle.slash" : "circle")
+                            .font(.system(size: 7, weight: .semibold)).foregroundStyle(status == "Loaded" ? Color.green : Color.secondary)
+                        Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }.fixedSize()
+                    .help(status == "Offline" ? "Ollama is not reachable" : "Model is \(status.lowercased()) in memory")
+                    .accessibilityElement(children: .combine)
                 }
-                Divider().frame(height: 18)
+            }
+            if speech.listening {
+                Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
+            }
+            HStack(alignment: .bottom, spacing: 11) {
                 // The prompt grows to about seven lines, then scrolls; text added at the end (typing, dictation) stays in view.
                 ScrollViewReader { promptProxy in
                     ScrollView(.vertical) {
@@ -444,15 +541,38 @@ struct AIView: View {
             }.padding(.horizontal, 14).padding(.vertical, 12).background(.background, in: RoundedRectangle(cornerRadius: 9))
                 .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(.separator) }
         }.padding(14)
-        .onAppear { prompt = model.aiDraft; Task { await model.refreshModelStatus() } } // Draft survives hiding the panel; load state is checked once when shown.
-        .onDisappear { model.aiDraft = prompt; speech.stop() }
+        // Markdown files dropped on the AI panel are added as notes, opened, and named in the message box to work on.
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            MarkdownDrop.load(providers) { urls in
+                let added = model.importNotes(urls)
+                guard !added.isEmpty else { return }
+                let names = added.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+                prompt = (prompt.isEmpty ? "" : prompt + "\n") + "Work with \(names): "
+                promptFocused = true
+            }
+        }
+        .onAppear { prompt = model.aiDraft; Task { await model.refreshModelStatus() }; model.startStatusPoll() } // Draft survives hiding the panel.
+        .onDisappear { model.aiDraft = prompt; speech.stop(); model.stopStatusPoll() }
+        // Load state follows Obby's own events; the slow fallback check runs only while Obby is in front.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.refreshModelStatus() }; model.startStatusPoll()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in model.stopStatusPoll() }
     }
     /// "Loaded" / "Unloaded" for Ollama, "Offline" when the provider can't be reached; nil when there is nothing to show.
+    static let examples = ["Organise my loose notes into folders", "Make flashcards from this note", "Summarise this note in five bullet points", "Find everything I wrote about "]
+    /// Ollama only (cloud providers have no load state; their connection shows in the provider row).
     var modelLoadStatus: String? {
-        guard !model.selectedModel.isEmpty else { return nil }
-        if !model.connected && !model.startingOllama { return "Offline" }
-        guard model.provider == .ollama, model.connected else { return nil }
+        guard model.provider == .ollama, !model.selectedModel.isEmpty, !model.startingOllama else { return nil }
+        if !model.connected { return "Offline" } // Always shown: without it nothing works.
+        guard model.showTechnical else { return nil } // Loading / Loaded / Unloaded are technical details.
+        if model.modelLoading { return "Loading" }
         return model.loadedModels.contains(model.selectedModel) ? "Loaded" : "Unloaded"
+    }
+    /// Keeps very long model names compact by shortening the middle; the full name is in the menu.
+    func shortModelName(_ name: String) -> String {
+        guard name.count > 32 else { return name }
+        return String(name.prefix(18)) + "…" + String(name.suffix(12))
     }
     func submit() {
         guard !model.busy, !model.switchingModel, !model.selectedModel.isEmpty else { return }
@@ -501,6 +621,11 @@ struct SettingsView: View {
                     Button("Change Folder…") { model.chooseFolder() }.disabled(model.busy)
                 }
                 Text("Your notes and attachments stay as ordinary files in this folder.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Editor") {
+                Stepper("Editor text size: \(Int(model.editorFontSize)) pt", value: $model.editorFontSize, in: 11...28, step: 1)
+                Text("Changes only how notes look in the editor (also View → Bigger, Smaller, Actual Size). Saved files are unchanged.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }.formStyle(.grouped)
@@ -566,10 +691,13 @@ struct SettingsView: View {
     var advancedTab: some View {
         Form {
             if model.provider == .ollama { ollamaSection } else { cloudSection }
-            Section("Action details") {
-                Toggle("Show technical action details", isOn: $model.showRawActions)
-                Text("Shows each action's request and result in the chat. This only changes the display.")
+            Section("Technical details") {
+                Toggle("Show technical details", isOn: $model.showTechnical)
+                Text("Shows model memory status (Loading, Loaded, Unloaded), context size, and the option to see each action's request and result. Off by default; it only changes the display.")
                     .font(.caption).foregroundStyle(.secondary)
+                if model.showTechnical {
+                    Toggle("Show technical action details", isOn: $model.showRawActions)
+                }
             }
             if model.provider != .ollama, model.activeCustom == nil, model.hasAPIKey {
                 Section {
@@ -874,18 +1002,15 @@ struct ProviderMenu: View {
                 Button { close(); Task { await model.connect(launch: true) } } label: {
                     actionLabel("Refresh connection and models", systemImage: "arrow.clockwise")
                 }.buttonStyle(.plain).disabled(locked)
-                Group {
-                    if #available(macOS 14.0, *) {
-                        SettingsLink { actionLabel("Set up another provider in Settings…", systemImage: "gearshape") }
-                    } else {
-                        Button { NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) } label: {
-                            actionLabel("Set up another provider in Settings…", systemImage: "gearshape")
-                        }
-                    }
-                }.buttonStyle(.plain).simultaneousGesture(TapGesture().onEnded { close() })
+                Button {
+                    close()
+                    DispatchQueue.main.async { model.showSettings = true } // After the drop-down closes.
+                } label: { actionLabel("Set up another provider in Settings…", systemImage: "gearshape") }
+                .buttonStyle(.plain)
             }
             if model.busy { Text("Stop the current response to switch providers.").font(.caption).foregroundStyle(.secondary) }
             if model.switchingModel { Text("Switching model. Please wait.").font(.caption).foregroundStyle(.secondary) }
         }.padding(10).frame(minWidth: 230, alignment: .leading)
+        .onAppear { Task { await model.refreshModelStatus() } } // Menu opened: refresh once.
     }
 }

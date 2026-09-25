@@ -373,8 +373,14 @@ struct ActionGroupView: View {
     let lines: [ChatLine]
     let showRaw: Bool
     var onUndo: ((ChatLine) -> Void)? = nil
+    var taskUndo: (count: Int, action: () -> Void)? = nil // "Undo task (N changes)", shown once per task.
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
+            if let taskUndo {
+                Button { taskUndo.action() } label: { Label("Undo task (\(taskUndo.count) changes)", systemImage: "arrow.uturn.backward") }
+                    .buttonStyle(.link).font(.caption).padding(.bottom, 2)
+                    .help("Put back every note this request changed, created or moved, exactly as it was")
+            }
             ForEach(lines) { line in
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Image(systemName: line.unsuccessful ? "exclamationmark.circle" : line.notice ? "info.circle" : "checkmark")

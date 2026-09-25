@@ -47,6 +47,7 @@ struct ChatRequest {
     var temperature: Double
     var contextWindow: Int // Effective window for this request (setting capped at the model limit).
     var keepAlive: Any
+    var format: [String: Any]? = nil // Ollama structured output (JSON schema); other providers ignore it.
 }
 
 struct ChatReply {
@@ -107,6 +108,7 @@ struct OllamaProvider: AIProvider {
         options["num_ctx"] = request.contextWindow // Otherwise Ollama silently uses its server default (often 4K).
         var body: [String: Any] = ["keep_alive": request.keepAlive, "model": request.model, "stream": false, "messages": [["role": "system", "content": request.system]] + request.messages.map(Self.native), "options": options]
         if let tools = request.tools { body["tools"] = tools }
+        if let format = request.format { body["format"] = format }
         return body
     }
     func chat(_ request: ChatRequest) async throws -> ChatReply {

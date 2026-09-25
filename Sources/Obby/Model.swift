@@ -54,7 +54,8 @@ import AppKit
     @Published var memory = ChatRecord()
     @Published var savedChats: [ChatRecord] = [] // This notes folder's remembered chats, newest first (for the history menu).
     @Published var rememberChats = UserDefaults.standard.object(forKey: "rememberChats") as? Bool ?? true
-    @Published var globalMemory = GlobalMemory.load() // Durable, explicitly stated preferences shared by every task.
+    @Published var globalMemory = GlobalMemory.load() // About me, lasting preferences and folder context, shared by every task.
+    @Published var learnAboutMe = UserDefaults.standard.object(forKey: "learnAboutMe") as? Bool ?? true
     /// The AI panel's visibility (View → Show/Hide AI, Cmd+Shift+A). Hiding only removes the panel from view: the chat,
     /// its memory, the provider/model and any running request are untouched.
     @Published var showAI = UserDefaults.standard.object(forKey: "showAI") as? Bool ?? true {
@@ -382,7 +383,7 @@ import AppKit
         } catch { self.error = error.localizedDescription }
     }
     func search() { perform { results = try vault?.search(query) ?? [] } }
-    func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: provider.modelKey); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats") }
+    func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: provider.modelKey); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe") }
 }
 struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil }
 /// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.

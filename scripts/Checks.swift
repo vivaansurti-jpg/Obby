@@ -38,6 +38,7 @@ import AppKit
         }
         check(Format.bold.apply(to: "🙂yes", range: NSRange(location: 2, length: 3)).0 == "🙂**yes**", "Unicode selection")
         let model = AppModel(restoreState: false); model.timer?.invalidate(); model.vault = vault
+        model.relatedNotesLocal = false; model.relatedNotesCloud = false // Related notes are checked on their own below.
         model.provider = .ollama; model.selectedModel = "" // Start from Ollama whatever an earlier (interrupted) run saved.
         model.openNote("School/Revision.md"); model.text = "Autosaved"; check(model.save(), "autosave")
         check(try vault.read("School/Revision.md") == "Autosaved", "autosave disk")
@@ -287,7 +288,7 @@ import AppKit
         let toolResult = ((secondBody?["messages"] as? [[String: Any]])?.last?["content"] as? [[String: Any]])?.first
         check(remote.count == 2 && remote[0].1["x-api-key"] == "test-anthropic-key" && !remote[0].0.absoluteString.contains("test-anthropic-key"), "Anthropic key sent only in header")
         check((toolResult?["content"] as? String)?.contains("Nested/A/B/C/D/Target.md") == true && model.chat.last?.text == "Found it.", "cloud model uses Obby's sandboxed tools")
-        check((remote[0].2?["tools"] as? [[String: Any]])?.count == 11 && !(String(describing: remote[0].2 ?? [:])).contains("uniquenavneedle"), "tools offered; no vault contents sent up front")
+        check((remote[0].2?["tools"] as? [[String: Any]])?.count == 4 && !(String(describing: remote[0].2 ?? [:])).contains("uniquenavneedle"), "tools offered; no vault contents sent up front")
         remote = []; round = 1
         RemoteHTTP.override = { url, headers, body in remote.append((url, headers, body)); return ["candidates": [["content": ["role": "model", "parts": [["text": "Hi"]]]]]] }
         model.provider = .gemini; model.apiKeys[.gemini] = "test-gemini-key"; model.selectedModel = "gemini-test"
@@ -309,7 +310,7 @@ import AppKit
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
         let chatBody = ollamaRequests.first { $0.0 == "/api/chat" }?.1
         check(chatBody != nil && chatBody?["tools"] == nil && !model.toolsAvailable, "non-tool model gets no tools")
-        check(((chatBody?["messages"] as? [[String: Any]])?.first?["content"] as? String)?.contains("you cannot search the vault") == true, "non-tool model told vault tools are unavailable")
+        check(((chatBody?["messages"] as? [[String: Any]])?.first?["content"] as? String)?.contains("Always reply with exactly one JSON object") == true && chatBody?["format"] != nil, "non-tool model asked to act gets the JSON action format, not tools")
         try vault.write("Current.md", content: "Photosynthesis notes", create: true); try vault.write("Other2.md", content: "Unrelated secret", create: true)
         model.openNote("Current.md"); ollamaRequests = []
         model.send("Summarize this note")
@@ -373,21 +374,20 @@ import AppKit
         blocked("non-image rejected") { _ = try vault.importImage(.data(Data("not an image".utf8), "png"), noteFolder: "") }
         // Tool calls written as text: executed through the sandboxed tools, never shown as prose.
         func textCall(_ text: String) -> [ToolCall]? { if case .calls(let calls, _) = TextToolCall.parse(text) { return calls }; return nil }
-        check(textCall(#"write_file{"path":"TOK.md","content":"# Hi"}"#)?.first?.name == "write_file", "name{json} text call parsed")
+        check(textCall(##"write_file{"path":"TOK.md","content":"# Hi"}"##)?.first?.name == "write_file", "name{json} text call parsed")
         check(textCall(#"{"tool":"append_to_file","path":"TOK.md","content":"x"}"#)?.first?.arguments["path"] as? String == "TOK.md", "flat JSON text call parsed")
         check(textCall("Sure.\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"TOK.md\"}}\n```")?.first?.name == "read_file", "prose then fenced call parsed")
         check(textCall(#"{"name":"Bob","age":3}"#) == nil && textCall(#"rm_rf{"path":"x"}"#) == nil && textCall("Use write_file to save notes.") == nil, "ordinary JSON, unknown names and prose are not calls")
         if case .invalid = TextToolCall.parse(#"write_file{"path":"TOK.md"}"#) { check(true, "call missing arguments is refused") } else { check(false, "call missing arguments is refused") }
-        check(ActionPresentation.reply(#"write_file{"path":"a.md","content":"# A
-long"}"#).isEmpty && ActionPresentation.reply("# Title\n\n- item") == "# Title\n\n- item", "raw tool syntax hidden, Markdown kept")
+        check(ActionPresentation.reply(##"write_file{"path":"a.md","content":"# A\nlong"}"##).isEmpty && ActionPresentation.reply("# Title\n\n- item") == "# Title\n\n- item", "raw tool syntax hidden, Markdown kept")
         var textRound = 0
         model.clearChat(); model.toolSupport = [:]
         model.requestOverride = { route, _ in
             if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
             guard route == "/api/chat" else { return [:] }
             textRound += 1
-            return ["message": ["role": "assistant", "content": textRound == 1 ? #"write_file{"path":"Current.md","content":"# TOK
-Added line"}"# : "Added it to Current.md."]]
+            let replies = [#"read_file{"path":"Current.md"}"#, ##"write_file{"path":"Current.md","content":"# TOK\nAdded line"}"##]
+            return ["message": ["role": "assistant", "content": textRound <= replies.count ? replies[textRound - 1] : "Added it to Current.md."]]
         }
         model.openNote("Current.md")
         model.send("Add this to Current.md")
@@ -397,6 +397,123 @@ Added line"}"# : "Added it to Current.md."]]
         _ = try model.executeTool("append_to_file", arguments: ["path": "Current.md", "content": "More"])
         check(try vault.read("Current.md") == "# TOK\nAdded line\n\nMore\n", "append keeps existing content")
         model.clearChat()
+
+        // Section edits, done by Obby rather than whole-note rewrites.
+        let sectioned = "# Plan\n\nIntro\n\n## Terms\n\nOld term\n\n```\n# not a heading\n```\n\n## Questions\n\nQ1\n"
+        try vault.write("Sections.md", content: sectioned, create: true)
+        let termsSection = try MarkdownSections.read(sectioned, heading: "terms", note: "Sections.md")
+        check(termsSection.contains("Old term") && !termsSection.contains("Q1") && termsSection.contains("not a heading"), "read one section by heading (code-fence # ignored)")
+        _ = try model.executeTool("replace_section", arguments: ["path": "Sections.md", "heading": "## Terms", "content": "New term"])
+        var afterEdit = try vault.read("Sections.md")
+        check(afterEdit.contains("## Terms\n\nNew term\n\n## Questions") && !afterEdit.contains("Old term") && afterEdit.contains("# Plan\n\nIntro"), "replace one section, others untouched")
+        let undoLine = model.pendingUndo
+        _ = try model.executeTool("append_to_section", arguments: ["path": "Sections.md", "heading": "Questions", "content": "Q2"])
+        afterEdit = try vault.read("Sections.md")
+        check(afterEdit.hasSuffix("Q1\n\nQ2\n") || afterEdit.contains("Q1\n\nQ2"), "append inside a section")
+        blocked("heading that doesn't exist") { _ = try model.executeTool("replace_section", arguments: ["path": "Sections.md", "heading": "Nope", "content": "x"]) }
+        blocked("ambiguous replace_text") { _ = try MarkdownSections.replaceText("a b a", find: "a", with: "c", note: "x") }
+        check(undoLine?.previous == sectioned, "each AI edit records the previous version for Undo")
+
+        // Undo restores the note exactly; a note the AI created goes to the Trash.
+        model.chat = [ChatLine(role: "Action", text: "Updated Sections.md.", undo: UndoEdit(path: "Sections.md", previous: sectioned, after: afterEdit))]
+        model.undoAIEdit(model.chat[0])
+        check(try vault.read("Sections.md") == sectioned && model.chat.first?.undo == nil, "Undo restores the previous version")
+        model.clearChat()
+
+        // Whole-note rewrites: must be read first during an AI request; much shorter replacements need the user's OK.
+        model.guardWrites = true; model.readThisRequest = []
+        blocked("rewrite without reading first") { _ = try model.executeTool("write_file", arguments: ["path": "Sections.md", "content": "x"]) }
+        _ = try model.executeTool("read_file", arguments: ["path": "Sections.md"])
+        model.shrinkOverride = { _ in false }
+        try vault.write("Long.md", content: String(repeating: "Long content. ", count: 60), create: true)
+        _ = try model.executeTool("read_file", arguments: ["path": "Long.md"])
+        let declined = try model.executeTool("write_file", arguments: ["path": "Long.md", "content": "short"])
+        let longNow = try vault.read("Long.md")
+        check(declined.hasPrefix("User declined replacing") && longNow.count > 400 && ActionPresentation.summary("write_file", arguments: ["path": "Long.md"], result: declined, failed: false) == "Kept Long.md unchanged.", "much shorter rewrite needs confirmation")
+        model.shrinkOverride = nil; model.guardWrites = false
+
+        // Tool routing: only the tools a request needs.
+        let editTools = ToolRouting.tools(for: "add this to TOK.md", hasAttachments: false)
+        check(editTools.contains("append_to_file") && editTools.contains("replace_section") && !editTools.contains("delete_path"), "edit request gets edit tools, not delete")
+        check(ToolRouting.tools(for: "Create a folder called Test", hasAttachments: false).contains("create_directory"), "create request gets create tools")
+        for greeting in ["hi there", "thanks!", "ok"] {
+            check(ToolRouting.isSmallTalk(greeting) && ToolRouting.tools(for: greeting, hasAttachments: false).isEmpty, "\"\(greeting)\" is small talk: no tools at all")
+        }
+        let unclear = ToolRouting.tools(for: "tell me more about the second idea please", hasAttachments: false)
+        check(!unclear.isEmpty && unclear.isDisjoint(with: ToolRouting.changing), "unmatched wording gets read-only tools, never changing ones")
+        check(ToolRouting.tools(for: "Where is the needle?", hasAttachments: false).contains("search_notes"), "short find request is not small talk")
+        model.relatedNotesLocal = true
+        let relatedForHi = await model.relatedNotes(for: "hi there", allowance: 10_000)
+        let relatedForThanks = await model.relatedNotes(for: "thanks!", allowance: 10_000)
+        check(relatedForHi.isEmpty && relatedForThanks.isEmpty, "small talk gets no related notes")
+        model.relatedNotesLocal = false
+        if case .call(let call) = ToolRouting.parseAction(#"{"action":"append_to_file","arguments":{"path":"TOK.md","content":"x"}}"#) { check(call.name == "append_to_file", "JSON action parsed") } else { check(false, "JSON action parsed") }
+        if case .reply(let text) = ToolRouting.parseAction(#"{"action":"reply","reply":"**Done**"}"#) { check(text == "**Done**", "JSON reply parsed") } else { check(false, "JSON reply parsed") }
+
+        // Memory quality: pins, "Remember that…", paths follow moves, missing files marked, folder context, related task.
+        model.clearChat()
+        model.pinFromRequest("Remember that my TOK title is question 3")
+        model.pinFromRequest("Remember when we did this?")
+        check(model.memory.pinned == ["My TOK title is question 3"], "\"Remember that…\" pins a fact; questions don't")
+        try vault.mkdir("Moves"); try vault.write("Moves/A.md", content: "a", create: true)
+        model.memory.remember(file: "Moves/A.md"); model.memory.remember(file: "Gone.md")
+        try vault.move("Moves", "Moved"); model.didMove("Moves", "Moved")
+        check(model.memory.relevantFiles.contains("Moved/A.md") && !model.memory.relevantFiles.contains("Moves/A.md"), "memory follows a moved folder")
+        check(model.memoryPacket().contains("no longer exist") && model.memoryPacket().contains("Gone.md"), "missing files are marked in memory")
+        model.setFolderContext("Moved", "IB Biology HL, likes flashcards")
+        model.openNote("Moved/A.md")
+        check(model.memoryPacket().contains("IB Biology HL"), "folder context included for notes in that folder")
+        model.setFolderContext("Moved", "")
+        model.history = [["role": "user", "content": "Work on A"], ["role": "assistant", "content": "Done"]]; model.persistChat()
+        let taskWithA = model.memory.id
+        model.clearChat()
+        check(model.relatedTask?.id == taskWithA, "opening a note offers the earlier task that used it")
+        model.clearAllChatMemory()
+
+        // One classifier, three cases: chat (no tools, no task memory), memory question (memory, no tools), work.
+        check(ToolRouting.classify("hi there") == .chat && ToolRouting.classify("thanks!") == .chat && ToolRouting.classify("ok") == .chat, "greetings are chat")
+        check(ToolRouting.classify("what did we decide?") == .memoryQuestion && ToolRouting.classify("Remind me where we left off") == .memoryQuestion, "memory questions recognised")
+        check(ToolRouting.classify("add this to TOK.md") == .work, "edit request is work")
+        var sentBodies: [String] = []
+        model.toolSupport = [:]
+        model.requestOverride = { route, body in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            guard route == "/api/chat" else { return [:] }
+            sentBodies.append(String(describing: body ?? [:]))
+            return ["message": ["role": "assistant", "content": "Hello!"]]
+        }
+        model.clearChat(); model.memory.pin("Deadline is Friday"); model.memory.currentGoal = "Finish TOK essay"
+        model.globalMemory.aboutMe = ["I study Biology HL"]
+        model.send("hi there")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let greetingSent = sentBodies.last ?? ""
+        check(greetingSent.contains("Reply briefly") && !greetingSent.contains("Deadline is Friday") && !greetingSent.contains("Finish TOK essay") && !greetingSent.contains("\"tools\"") && !greetingSent.contains("related_note") && greetingSent.contains("I study Biology HL"), "\"hi there\": no tools, no task memory, no related notes")
+        model.send("what did we decide?")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let memorySent = sentBodies.last ?? ""
+        check(memorySent.contains("Deadline is Friday") && memorySent.contains("Finish TOK essay") && !memorySent.contains("\"tools\""), "memory question gets task memory and pins, no tools")
+        model.clearAllChatMemory()
+
+        // About me: stated facts only, merged, capped, never sensitive, off when the toggle is off.
+        check(GlobalMemory.merge(["I study Biology HL"], ["i study biology HL.", "My exam is in May"]) == ["I study Biology HL", "My exam is in May"] || GlobalMemory.merge(["I study Biology HL"], ["i study biology HL.", "My exam is in May"]).count == 2, "near-duplicate facts merged")
+        check(GlobalMemory.merge(["My exam is in May", "I study Law"], ["My exam is in June"]) == ["I study Law", "My exam is in June"], "newer fact replaces older fact on the same subject")
+        check(GlobalMemory.merge([], (1...20).map { "Fact number \($0) about topic \($0 * 7)" }).count == GlobalMemory.aboutMeLimit && GlobalMemory.merge([], (1...20).map { "Fact number \($0) about topic \($0 * 7)" }).last == "Fact number 20 about topic 140", "cap enforced, oldest dropped")
+        check(GlobalMemory.merge([], ["My password is hunter2", "I have ADHD", "My bank is Lloyds", "I study Law"]) == ["I study Law"], "sensitive facts ignored")
+        check(GlobalMemory.statesPersonalFact("I'm doing Biology HL") && GlobalMemory.statesPersonalFact("my exam is in May") && !GlobalMemory.statesPersonalFact("Summarise TOK.md"), "personal statements recognised")
+        model.clearChat()
+        model.pinFromRequest("Remember that I prefer flashcards to essays")
+        check(model.globalMemory.aboutMe.contains("I prefer flashcards to essays") && model.memory.pinned.isEmpty, "\"Remember that I…\" goes to About me, not a task pin")
+        model.learnAboutMe = true
+        model.learnAboutUser(["I am doing Psychology SL"], statedIn: "btw I am doing Psychology SL this year")
+        model.learnAboutUser(["The user loves chess"], statedIn: "summarise my chess note")
+        check(model.globalMemory.aboutMe.contains("I am doing Psychology SL") && !model.globalMemory.aboutMe.contains("The user loves chess"), "only facts the user stated are learned")
+        model.learnAboutMe = false
+        model.learnAboutUser(["I play the violin"], statedIn: "I play the violin")
+        check(!model.globalMemory.aboutMe.contains("I play the violin"), "learning off: nothing learned")
+        model.learnAboutMe = true
+        let oldMemory = try JSONDecoder().decode(GlobalMemory.self, from: Data(#"{"preferences":["Bullet points"]}"#.utf8))
+        check(oldMemory.preferences == ["Bullet points"] && oldMemory.aboutMe.isEmpty, "old Memory.json files still load")
+        model.clearAllChatMemory()
 
         // Chat memory: saved per chat, restored, kept across model switches, cleared without touching notes.
         model.clearChat()

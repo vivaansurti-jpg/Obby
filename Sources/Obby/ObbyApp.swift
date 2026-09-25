@@ -250,6 +250,7 @@ struct InlineTitleEditor: NSViewRepresentable {
 struct AIView: View {
     @EnvironmentObject var model: AppModel
     @State var prompt = ""
+    @State var showMemory = false
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack { Text("Obby AI").font(.headline); Text(model.providerBadge).font(.caption).foregroundStyle(.secondary).help(model.isLocalProvider ? "Requests stay on this Mac." : "Requests are sent to this cloud provider."); Spacer()
@@ -273,8 +274,11 @@ struct AIView: View {
                 Text("Chat only · can work with the current note, but cannot use vault tools").font(.caption).foregroundStyle(.secondary)
             }
             if model.memory.itemCount + model.globalMemory.preferences.count > 0 {
-                Text("Memory · \(model.memory.itemCount + model.globalMemory.preferences.count) items").font(.caption2).foregroundStyle(.secondary)
-                    .help([model.globalMemory.packet, model.memory.packet].filter { !$0.isEmpty }.joined(separator: "\n\n"))
+                Button { showMemory = true } label: {
+                    Text("Memory · \(model.memory.itemCount + model.globalMemory.preferences.count) items").font(.caption2).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain).help("See and edit what this task remembers")
+                .popover(isPresented: $showMemory, arrowEdge: .bottom) { MemoryPopover().environmentObject(model) }
             }
             if let usage = model.contextUsage {
                 Text("Context: \(ContextBudget.label(usage.used)) / \(ContextBudget.windowLabel(usage.window))").font(.caption2).foregroundStyle(.secondary)
@@ -286,11 +290,14 @@ struct AIView: View {
                     LazyVStack(alignment: .leading, spacing: 18) {
                         if model.chat.isEmpty && !model.aiConfigured {
                             HStack(spacing: 6) { Text("Set up AI in Settings.").foregroundStyle(.secondary); SettingsGear() }.padding(.top, 12)
+                        } else if model.chat.isEmpty, let related = model.relatedTask {
+                            Button("Continue: \(related.title.isEmpty ? "earlier task" : related.title)") { model.openChat(related) }
+                                .buttonStyle(.link).font(.caption).padding(.top, 12).help("Reopen the earlier task that worked on this note")
                         } else if model.chat.isEmpty { Text(model.isLocalProvider ? "Ask a question, summarize a note, or organize your folders. Obby uses your local \(model.provider.label) model." : "Ask a question, summarize a note, or organize your folders. Obby uses \(model.provider.label); only what a request needs is sent.").foregroundStyle(.secondary).padding(.top, 12) }
                         // Presentation only: Obby renders the model's Markdown and its own action summaries; nothing here goes back to the model.
                         ForEach(ChatGroup.groups(model.chat)) { group in
                             if group.isActions {
-                                ActionGroupView(lines: group.lines, showRaw: model.showRawActions).id(group.id)
+                                ActionGroupView(lines: group.lines, showRaw: model.showRawActions, onUndo: { model.undoAIEdit($0) }).id(group.id)
                             } else if let line = group.lines.first {
                                 let displayed = line.role == "Obby" && !model.showRawActions ? ActionPresentation.reply(line.text) : line.text
                                 if !displayed.isEmpty {
@@ -302,6 +309,7 @@ struct AIView: View {
                                         }
                                         else { Text(displayed).textSelection(.enabled) }
                                     }.frame(maxWidth: .infinity, alignment: .leading).id(group.id)
+                                    .contextMenu { Button("Pin to Memory") { model.pin(line.text) } }
                                 }
                             }
                         }
@@ -314,15 +322,20 @@ struct AIView: View {
             if model.busy { HStack { ProgressView().controlSize(.small); Text(model.isLocalProvider ? "Working locally…" : "Working…").font(.caption); Spacer(); Button("Stop") { model.aiTask?.cancel() } } }
             Divider()
             TextField("Ask Obby…", text: $prompt, axis: .vertical).lineLimit(2...6).textFieldStyle(.roundedBorder).onSubmit { submit() }
-            HStack { Text("Only your Obby folder").font(.caption2).foregroundStyle(.secondary); Spacer(); Button("Send") { submit() }.keyboardShortcut(.return, modifiers: .command).disabled(model.busy || model.switchingModel || model.selectedModel.isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+            HStack { Text("Only your Obby folder").font(.caption2).foregroundStyle(.secondary); Spacer(); QuickActionsMenu(); Button("Send") { submit() }.keyboardShortcut(.return, modifiers: .command).disabled(model.busy || model.switchingModel || model.selectedModel.isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
         }.padding(14)
         .onAppear { prompt = model.aiDraft } // An unsent draft survives hiding the panel.
         .onDisappear { model.aiDraft = prompt }
     }
-    func submit() { guard !model.busy, !model.switchingModel, !model.selectedModel.isEmpty else { return }; model.send(prompt); prompt = "" }
+    func submit() {
+        guard !model.busy, !model.switchingModel, !model.selectedModel.isEmpty else { return }
+        if let quick = QuickAction.parse(prompt) { model.runQuickAction(quick.action, save: quick.save); prompt = ""; return } // "/flashcards", "/quiz save"…
+        model.send(prompt); prompt = ""
+    }
 }
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
+    @State var showMemory = false
     @State var url = ""
     @State var baseURL = ""
     @State var apiKey = ""
@@ -352,6 +365,11 @@ struct SettingsView: View {
                 Text(model.providerBadge).font(.caption.weight(.semibold))
                 Text(model.isLocalProvider ? "Your AI requests stay on this Mac." : "Relevant note or attachment content may be sent to this provider when you ask Obby to work with it.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("Include related notes automatically", isOn: model.isLocalProvider ? $model.relatedNotesLocal : $model.relatedNotesCloud)
+                    .onChange(of: model.relatedNotesLocal) { _ in model.persistSettings() }
+                    .onChange(of: model.relatedNotesCloud) { _ in model.persistSettings() }
+                Text(model.isLocalProvider ? "Adds short excerpts from your most relevant notes to each request (on by default for local models)." : "Adds short excerpts from your most relevant notes to each request. Off by default for cloud providers, because those excerpts are sent to them.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("Context window", selection: $model.contextWindow) {
                     ForEach(ContextWindow.allCases) { Text($0.label).tag($0) }
                 }.onChange(of: model.contextWindow) { _ in model.persistSettings() }
@@ -359,19 +377,21 @@ struct SettingsView: View {
             }
             if model.provider == .ollama { ollamaSection } else { cloudSection }
             Section("Memory") {
+                Button("Obby knows \(model.globalMemory.aboutMe.count + model.globalMemory.preferences.count) things about you · View") { showMemory = true }
+                    .buttonStyle(.link)
+                Toggle("Learn about me from chats", isOn: $model.learnAboutMe)
+                    .onChange(of: model.learnAboutMe) { _ in model.persistSettings() }
                 Toggle("Remember AI tasks between launches", isOn: $model.rememberChats)
                     .onChange(of: model.rememberChats) { on in model.persistSettings(); if on { model.persistChat() }; model.reloadSavedChats() }
                 HStack {
                     Button("Clear current task memory") { model.clearCurrentChatMemory() }.disabled(model.busy)
                     Button("Clear all AI memory") { model.clearAllChatMemory() }.disabled(model.busy)
                 }
-                ForEach(model.globalMemory.preferences, id: \.self) { item in // Durable preferences you stated ("from now on…").
-                    HStack { Text(item).font(.caption).lineLimit(2); Spacer(); Button { model.forgetGlobalPreference(item) } label: { Image(systemName: "minus.circle") }.buttonStyle(.borderless).help("Forget this preference") }
-                }
                 Text("Task memory is a short summary kept on this Mac, separate from your notes. Clearing it never deletes notes or attachments.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }.formStyle(.grouped).frame(width: 520, height: 600)
+            .sheet(isPresented: $showMemory) { MemorySettingsSheet().environmentObject(model) }
             .task { syncDrafts(); await model.connect() }
             .onChange(of: model.selectedModel) { value in manualModel = value }
     }

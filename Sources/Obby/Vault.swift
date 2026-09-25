@@ -361,3 +361,75 @@ extension Vault {
         return result.isEmpty ? "image" : String(result.prefix(80))
     }
 }
+
+/// Section-level Markdown edits, done by Obby rather than by asking a model to rewrite a whole note.
+/// Headings are ATX lines ("#".."######") outside fenced code blocks; a section runs until the next heading of the
+/// same or a higher level.
+enum MarkdownSections {
+    struct Heading { let line: Int; let level: Int; let title: String }
+    static func headings(_ lines: [String]) -> [Heading] {
+        var result: [Heading] = [], inFence = false
+        for (index, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") { inFence.toggle(); continue }
+            guard !inFence, trimmed.hasPrefix("#") else { continue }
+            let level = trimmed.prefix(while: { $0 == "#" }).count
+            let rest = trimmed.dropFirst(level)
+            guard level <= 6, rest.isEmpty || rest.first == " " else { continue }
+            result.append(Heading(line: index, level: level, title: rest.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "#")).trimmingCharacters(in: .whitespaces)))
+        }
+        return result
+    }
+    static func normalise(_ heading: String) -> String {
+        heading.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "#"))).trimmingCharacters(in: CharacterSet(charactersIn: ":")).lowercased()
+    }
+    /// The section for `heading`: exact (case-insensitive) title first, otherwise a unique partial match.
+    static func locate(_ lines: [String], heading: String, note: String) throws -> (start: Int, end: Int) {
+        let all = headings(lines), wanted = normalise(heading)
+        var matches = all.filter { normalise($0.title) == wanted }
+        if matches.isEmpty, !wanted.isEmpty { matches = all.filter { normalise($0.title).contains(wanted) } }
+        guard !matches.isEmpty else {
+            let list = all.prefix(12).map { $0.title }.joined(separator: ", ")
+            throw ObbyError(all.isEmpty ? "\(note) has no headings." : "\(note) has no section called “\(heading)”. Its headings are: \(list).")
+        }
+        guard matches.count == 1 else { throw ObbyError("\(note) has more than one section called “\(heading)”. Use the exact heading.") }
+        let found = matches[0]
+        let end = all.first { $0.line > found.line && $0.level <= found.level }?.line ?? lines.count
+        return (found.line, end)
+    }
+    static func read(_ text: String, heading: String, note: String) throws -> String {
+        let lines = text.components(separatedBy: "\n"), range = try locate(lines, heading: heading, note: note)
+        return lines[range.start..<range.end].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    /// Replaces the body under the heading (the heading line itself is kept). A repeated heading line at the start of
+    /// `content` is dropped so the heading is not duplicated.
+    static func replace(_ text: String, heading: String, with content: String, note: String) throws -> String {
+        var lines = text.components(separatedBy: "\n")
+        let range = try locate(lines, heading: heading, note: note)
+        var body = content.trimmingCharacters(in: .newlines).components(separatedBy: "\n")
+        if let first = body.first, first.trimmingCharacters(in: .whitespaces).hasPrefix("#"), normalise(first) == normalise(lines[range.start]) { body.removeFirst() }
+        while body.first?.trimmingCharacters(in: .whitespaces).isEmpty == true { body.removeFirst() }
+        let tail = range.end < lines.count ? [""] : []
+        lines.replaceSubrange((range.start + 1)..<range.end, with: [""] + body + tail)
+        return lines.joined(separator: "\n")
+    }
+    /// Adds `content` at the end of the section, keeping what is already there.
+    static func append(_ text: String, heading: String, content: String, note: String) throws -> String {
+        var lines = text.components(separatedBy: "\n")
+        let range = try locate(lines, heading: heading, note: note)
+        var end = range.end
+        while end > range.start + 1, lines[end - 1].trimmingCharacters(in: .whitespaces).isEmpty { end -= 1 }
+        let addition = content.trimmingCharacters(in: .newlines).components(separatedBy: "\n")
+        let tail = range.end < lines.count ? [""] : []
+        lines.replaceSubrange(end..<range.end, with: [""] + addition + tail)
+        return lines.joined(separator: "\n")
+    }
+    /// Replaces one exact passage; refuses if it is missing or appears more than once.
+    static func replaceText(_ text: String, find: String, with replacement: String, note: String) throws -> String {
+        guard !find.isEmpty else { throw ObbyError("Say which text to replace.") }
+        let count = text.components(separatedBy: find).count - 1
+        guard count == 1 else { throw ObbyError(count == 0 ? "That text isn’t in \(note). Read the note and copy the passage exactly." : "That text appears \(count) times in \(note). Include more of the surrounding text so it matches once.") }
+        return text.replacingOccurrences(of: find, with: replacement)
+    }
+}
+

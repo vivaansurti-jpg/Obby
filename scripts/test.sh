@@ -40,5 +40,5 @@ resolve_sdk() {
 
 SDK="$(resolve_sdk)"
 mkdir -p build
-swiftc -sdk "$SDK" -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/Obby/Vault.swift Sources/Obby/Editor.swift Sources/Obby/Model.swift Sources/Obby/Ollama.swift Sources/Obby/ChatMemory.swift Sources/Obby/ModelSettings.swift Sources/Obby/SidebarDrag.swift Sources/Obby/AIProvider.swift Sources/Obby/Keychain.swift Sources/Obby/ContextBudget.swift scripts/Checks.swift -o build/ObbyChecks -framework SwiftUI -framework AppKit -framework Security -module-cache-path /tmp/obby-swift-cache
+swiftc -sdk "$SDK" -target "$(uname -m)-apple-macosx13.0" -parse-as-library Sources/Obby/Vault.swift Sources/Obby/Editor.swift Sources/Obby/Model.swift Sources/Obby/Ollama.swift Sources/Obby/ChatMemory.swift Sources/Obby/ModelSettings.swift Sources/Obby/SidebarDrag.swift Sources/Obby/AIProvider.swift Sources/Obby/Keychain.swift Sources/Obby/ContextBudget.swift Sources/Obby/NoteIndex.swift scripts/Checks.swift -o build/ObbyChecks -framework SwiftUI -framework AppKit -framework Security -module-cache-path /tmp/obby-swift-cache
 build/ObbyChecks

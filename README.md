@@ -153,3 +153,31 @@ Obby does not own your content; it is an interface over a normal folder you choo
 If the model wants to do something, Obby does it; if it wants to say something, Obby renders it. Native tool calls are executed through Obby's sandboxed file layer. Some smaller local models write a tool call as text instead (for example `write_file{"path":"TOK.md","content":"…"}` or `{"tool":"write_file",…}`); Obby recognises this only when the reply is (or ends in) a call to a known Obby tool with all required arguments, and runs it through the same checks. Ordinary JSON, code, prose and unknown tool names are never executed. A call Obby can't read is reported as "Couldn't run the requested action" and the model is asked once or twice to retry; it is never shown as text.
 
 With **Show raw actions** off, the chat shows only compact summaries (✓ Updated TOK.md, ✓ Created the Test folder) and failures such as "Couldn't update TOK.md." with a short reason; raw calls, IDs, JSON and payloads appear only when it is on. Tool payloads never reach the Markdown renderer. `append_to_file` adds to the end of a note while keeping its existing content, so "add this to TOK.md" doesn't require rewriting the note. Before any tool runs, pending editor changes are saved; after an AI edit to the open note, the editor reloads the new text straight away, so autosave can't overwrite the AI's change.
+
+## Safer AI edits
+
+- **Undo**: every AI change to a note (edit, append, section change, rewrite, or a note it created) gets an **Undo** button on its action line. Undo puts the note back exactly as it was, or moves an AI-created note to the Trash. If the note changed after the AI edit, Obby asks first. Undo history is kept in memory for the session only.
+- **Rewrite checks**: during an AI request, the model may replace a whole note only after reading it, and replacing a substantial note (over about 400 characters) with something much shorter (under 60%) asks for confirmation.
+- **Section tools**: `read_section`, `replace_section`, `append_to_section` and `replace_text` let the model change one part of a note (by heading, or one exact passage) without rewriting the rest. Headings inside code blocks are ignored.
+- **Tool routing**: each request is offered only the tools its wording needs (for example editing tools for "add this to…", folder tools for "move…"), which makes small models far more reliable. Tools that change or delete notes are offered only when the wording asks for them; other requests get read-only tools. Short conversational messages ("hi there", "thanks!", "ok") get a one-line prompt with only your lasting preferences: no tools, no task memory, no related notes and no action format. Questions about the task itself ("what did we decide?", "remind me", "where were we") get the task memory and pins but no tools, and a text tool call for a tool the request wasn't offered is never run.
+- **Related notes** are only searched for requests of at least four meaningful words, and weak matches are left out.
+- **Action format for local models without tool support**: when such an Ollama model is asked to change notes, Obby uses Ollama structured outputs so the reply must be either one valid action or a plain answer, which Obby then runs through the same checks.
+
+## Memory tools
+
+- **Memory viewer**: click "Memory · N items" in the AI panel to see what the current task remembers (goal, pinned facts, summary, decisions, next steps, preferences, completed actions, files, lasting preferences), edit the goal and remove any item.
+- **Pinning**: right-click any message and choose **Pin to Memory**, or start a request with "Remember that…". Pinned facts are never condensed away (up to 20 per task).
+- **Folder context**: right-click a folder (or a note, for its folder) and choose **Folder Context…** to give the AI a short standing note about that folder, used whenever it works on notes there. Stored in Obby's memory file, not in your notes.
+- **Accurate file references**: when notes or folders are moved, renamed or deleted in Obby, every task memory and folder context follows the change. Files moved or deleted outside Obby are marked as no longer existing rather than silently misleading the model.
+- **Continue**: opening a note that an earlier task worked on shows "Continue: <task>" in an empty chat.
+- **Related notes**: Obby can add short excerpts from your most relevant notes to each request, found with an in-memory keyword index that is never written to disk (on by default for local models, off for cloud providers; Settings → AI Provider). A "Using:" line shows which notes were included.
+- **Quick actions**: the wand menu next to Send, or typing `/summarise`, `/flashcards`, `/quiz`, `/outline` or `/revision` (add `save` to save the result as a new note beside the current one).
+
+## About me
+
+Obby keeps a short "About me" list (up to 15 lines of at most 120 characters) in `Memory.json`, and includes it as "About the user" in every request, small talk included (roughly 50 to 100 tokens).
+
+- **Learning without extra requests**: when you state something about yourself ("I'm doing Biology HL", "my exam is in May", "I study…", "I prefer…"), the existing memory update also picks out facts you stated about yourself. Obby keeps a fact only if you actually said it (its words must appear in your own message), never guesses or note contents, and never anything sensitive (health, money, passwords, ID numbers).
+- **Merging**: near-duplicates are merged, a newer fact replaces an older one on the same subject ("my exam is in June" replaces "my exam is in May"), and when the list is full the oldest fact is dropped.
+- **"Remember that I…"** or **"Remember I…"** goes straight to About me; other "Remember that…" requests stay pinned to the current task.
+- **Settings → Memory**: "Obby knows N things about you · View" opens a viewer for About me, lasting preferences, folder contexts and saved tasks. Every item can be edited or removed, and About me and preferences have an Add field. **Learn about me from chats** (on by default) turns learning off; explicit "Remember that I…" still works. **Clear all AI memory** also clears About me.

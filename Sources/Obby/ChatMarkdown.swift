@@ -371,6 +371,7 @@ struct ChatGroup: Identifiable {
 struct ActionGroupView: View {
     let lines: [ChatLine]
     let showRaw: Bool
+    var onUndo: ((ChatLine) -> Void)? = nil
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             ForEach(lines) { line in
@@ -379,6 +380,9 @@ struct ActionGroupView: View {
                         .imageScale(.small)
                         .accessibilityHidden(true)
                     Text(line.text.hasSuffix(".") ? String(line.text.dropLast()) : line.text)
+                    if let onUndo, line.undo != nil {
+                        Button("Undo") { onUndo(line) }.buttonStyle(.link).help("Put the note back exactly as it was before this AI change")
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -397,3 +401,183 @@ struct ActionGroupView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
+
+/// The memory viewer (click "Memory · N items"): what this task remembers, editable and removable item by item.
+/// Changes are saved immediately. Notes are never copied here; files are listed by path.
+struct MemoryPopover: View {
+    @EnvironmentObject var model: AppModel
+    @State private var goal = ""
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("This task’s memory").font(.headline)
+                Text("Kept on this Mac and sent with each request, whichever model you use. Notes are read from disk, not copied here.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Goal").font(.caption.weight(.semibold))
+                    TextField("What this task is for", text: $goal, axis: .vertical).textFieldStyle(.roundedBorder).font(.caption)
+                        .onSubmit { saveGoal() }
+                }
+                list("Pinned", \.pinned)
+                if !model.memory.summary.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack { Text("Summary").font(.caption.weight(.semibold)); Spacer(); remove { model.memory.summary = "" } }
+                        Text(model.memory.summary).font(.caption).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                list("Decisions", \.decisions)
+                list("Next steps", \.openQuestions)
+                list("Preferences for this task", \.preferences)
+                list("Completed", \.completedActions)
+                if !model.memory.relevantFiles.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Files").font(.caption.weight(.semibold))
+                        ForEach(Array(model.memory.relevantFiles.enumerated()), id: \.offset) { index, path in
+                            HStack(alignment: .top) {
+                                Text(path).font(.caption).strikethrough(!model.fileExists(path)).help(model.fileExists(path) ? path : "No longer exists (moved or deleted outside Obby)")
+                                Spacer()
+                                remove { model.memory.relevantFiles.remove(at: index) }
+                            }
+                        }
+                    }
+                }
+                if !model.globalMemory.preferences.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Lasting preferences (every task)").font(.caption.weight(.semibold))
+                        ForEach(model.globalMemory.preferences, id: \.self) { item in
+                            HStack(alignment: .top) { Text(item).font(.caption).fixedSize(horizontal: false, vertical: true); Spacer(); remove { model.forgetGlobalPreference(item) } }
+                        }
+                    }
+                }
+                Divider()
+                Button("Clear this task’s memory", role: .destructive) { model.clearCurrentChatMemory() }.font(.caption).disabled(model.busy)
+            }
+            .padding(14)
+        }
+        .frame(width: 340, height: 440)
+        .onAppear { goal = model.memory.currentGoal }
+        .onDisappear { saveGoal() }
+    }
+    func saveGoal() {
+        let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != model.memory.currentGoal else { return }
+        model.memory.currentGoal = String(trimmed.prefix(240)); model.persistChat()
+    }
+    @ViewBuilder func list(_ title: String, _ key: WritableKeyPath<ChatRecord, [String]>) -> some View {
+        let items = model.memory[keyPath: key]
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.caption.weight(.semibold))
+                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                    HStack(alignment: .top) {
+                        Text(item).font(.caption).fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        remove { if index < model.memory[keyPath: key].count { model.memory[keyPath: key].remove(at: index) } }
+                    }
+                }
+            }
+        }
+    }
+    func remove(_ action: @escaping () -> Void) -> some View {
+        Button { action(); model.persistChat() } label: { Image(systemName: "minus.circle") }
+            .buttonStyle(.borderless).help("Remove from memory")
+    }
+}
+
+/// Settings → Memory → View: everything Obby remembers across tasks, editable and removable item by item.
+struct MemorySettingsSheet: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var newFact = ""
+    @State private var newPreference = ""
+    @State private var tasks: [ChatRecord] = []
+    var body: some View {
+        VStack(spacing: 0) {
+            List {
+                Section("About me") {
+                    ForEach(model.globalMemory.aboutMe.indices, id: \.self) { index in
+                        editableRow(Binding(get: { index < model.globalMemory.aboutMe.count ? model.globalMemory.aboutMe[index] : "" },
+                                            set: { if index < model.globalMemory.aboutMe.count { model.globalMemory.aboutMe[index] = String($0.prefix(GlobalMemory.aboutMeLength)) } }),
+                                    remove: { model.globalMemory.aboutMe.remove(at: index) })
+                    }
+                    addRow("Add a fact about you…", text: $newFact) {
+                        model.globalMemory.aboutMe = GlobalMemory.merge(model.globalMemory.aboutMe, [newFact])
+                    }
+                }
+                Section("Lasting preferences") {
+                    ForEach(model.globalMemory.preferences.indices, id: \.self) { index in
+                        editableRow(Binding(get: { index < model.globalMemory.preferences.count ? model.globalMemory.preferences[index] : "" },
+                                            set: { if index < model.globalMemory.preferences.count { model.globalMemory.preferences[index] = String($0.prefix(200)) } }),
+                                    remove: { model.globalMemory.preferences.remove(at: index) })
+                    }
+                    addRow("Add a preference…", text: $newPreference) {
+                        let item = newPreference.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !item.isEmpty, !model.globalMemory.preferences.contains(item) { model.globalMemory.preferences = Array((model.globalMemory.preferences + [String(item.prefix(200))]).suffix(10)) }
+                    }
+                }
+                Section("Folder contexts") {
+                    let keys = model.globalMemory.folders.keys.sorted()
+                    if keys.isEmpty { Text("None yet. Right-click a folder in the sidebar and choose Folder Context…").foregroundStyle(.secondary) }
+                    ForEach(keys, id: \.self) { key in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(folderLabel(key)).font(.caption).foregroundStyle(.secondary)
+                            editableRow(Binding(get: { model.globalMemory.folders[key] ?? "" }, set: { model.globalMemory.folders[key] = String($0.prefix(500)) }),
+                                        remove: { model.globalMemory.folders.removeValue(forKey: key) })
+                        }
+                    }
+                }
+                Section("Saved tasks") {
+                    if tasks.isEmpty { Text("No saved tasks for this notes folder.").foregroundStyle(.secondary) }
+                    ForEach(tasks) { task in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                TextField("Task title", text: Binding(get: { tasks.first { $0.id == task.id }?.title ?? "" },
+                                                                      set: { title in rename(task.id, title) }))
+                                Text("Last used " + task.updatedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button { ChatStore.delete(task.id); reloadTasks() } label: { Image(systemName: "minus.circle") }
+                                .buttonStyle(.borderless).help("Forget this task (notes are not affected)")
+                        }
+                    }
+                }
+            }
+            Divider()
+            HStack {
+                Text("Kept on this Mac. Removing memory never deletes notes or attachments.").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }.padding(12)
+        }
+        .frame(width: 520, height: 560)
+        .onAppear { reloadTasks() }
+        .onChange(of: model.globalMemory) { memory in memory.save() } // Every edit is saved straight away.
+        .onDisappear { model.globalMemory.aboutMe.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }; model.globalMemory.preferences.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }; model.reloadSavedChats() }
+    }
+    func editableRow(_ text: Binding<String>, remove: @escaping () -> Void) -> some View {
+        HStack {
+            TextField("", text: text)
+            Button(action: remove) { Image(systemName: "minus.circle") }.buttonStyle(.borderless).help("Remove")
+        }
+    }
+    func addRow(_ placeholder: String, text: Binding<String>, add: @escaping () -> Void) -> some View {
+        HStack {
+            TextField(placeholder, text: text).onSubmit { add(); text.wrappedValue = "" }
+            Button("Add") { add(); text.wrappedValue = "" }.disabled(text.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+    func folderLabel(_ key: String) -> String {
+        let parts = key.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        let root = ((parts.first ?? "") as NSString).lastPathComponent
+        let folder = parts.count > 1 ? parts[1] : ""
+        return folder.isEmpty ? root + " (whole folder)" : root + " › " + folder
+    }
+    func reloadTasks() { tasks = model.vault.map { ChatStore.all(root: $0.root.path) } ?? [] }
+    func rename(_ id: UUID, _ title: String) {
+        guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
+        tasks[index].title = String(title.prefix(80))
+        ChatStore.save(tasks[index])
+        if model.memory.id == id { model.memory.title = tasks[index].title }
+    }
+}
+

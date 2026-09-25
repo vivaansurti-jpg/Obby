@@ -58,7 +58,7 @@ struct NativeFileSidebar: NSViewRepresentable {
         outline.setDraggingSourceOperationMask(.move, forLocal: true)
         outline.setDraggingSourceOperationMask([], forLocal: false)
         let menu = NSMenu()
-        for (title, action) in [("Rename…", #selector(Coordinator.rename)), ("Move…", #selector(Coordinator.move)), ("Move to Trash…", #selector(Coordinator.remove))] {
+        for (title, action) in [("Rename…", #selector(Coordinator.rename)), ("Move…", #selector(Coordinator.move)), ("Folder Context…", #selector(Coordinator.folderContext)), ("Move to Trash…", #selector(Coordinator.remove))] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = context.coordinator; menu.addItem(item)
         }
@@ -176,5 +176,6 @@ struct NativeFileSidebar: NSViewRepresentable {
         @objc func rename() { if let path = contextPath { model.relocate(path, rename: true) } }
         @objc func move() { if let path = contextPath { model.relocate(path, rename: false) } }
         @objc func remove() { if let path = contextPath { model.remove(path) } }
+        @objc func folderContext() { if let path = contextPath { model.editFolderContext(path) } }
     }
 }

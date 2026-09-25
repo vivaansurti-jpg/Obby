@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 // Session-only values. Never encode these into preferences, files, or logs.
 enum ChatMemory {
@@ -49,12 +50,12 @@ extension AppModel {
     func appendChat(role: String, text: String) {
         chat = ChatMemory.trimDisplay(chat + [ChatLine(role: role, text: text)])
     }
-    func appendAction(call: [String: Any], name: String, arguments: [String: Any], response: [String: Any], failed: Bool) {
+    func appendAction(call: [String: Any], name: String, arguments: [String: Any], response: [String: Any], failed: Bool, undo: UndoEdit? = nil) {
         let result = response["content"] as? String ?? ""
         let data = try? JSONSerialization.data(withJSONObject: ["call": call, "response": response], options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         let raw = data.flatMap { String(data: $0, encoding: .utf8) }
         let summary = ActionPresentation.summary(name, arguments: arguments, result: result, failed: failed)
-        let line = ChatLine(role: "Action", text: summary, rawAction: raw, unsuccessful: failed || summary == "Deletion cancelled.")
+        let line = ChatLine(role: "Action", text: summary, rawAction: raw, unsuccessful: failed || summary == "Deletion cancelled.", undo: failed ? nil : undo)
         chat = ChatMemory.trimDisplay(chat + [line])
     }
     /// A compact informational line in the action list (not sent to the model).
@@ -78,21 +79,25 @@ enum ActionPresentation {
     static func name(_ path: String) -> String { path.split(separator: "/").last.map(String.init) ?? "Obby" }
     static func summary(_ tool: String, arguments: [String: Any], result: String, failed: Bool) -> String {
         func arg(_ key: String) -> String { arguments[key] as? String ?? "" }
+        let heading = arg("heading").trimmingCharacters(in: CharacterSet(charactersIn: "# "))
         if failed { // "Couldn’t update TOK.md." plus Obby's own short reason; never raw exceptions, JSON or full Mac paths.
             let reason = result.hasPrefix("Error: ") ? String(result.dropFirst(7)) : ""
             let safeReason = reason.isEmpty || reason.contains("/Users/") || reason.contains("/private/") || reason.hasPrefix("/") || reason.contains("{") ? "" : reason
             if tool == "read_attachment" || tool == "read_file", !safeReason.isEmpty { return safeReason }
             let path = arg("path").isEmpty ? arg("oldPath") : arg("path")
-            let verbs = ["write_file": "update", "append_to_file": "update", "create_file": "create", "create_directory": "create",
+            let verbs = ["write_file": "update", "append_to_file": "update", "replace_section": "update", "append_to_section": "update", "replace_text": "update", "read_section": "read", "create_file": "create", "create_directory": "create",
                          "rename_path": "rename", "move_path": "move", "delete_path": "delete", "read_file": "read", "read_attachment": "read"]
             let target = path.isEmpty ? "the item" : name(path)
             return "Couldn’t \(verbs[tool] ?? "complete this action for") \(target)." + (safeReason.isEmpty ? "" : " " + safeReason)
         }
         if tool == "delete_path" && result == "User declined deletion. Do not retry." { return "Deletion cancelled." }
+        if result.hasPrefix("User declined replacing") { return "Kept \(name(arg("path"))) unchanged." }
         switch tool {
         case "create_directory": return "Created the \(name(arg("path"))) folder."
         case "create_file": return "Created \(name(arg("path")))."
-        case "write_file", "append_to_file": return "Updated \(name(arg("path")))."
+        case "write_file", "append_to_file", "replace_text": return "Updated \(name(arg("path")))."
+        case "replace_section", "append_to_section": return "Updated the “\(heading)” section of \(name(arg("path")))."
+        case "read_section": return "Read the “\(heading)” section of \(name(arg("path")))."
         case "read_file", "read_attachment": return "Read \(name(arg("path")))."
         case "list_directory": return "Checked the \(name(arg("path"))) folder."
         case "search_notes": return "Searched your notes for “\(arg("query"))”."
@@ -133,7 +138,7 @@ enum ActionPresentation {
         }.joined(separator: "\n")
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    static let toolNames: Set<String> = ["list_directory", "read_file", "read_attachment", "append_to_file", "write_file", "create_file", "create_directory", "rename_path", "move_path", "delete_path", "search_notes"]
+    static let toolNames: Set<String> = ["list_directory", "read_file", "read_attachment", "append_to_file", "read_section", "replace_section", "append_to_section", "replace_text", "write_file", "create_file", "create_directory", "rename_path", "move_path", "delete_path", "search_notes"]
     /// True only for the shapes of tool calls: {"tool_calls": …}, {"name": <Obby tool>, "arguments": …}, {"function": {…}}.
     static func isToolEnvelope(_ json: Any) -> Bool {
         if let array = json as? [Any] { return !array.isEmpty && array.allSatisfy(isToolEnvelope) }
@@ -188,12 +193,16 @@ struct ChatRecord: Codable, Identifiable, Equatable {
     var completedActions: [String] = []
     var openQuestions: [String] = []
     var preferences: [String] = [] // Preferences the user stated for this task only.
-    var isEmpty: Bool { recentMessages.isEmpty && summary.isEmpty }
+    var pinned: [String] = [] // Facts the user pinned ("Pin to Memory", "Remember that…"). Never condensed away.
+    var isEmpty: Bool { recentMessages.isEmpty && summary.isEmpty && pinned.isEmpty }
     /// Structured memory items (for the small "Memory · N items" indicator).
-    var itemCount: Int { (currentGoal.isEmpty ? 0 : 1) + (summary.isEmpty ? 0 : 1) + decisions.count + completedActions.count + openQuestions.count + preferences.count + relevantFiles.count }
+    var itemCount: Int { (currentGoal.isEmpty ? 0 : 1) + (summary.isEmpty ? 0 : 1) + pinned.count + decisions.count + completedActions.count + openQuestions.count + preferences.count + relevantFiles.count }
     /// The compact memory sent with a request (only this chat's, never the whole store).
-    var packet: String {
+    var packet: String { packet(missing: []) }
+    /// `missing`: remembered files that no longer exist (moved or deleted outside Obby), listed separately.
+    func packet(missing: Set<String>) -> String {
         var parts: [String] = []
+        if !pinned.isEmpty { parts.append("Pinned by the user (keep these in mind):\n" + pinned.map { "- " + $0 }.joined(separator: "\n")) }
         if !currentGoal.isEmpty { parts.append("Current goal: " + currentGoal) }
         if !summary.isEmpty { parts.append("Summary so far:\n" + summary) }
         func list(_ title: String, _ items: [String]) { if !items.isEmpty { parts.append(title + ":\n" + items.map { "- " + $0 }.joined(separator: "\n")) } }
@@ -201,8 +210,16 @@ struct ChatRecord: Codable, Identifiable, Equatable {
         list("Completed actions", Array(completedActions.suffix(12)))
         list("Open questions and next steps", openQuestions)
         list("Preferences for this task", preferences)
-        if !relevantFiles.isEmpty { parts.append("Relevant files (read them again if needed; they may have changed): " + relevantFiles.joined(separator: ", ")) }
+        let present = relevantFiles.filter { !missing.contains($0) }
+        if !present.isEmpty { parts.append("Relevant files (read them again if needed; they may have changed): " + present.joined(separator: ", ")) }
+        let gone = relevantFiles.filter { missing.contains($0) }
+        if !gone.isEmpty { parts.append("Files this task used that no longer exist (moved or deleted outside Obby): " + gone.joined(separator: ", ")) }
         return parts.joined(separator: "\n\n")
+    }
+    mutating func pin(_ fact: String) {
+        let text = fact.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !pinned.contains(text) else { return }
+        pinned.append(text); pinned = Array(pinned.suffix(20))
     }
     mutating func remember(file: String) {
         guard !file.isEmpty else { return }
@@ -229,6 +246,7 @@ extension ChatRecord {
         completedActions = try c.decodeIfPresent([String].self, forKey: .completedActions) ?? []
         openQuestions = try c.decodeIfPresent([String].self, forKey: .openQuestions) ?? []
         preferences = try c.decodeIfPresent([String].self, forKey: .preferences) ?? []
+        pinned = try c.decodeIfPresent([String].self, forKey: .pinned) ?? []
     }
 }
 
@@ -236,7 +254,76 @@ extension ChatRecord {
 /// Saved as Application Support/Obby/Memory.json.
 struct GlobalMemory: Codable, Equatable {
     var preferences: [String] = []
-    var packet: String { preferences.isEmpty ? "" : "User preferences (apply to every task):\n" + preferences.map { "- " + $0 }.joined(separator: "\n") }
+    var folders: [String: String] = [:] // Folder context, keyed "<notes root>|<folder path>".
+    var aboutMe: [String] = [] // Facts the user stated about themselves ("I'm doing Biology HL"), newest last.
+    init() {}
+    init(from decoder: Decoder) throws { // Older Memory.json files may lack any of these.
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        preferences = try c.decodeIfPresent([String].self, forKey: .preferences) ?? []
+        folders = try c.decodeIfPresent([String: String].self, forKey: .folders) ?? [:]
+        aboutMe = try c.decodeIfPresent([String].self, forKey: .aboutMe) ?? []
+    }
+    /// Sent with every request (small talk too): who the user is, then their lasting preferences.
+    var packet: String {
+        var parts: [String] = []
+        if !aboutMe.isEmpty { parts.append("About the user:\n" + aboutMe.map { "- " + $0 }.joined(separator: "\n")) }
+        if !preferences.isEmpty { parts.append("User preferences (apply to every task):\n" + preferences.map { "- " + $0 }.joined(separator: "\n")) }
+        return parts.joined(separator: "\n\n")
+    }
+
+    // MARK: About me
+
+    static let aboutMeLimit = 15, aboutMeLength = 120
+    /// Never stored, even if stated: health, finances, credentials and identity numbers.
+    static let sensitiveWords = ["password", "passcode", "pin code", "login", "credential", "social security", "ssn", "passport", "national id",
+                                 "credit card", "card number", "bank", "account number", "iban", "salary", "income", "debt", "loan", "net worth",
+                                 "diagnos", "medication", "medicine", "illness", "disease", "disorder", "depress", "anxiety", "therapy", "therapist",
+                                 "pregnan", "adhd", "autis", "cancer", "diabet", "hiv", "health", "doctor", "hospital", "address is", "phone number"]
+    static func isSensitive(_ fact: String) -> Bool {
+        let lowered = fact.lowercased()
+        return sensitiveWords.contains(where: lowered.contains) || lowered.range(of: "[0-9]{6,}", options: .regularExpression) != nil
+    }
+    static func normalised(_ text: String) -> [String] {
+        text.lowercased().replacingOccurrences(of: "’", with: "'").split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" }).map(String.init)
+    }
+    /// "My exam is in May" and "My exam is in June" share the subject "my exam" (a newer fact replaces the older one).
+    static func subject(_ fact: String) -> String? {
+        let words = normalised(fact)
+        guard words.first == "my", let verb = words.firstIndex(where: { ["is", "are", "was", "will"].contains($0) }), verb <= 4 else { return nil }
+        return words[..<verb].joined(separator: " ")
+    }
+    static func similar(_ a: String, _ b: String) -> Bool {
+        let x = Set(normalised(a)), y = Set(normalised(b))
+        guard !x.isEmpty, !y.isEmpty else { return false }
+        if x == y || x.isSubset(of: y) || y.isSubset(of: x) { return true }
+        return Double(x.intersection(y).count) / Double(x.union(y).count) >= 0.7
+    }
+    /// Adds facts: sensitive ones are dropped, near duplicates and same-subject facts are replaced by the newer
+    /// wording, and when full the oldest are dropped.
+    static func merge(_ existing: [String], _ new: [String]) -> [String] {
+        var result = existing
+        for raw in new {
+            var fact = raw.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "-•* "))
+            guard fact.count >= 3, !isSensitive(fact) else { continue }
+            if fact.count > aboutMeLength { fact = String(fact.prefix(aboutMeLength)) }
+            let topic = subject(fact)
+            result.removeAll { similar($0, fact) || (topic != nil && subject($0) == topic) }
+            result.append(fact)
+        }
+        return Array(result.suffix(aboutMeLimit))
+    }
+    /// Only facts the user actually said: most of the fact's words must appear in the user's own message.
+    static func isStated(_ fact: String, in userText: String) -> Bool {
+        let said = Set(normalised(userText)), words = normalised(fact).filter { $0.count >= 4 }
+        guard !words.isEmpty else { return false }
+        return Double(words.filter(said.contains).count) / Double(words.count) >= 0.6
+    }
+    /// Wording that states something about the user ("I'm…", "my exam is…", "I study…").
+    static func statesPersonalFact(_ text: String) -> Bool {
+        let lowered = " " + text.lowercased().replacingOccurrences(of: "’", with: "'") + " "
+        if [" i am ", " i'm ", " im ", " i study ", " i work ", " i prefer ", " i'd prefer ", " i live ", " i go to ", " i take "].contains(where: lowered.contains) { return true }
+        return lowered.range(of: " my [a-z]+( [a-z]+)? (is|are) ", options: .regularExpression) != nil
+    }
     static var file: URL { ChatStore.root.appendingPathComponent("Memory.json") }
     static func load() -> GlobalMemory { (try? JSONDecoder().decode(GlobalMemory.self, from: Data(contentsOf: file))) ?? GlobalMemory() }
     func save() {
@@ -249,7 +336,7 @@ struct GlobalMemory: Codable, Equatable {
     /// Only phrasing that states a lasting preference can add to global memory; other details stay with the task.
     static func statesLastingPreference(_ text: String) -> Bool {
         let lowered = text.lowercased()
-        return ["from now on", "going forward", "in future", "in the future", "by default", "always ", "never ", "remember that i", "remember i ", "i prefer", "i'd prefer", "i would prefer", "every time"].contains(where: lowered.contains)
+        return ["from now on", "going forward", "in future", "in the future", "by default", "always ", "never ", "i prefer", "i'd prefer", "i would prefer", "every time"].contains(where: lowered.contains)
     }
 }
 
@@ -323,7 +410,8 @@ extension AppModel {
         let size = history.reduce(0) { $0 + ContextBudget.tokens($1["content"] as? String ?? "") }
         let compact = size > budget / 2 && history.count > 8
         let lasting = GlobalMemory.statesLastingPreference(prompt)
-        guard compact || didWork || lasting else { return }
+        let personal = learnAboutMe && GlobalMemory.statesPersonalFact(prompt) // "I'm doing Biology HL": worth learning, no extra request.
+        guard compact || didWork || lasting || personal else { return }
         let older = compact ? Array(history.dropLast(8)) : [], recent = Array(history.suffix(compact ? 8 : 2))
         func transcript(_ messages: [[String: Any]], limit: Int) -> String {
             String(messages.map { "\($0["role"] as? String ?? ""): \(ChatMemory.clipped($0["content"] as? String ?? "", limit: limit))" }
@@ -334,7 +422,9 @@ extension AppModel {
         "summary" (at most 120 words, facts needed to continue the task), "currentGoal" (one sentence), \
         "decisions" (array, at most 6), "openQuestions" (array, at most 6 unresolved next steps), \
         "preferences" (array, at most 5: how the user wants THIS task done, only if they said so), \
-        "globalPreferences" (array, at most 3: only preferences the user explicitly said apply from now on or always; otherwise []). \
+        "globalPreferences" (array, at most 3: only preferences the user explicitly said apply from now on or always; otherwise []), \
+        "aboutUser" (array, at most 3 short facts the user explicitly STATED about themselves in their own messages, such as their subjects, \
+        exam dates or how they like to work; never guesses, never note contents, never health, money, passwords or ID numbers; otherwise []). \
         Mention notes by path only; never copy note contents.
 
         Current memory:
@@ -357,6 +447,7 @@ extension AppModel {
             if let decisions = items("decisions", 6) { memory.decisions = decisions }
             if let questions = items("openQuestions", 6) { memory.openQuestions = questions }
             if let preferences = items("preferences", 5) { memory.preferences = preferences }
+            if let facts = items("aboutUser", 3), !facts.isEmpty { learnAboutUser(facts, statedIn: prompt) }
             if lasting, let global = items("globalPreferences", 3), !global.isEmpty { // Never promoted without explicit wording.
                 for item in global where !globalMemory.preferences.contains(item) { globalMemory.preferences.append(item) }
                 globalMemory.preferences = Array(globalMemory.preferences.suffix(10))
@@ -381,6 +472,7 @@ enum TextToolCall {
     static let required: [String: [String]] = [
         "list_directory": ["path"], "read_file": ["path"], "read_attachment": ["path"], "search_notes": ["query"],
         "write_file": ["path", "content"], "append_to_file": ["path", "content"], "create_file": ["path", "content"],
+        "read_section": ["path", "heading"], "replace_section": ["path", "heading", "content"], "append_to_section": ["path", "heading", "content"], "replace_text": ["path", "find", "replace"],
         "create_directory": ["path"], "rename_path": ["oldPath", "newPath"], "move_path": ["oldPath", "newPath"], "delete_path": ["path"]]
     enum Outcome { case notACall, calls([ToolCall], prose: String), invalid(String) }
 
@@ -457,6 +549,237 @@ enum TextToolCall {
         return required.keys.sorted { $0.count > $1.count }.first { name in
             body.hasPrefix(name) && String(body.dropFirst(name.count)).trimmingCharacters(in: .whitespaces).first.map { $0 == "{" || $0 == "(" } == true
         }
+    }
+}
+
+// MARK: Memory quality: pins, folder context, paths kept in sync
+
+extension AppModel {
+    /// Facts learned from a chat (via the memory update): only when learning is on and the user actually said them.
+    func learnAboutUser(_ facts: [String], statedIn userText: String) {
+        guard learnAboutMe else { return }
+        let stated = facts.filter { GlobalMemory.isStated($0, in: userText) }
+        guard !stated.isEmpty else { return }
+        let before = globalMemory.aboutMe
+        globalMemory.aboutMe = GlobalMemory.merge(before, stated)
+        if globalMemory.aboutMe != before { globalMemory.save(); appendNotice("Updated what Obby knows about you.") }
+    }
+    /// Explicit additions ("Remember that I…", Settings → Add…). Sensitive facts are still refused.
+    func addAboutMe(_ facts: [String]) {
+        let before = globalMemory.aboutMe
+        globalMemory.aboutMe = GlobalMemory.merge(before, facts)
+        guard globalMemory.aboutMe != before else { appendNotice("That wasn’t saved (it may be sensitive or already known).", failed: true); return }
+        globalMemory.save(); appendNotice("Added to About me.")
+    }
+    /// Pins a fact to this task's memory (never condensed away).
+    func pin(_ text: String) {
+        let fact = ChatMemory.clipped(text.trimmingCharacters(in: .whitespacesAndNewlines), limit: 300)
+        guard !fact.isEmpty else { return }
+        memory.pin(fact)
+        appendNotice("Pinned to this task’s memory.")
+        persistChat()
+    }
+    /// "Remember that…" / "Remember: …" at the start of a request becomes a pinned fact, decided by Obby, not the model.
+    func pinFromRequest(_ prompt: String) {
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = text.lowercased()
+        for lead in ["please remember that ", "remember that ", "please remember: ", "remember: ", "please remember ", "remember "] where lowered.hasPrefix(lead) {
+            let fact = String(text.dropFirst(lead.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard fact.count > 3, !fact.hasSuffix("?") else { return } // "Remember when…?" is a question, not a fact.
+            let lowerFact = fact.lowercased().replacingOccurrences(of: "’", with: "'")
+            if ["i ", "i'm ", "i am ", "i've ", "i'd "].contains(where: lowerFact.hasPrefix) { // About the user, not the task.
+                addAboutMe([fact.prefix(1).uppercased() + fact.dropFirst()])
+                return
+            }
+            memory.pin(ChatMemory.clipped(fact.prefix(1).uppercased() + fact.dropFirst(), limit: 300))
+            appendNotice("Pinned to this task’s memory.")
+            return
+        }
+    }
+    /// Everything memory contributes to a request: lasting preferences, folder context, then this task's memory with
+    /// files that no longer exist marked as such.
+    func memoryPacket() -> String {
+        var missing: Set<String> = []
+        if let vault {
+            for path in memory.relevantFiles where ((try? vault.resolve(path)).map { !FileManager.default.fileExists(atPath: $0.path) } ?? true) { missing.insert(path) }
+        }
+        return [globalMemory.packet, folderContextPacket(), memory.packet(missing: missing)].filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+    func fileExists(_ path: String) -> Bool {
+        guard let vault, let url = try? vault.resolve(path) else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    func folderKey(_ folder: String) -> String { (vault?.root.path ?? "") + "|" + folder }
+    func folderContext(_ folder: String) -> String { globalMemory.folders[folderKey(folder)] ?? "" }
+    func setFolderContext(_ folder: String, _ text: String) {
+        let value = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
+        if value.isEmpty { globalMemory.folders.removeValue(forKey: folderKey(folder)) } else { globalMemory.folders[folderKey(folder)] = value }
+        globalMemory.save()
+    }
+    /// Context for the folders of the open note and the task's main files (nearest first, at most two).
+    func folderContextPacket() -> String {
+        var folders: [String] = []
+        for path in [note].compactMap({ $0 }) + Array(memory.relevantFiles.prefix(3)) {
+            var parts = Array(path.split(separator: "/").map(String.init).dropLast())
+            while !parts.isEmpty {
+                let folder = parts.joined(separator: "/")
+                if !folders.contains(folder) { folders.append(folder) }
+                parts.removeLast()
+            }
+        }
+        if !folders.contains("") { folders.append("") } // The notes folder itself.
+        let found = folders.compactMap { folder -> String? in
+            let text = folderContext(folder)
+            return text.isEmpty ? nil : "Folder context (\(folder.isEmpty ? "whole notes folder" : folder)): \(text)"
+        }
+        return found.prefix(2).joined(separator: "\n")
+    }
+    /// Folder context editor (sidebar → Folder Context…). A note's own folder is used when a note is chosen.
+    func editFolderContext(_ path: String) {
+        guard let vault else { return }
+        let isFolder = ((try? vault.resolve(path, allowRoot: true).resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory) == true
+        let folder = isFolder ? path : (path as NSString).deletingLastPathComponent
+        let alert = NSAlert()
+        alert.messageText = "Folder context for \(folder.isEmpty ? "all notes" : folder)"
+        alert.informativeText = "A short note the AI gets whenever it works on notes in this folder, for example “IB Biology HL, exam May 2027, I like flashcards”. It is kept on this Mac, not in your notes."
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 320, height: 90))
+        scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        let field = NSTextView(frame: scroll.bounds)
+        field.isRichText = false; field.font = .systemFont(ofSize: 13); field.autoresizingMask = [.width]; field.string = folderContext(folder)
+        scroll.documentView = field
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        setFolderContext(folder, field.string)
+    }
+    /// A note or folder moved or renamed inside Obby: task memories (current and saved) and folder context follow it.
+    func memoryDidMove(_ old: String, _ new: String) {
+        func moved(_ path: String) -> String { path == old ? new : path.hasPrefix(old + "/") ? new + path.dropFirst(old.count) : path }
+        memory.relevantFiles = memory.relevantFiles.map(moved)
+        if let root = vault?.root.path {
+            for var record in ChatStore.all(root: root) where record.id != memory.id && record.relevantFiles.contains(where: { moved($0) != $0 }) {
+                record.relevantFiles = record.relevantFiles.map(moved); ChatStore.save(record)
+            }
+        }
+        let prefix = folderKey(old)
+        var changed = false
+        for (key, value) in globalMemory.folders where key == prefix || key.hasPrefix(prefix + "/") {
+            globalMemory.folders.removeValue(forKey: key)
+            globalMemory.folders[folderKey(new) + key.dropFirst(prefix.count)] = value
+            changed = true
+        }
+        if changed { globalMemory.save() }
+        persistChat()
+    }
+    /// A note or folder moved to the Trash: memories stop referring to it.
+    func memoryDidDelete(_ path: String) {
+        func gone(_ item: String) -> Bool { item == path || item.hasPrefix(path + "/") }
+        memory.relevantFiles.removeAll(where: gone)
+        if let root = vault?.root.path {
+            for var record in ChatStore.all(root: root) where record.id != memory.id && record.relevantFiles.contains(where: gone) {
+                record.relevantFiles.removeAll(where: gone); ChatStore.save(record)
+            }
+        }
+        let prefix = folderKey(path)
+        let keys = globalMemory.folders.keys.filter { $0 == prefix || $0.hasPrefix(prefix + "/") }
+        if !keys.isEmpty { for key in keys { globalMemory.folders.removeValue(forKey: key) }; globalMemory.save() }
+        persistChat()
+    }
+    /// A saved task that worked on the open note (offered as "Continue: …" in an empty chat).
+    var relatedTask: ChatRecord? {
+        guard let note, chat.isEmpty else { return nil }
+        return savedChats.first { $0.id != memory.id && $0.relevantFiles.contains(note) }
+    }
+    var relatedNotesEnabled: Bool { isLocalProvider ? relatedNotesLocal : relatedNotesCloud }
+    /// Up to three related note excerpts from the in-memory index, within `allowance` tokens (the open note excluded).
+    func relatedNotes(for prompt: String, allowance: Int) async -> [NoteSnippet] {
+        let meaningful = prompt.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).filter { $0.count >= 3 && !ContextBudget.stopWords.contains(String($0)) && !["the", "and", "you", "are", "for", "can"].contains(String($0)) }
+        guard let vault, meaningful.count >= 4, !ToolRouting.isSmallTalk(prompt) else { return [] } // Too short to search on.
+        await noteIndex.rebuild(vault: vault) // Only changed files are re-read.
+        var used = 0
+        return await noteIndex.search(prompt, limit: 3, excluding: Set([note].compactMap { $0 })).filter { snippet in
+            guard snippet.score >= 1.0 else { return false } // Weak matches add noise, not help.
+            let size = ContextBudget.tokens(snippet.text) + 20
+            guard used + size <= allowance else { return false }
+            used += size; return true
+        }
+    }
+}
+
+/// Offers only the tools a request needs (small models choose far better from 3 tools than from 15, and call
+/// tools they are offered even when nobody asked). Decided from the request's wording: changing tools only when the
+/// wording asks for a change; read-only tools when nothing matches; no tools at all for small talk.
+enum ToolRouting {
+    static let reading: Set<String> = ["read_file", "read_section", "search_notes", "list_directory"]
+    static let changing: Set<String> = ["write_file", "append_to_file", "replace_section", "append_to_section", "replace_text", "create_file", "create_directory", "move_path", "rename_path", "delete_path"]
+    static let baseline: Set<String> = ["read_file", "read_section", "search_notes"]
+    /// The one classifier: conversation (no tools, no task memory), a question about the task's memory (memory, no
+    /// tools), or work (full memory, routed tools).
+    enum Kind { case chat, memoryQuestion, work }
+    static let memoryPhrases = ["what were we doing", "what was i doing", "what were we working on", "what did i decide", "what did we decide",
+                                "remind me", "what have we done", "what have i done", "what did we do", "where were we", "where did we leave",
+                                "what's the plan", "what is the plan", "catch me up", "recap"]
+    static func classify(_ prompt: String) -> Kind {
+        let lowered = prompt.lowercased().replacingOccurrences(of: "’", with: "'")
+        if memoryPhrases.contains(where: lowered.contains) { return .memoryQuestion }
+        return isSmallTalk(prompt) ? .chat : .work
+    }
+    /// Words that point at notes or files; a short message without any of them (and no routing keywords) is small talk.
+    static let noteWords = ["note", "notes", "file", "files", "folder", "folders", "md", "pdf", "attach", "attached", "attachment", "document",
+                            "section", "heading", "summar", "flashcard", "quiz", "outline", "revision", "search", "find", "read", "open", "where", "which"]
+    /// Greetings, thanks, "ok" and other short messages with no note or file words: sent with no tools at all.
+    static func isSmallTalk(_ prompt: String) -> Bool {
+        let lowered = prompt.lowercased()
+        let words = lowered.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        guard words.count < 6, !lowered.contains(".md"), !lowered.contains("/") else { return false }
+        let set = Set(words)
+        let pointsAtNotes = noteWords.contains { key in set.contains(key) || (key.count >= 5 && set.contains { $0.hasPrefix(key) }) }
+        return !pointsAtNotes && matched(prompt, hasAttachments: false).isEmpty
+    }
+    /// The tools for a request: an empty set means none (small talk).
+    static func tools(for prompt: String, hasAttachments: Bool) -> Set<String> {
+        if isSmallTalk(prompt) { return [] }
+        return matched(prompt, hasAttachments: hasAttachments).union(baseline)
+    }
+    /// Tools asked for by the request's wording (reading tools included when the wording is about finding or reading).
+    static func matched(_ prompt: String, hasAttachments: Bool) -> Set<String> {
+        let lowered = prompt.lowercased()
+        let words = Set(lowered.split(whereSeparator: { !$0.isLetter }).map(String.init))
+        func mentions(_ keys: [String]) -> Bool {
+            keys.contains { key in key.contains(" ") ? lowered.contains(key) : words.contains(key) || (key.count >= 5 && words.contains { $0.hasPrefix(key) }) }
+        }
+        var chosen: Set<String> = []
+        if mentions(["add", "append", "insert", "write", "edit", "update", "change", "rewrite", "replace", "fix", "correct", "put", "include", "expand", "shorten", "improve", "section", "paragraph", "heading", "reword", "format", "remove", "tidy"]) {
+            chosen.formUnion(["append_to_file", "append_to_section", "replace_section", "replace_text", "write_file"])
+        }
+        if mentions(["create", "new note", "new folder", "make a note", "make a folder", "save", "draft", "start a note"]) { chosen.formUnion(["create_file", "create_directory"]) }
+        if mentions(["move", "rename", "organise", "organize", "sort", "folder", "archive", "file it", "put it in"]) { chosen.formUnion(["create_directory", "move_path", "rename_path", "list_directory"]) }
+        if mentions(["delete", "trash", "get rid"]) { chosen.insert("delete_path") }
+        if mentions(["attach", "attached", "attachment", "pdf", "document", "image", "photo", "screenshot", "csv", "scan", "picture"]) || (hasAttachments && mentions(["file", "paper", "reading", "article"])) {
+            chosen.insert("read_attachment")
+        }
+        if mentions(["find", "search", "where", "which", "look", "list", "show", "notes", "note", "read", "summar", "explain", "what", "why", "how", "quiz", "flashcard", "compare", "about"]) {
+            chosen.formUnion(reading)
+        }
+        return chosen
+    }
+    /// Ollama JSON-schema output for models without native tools: one action or one reply per message.
+    static func actionSchema(_ names: [String]) -> [String: Any] {
+        ["type": "object",
+         "properties": ["action": ["type": "string", "enum": names.sorted() + ["reply"]], "arguments": ["type": "object"], "reply": ["type": "string"]],
+         "required": ["action"]]
+    }
+    enum Action { case reply(String), call(ToolCall), unreadable }
+    static func parseAction(_ text: String) -> Action {
+        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start < end,
+              let json = try? JSONSerialization.jsonObject(with: Data(text[start...end].utf8)) as? [String: Any],
+              let action = json["action"] as? String else { return .unreadable }
+        if action == "reply" { return .reply(json["reply"] as? String ?? "") }
+        guard let needed = TextToolCall.required[action] else { return .unreadable }
+        let arguments = ToolCall.arguments(json["arguments"])
+        guard needed.allSatisfy({ arguments[$0] is String }) else { return .unreadable }
+        return .call(ToolCall(id: "action-" + UUID().uuidString, name: action, arguments: arguments, raw: ["action": json]))
     }
 }
 

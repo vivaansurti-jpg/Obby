@@ -9,7 +9,7 @@ import UniformTypeIdentifiers
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     var body: some Scene {
         WindowGroup("Obby") {
-            ContentView().environmentObject(model).frame(minWidth: 920, minHeight: 580)
+            ContentView().frame(minWidth: 920, minHeight: 580)
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
                         SettingsGear()
@@ -21,6 +21,7 @@ import UniformTypeIdentifiers
                 }
                 .onAppear { delegate.model = model; NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true) }
                 .sheet(isPresented: $model.showSettings) { SettingsSheet().environmentObject(model) }
+                .environmentObject(model) // Last, so the toolbar (settings gear) and sheet can use it too.
         }
         .defaultSize(width: 1200, height: 760)
         .commands {
@@ -56,6 +57,8 @@ struct SettingsSheet: View {
                 Button("Done") { model.showSettings = false }.keyboardShortcut(.cancelAction)
             }.padding(12)
         }
+        // One fixed size for every tab, small enough to stay inside the main window (minimum 920 × 580).
+        .frame(width: 600, height: 540)
     }
 }
 /// Reads the file URLs of a drop; only Markdown files are accepted.
@@ -118,7 +121,8 @@ struct ContentView: View {
     @StateObject var bridge = EditorBridge()
     @FocusState var searchFocused: Bool
     @State private var showTableSheet = false
-    @State private var tableColumns = 3, tableRows = 3
+    @State private var tableColumns = 3
+    @State private var tableRows = 3
     var body: some View {
         Group {
             if model.showOnboarding {
@@ -365,8 +369,8 @@ struct AIView: View {
                     if model.showTechnical {
                         Divider()
                         Toggle(isOn: $model.showRawActions) { Label("Show technical action details", systemImage: "curlybraces") }
+                            .help("Shows the request and result for each action. This does not change your notes or what the AI can do.")
                     }
-                        .help("Shows the request and result for each action. This does not change your notes or what the AI can do.")
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("More").accessibilityLabel("More")
                     .popover(isPresented: $showMemory, arrowEdge: .bottom) { MemoryPopover().environmentObject(model) }
@@ -594,16 +598,37 @@ struct SettingsView: View {
     @State private var newKey = ""
     @State private var newTools = true
     @State private var addError: String?
+    @State private var settingsTab = "Notes"
+    static let tabs = [("Notes", "folder"), ("AI", "sparkles"), ("Memory", "brain"), ("Advanced", "slider.horizontal.3")]
     var providerSelection: Binding<ProviderKind> {
         Binding(get: { model.provider }, set: { next in Task { await model.switchProvider(next); syncDrafts() } })
     }
     var body: some View {
-        TabView {
-            generalTab.tabItem { Label("Notes", systemImage: "folder") }
-            aiTab.tabItem { Label("AI", systemImage: "sparkles") }
-            memoryTab.tabItem { Label("Memory", systemImage: "brain") }
-            advancedTab.tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
-        }.frame(minWidth: 560, idealWidth: 580, minHeight: 520)
+        // Icon tabs like the former Settings window (a TabView inside a sheet shows text-only tabs).
+        VStack(spacing: 0) {
+            HStack(spacing: 4) {
+                ForEach(Self.tabs, id: \.0) { name, icon in
+                    Button { settingsTab = name } label: {
+                        VStack(spacing: 3) {
+                            Image(systemName: icon).font(.system(size: 20)).frame(height: 24)
+                            Text(name).font(.caption)
+                        }.frame(width: 76, height: 50)
+                        .foregroundStyle(settingsTab == name ? Color.accentColor : Color.secondary)
+                        .background(settingsTab == name ? Color.secondary.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(Rectangle())
+                    }.buttonStyle(.plain).accessibilityLabel(name)
+                }
+            }.padding(.vertical, 8)
+            Divider()
+            Group {
+                switch settingsTab {
+                case "AI": aiTab
+                case "Memory": memoryTab
+                case "Advanced": advancedTab
+                default: generalTab
+                }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity) // Each tab's Form scrolls inside the fixed sheet size.
+        }
             .sheet(isPresented: $showMemory) { MemorySettingsSheet().environmentObject(model) }
             .task { syncDrafts(); await model.connect() }
             .onChange(of: model.selectedModel) { value in manualModel = value }

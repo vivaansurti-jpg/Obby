@@ -61,6 +61,13 @@ import AppKit
         didSet { UserDefaults.standard.set(showAI, forKey: "showAI") }
     }
     var aiDraft = "" // Unsent text in the AI prompt field, kept while the panel is hidden (not published: no redraws).
+    var pendingUndo: UndoEdit? // Set by executeTool for the action line it is about to produce.
+    var readThisRequest: Set<String> = [] // Notes the model has read (or was given) during the current AI request.
+    var shrinkOverride: ((String) -> Bool)? // The checks answer the shrink question without a dialog.
+    var guardWrites = false // True during an AI request: whole-note rewrites require the note to have been read first.
+    let noteIndex = NoteIndex() // In-memory keyword index for "related notes" (never written to disk).
+    @Published var relatedNotesLocal = UserDefaults.standard.object(forKey: "relatedNotesLocal") as? Bool ?? true
+    @Published var relatedNotesCloud = UserDefaults.standard.object(forKey: "relatedNotesCloud") as? Bool ?? false
     var historySummary: String { get { memory.summary } set { memory.summary = newValue } }
     var loading = false
     var diskText = ""
@@ -250,6 +257,7 @@ import AppKit
     func didMove(_ old: String, _ new: String) {
         if let note, note == old || note.hasPrefix(old + "/") { self.note = new + note.dropFirst(old.count); UserDefaults.standard.set(self.note, forKey: "lastNote") }
         selection = new
+        memoryDidMove(old, new) // Task memories and folder context follow the note or folder.
     }
     /// Drop/paste/toolbar attachments for the open note: copies files into the note's Attachments folder and returns
     /// the Markdown to insert (`![name](…)` for images, `[name](…)` for documents), or nil if nothing was imported.
@@ -341,8 +349,42 @@ import AppKit
         let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "Move \(path) to Trash?"; alert.informativeText = "Folders and everything inside them will be moved to the Trash."; alert.addButton(withTitle: "Move to Trash"); alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
-    func remove(_ path: String) { guard save(), confirmDelete(path) else { return }; perform { try vault?.delete(path); refresh() } }
+    func remove(_ path: String) { guard save(), confirmDelete(path) else { return }; perform { try vault?.delete(path); memoryDidDelete(path); refresh() } }
+    /// Asked before the AI replaces a substantial note with something much shorter.
+    func confirmShrink(_ path: String, from old: Int, to new: Int) -> Bool {
+        if let shrinkOverride { return shrinkOverride(path) }
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = "Replace \((path as NSString).lastPathComponent) with a much shorter version?"
+        alert.informativeText = "The AI wants to replace this note (\(old) characters) with \(new) characters. You can undo it afterwards from the chat."
+        alert.addButton(withTitle: "Replace"); alert.addButton(withTitle: "Keep Current Note")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+    /// The Undo button on an AI edit: restores the note exactly as it was (or moves an AI-created note to the Trash).
+    /// If the note changed after the AI edit, asks first so later work isn't lost silently.
+    func undoAIEdit(_ line: ChatLine) {
+        guard let edit = line.undo, let vault, !busy, save() else { return }
+        let name = (edit.path as NSString).lastPathComponent
+        do {
+            let current = try? vault.read(edit.path)
+            if current != edit.after {
+                let alert = NSAlert(); alert.alertStyle = .warning
+                alert.messageText = "\(name) changed after the AI edit."
+                alert.informativeText = "Undoing replaces those later changes with the version from before the AI edit."
+                alert.addButton(withTitle: "Undo Anyway"); alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+            if let previous = edit.previous { try vault.write(edit.path, content: previous, create: current == nil) }
+            else if current != nil { try vault.delete(edit.path) }
+            if let index = chat.firstIndex(where: { $0.id == line.id }) { chat[index].undo = nil }
+            appendNotice("Undid the AI change to \(name).")
+            memory.remember(action: "Undid the AI change to \(name).")
+            persistChat(); refresh()
+        } catch { self.error = error.localizedDescription }
+    }
     func search() { perform { results = try vault?.search(query) ?? [] } }
     func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: provider.modelKey); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats") }
 }
-struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false }
+struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil }
+/// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.
+/// `previous == nil` means the AI created the note, so undo moves it to the Trash.
+struct UndoEdit { let path: String; let previous: String?; let after: String }

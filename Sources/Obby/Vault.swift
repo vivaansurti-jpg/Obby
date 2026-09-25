@@ -73,7 +73,24 @@ final class Vault {
         let url = try markdown(path)
         if create && fm.fileExists(atPath: url.path) { throw ObbyError("A file already exists at \(path).") }
         if !create && !fm.fileExists(atPath: url.path) { throw ObbyError("The note no longer exists.") }
-        try atomicWrite(Data(content.utf8), to: url, create: create)
+        let name = url.lastPathComponent, parent = (path as NSString).deletingLastPathComponent
+        do {
+            if create && !parent.isEmpty { try mkdir(parent) } // Missing parent folders, through resolve() like any folder.
+            try atomicWrite(Data(content.utf8), to: url, create: create)
+        } catch let error as ObbyError { throw error } catch { throw Self.saveError(name, error) }
+    }
+    /// "Couldn’t save <name>." plus a short reason; never a temporary file name or a full path.
+    static func saveError(_ name: String, _ error: Error) -> ObbyError {
+        let reason: String
+        switch (error as? CocoaError)?.code {
+        case .fileWriteNoPermission?, .fileReadNoPermission?: reason = "Obby doesn’t have permission to write there."
+        case .fileWriteOutOfSpace?: reason = "The disk is full."
+        case .fileWriteVolumeReadOnly?: reason = "The disk is read-only."
+        case .fileWriteFileExists?: reason = "A file with that name already exists."
+        case .fileNoSuchFile?, .fileReadNoSuchFile?: reason = "Its folder doesn’t exist."
+        default: reason = "The file couldn’t be written."
+        }
+        return ObbyError("Couldn’t save \(name). \(reason)")
     }
     /// Safe save: write a temporary file beside the note, confirm its size, then atomically move it into place (or
     /// replace the old version). If anything fails the previous version is untouched and the temporary file is removed.
@@ -161,21 +178,16 @@ extension Vault {
     static let maxImageBytes = 50_000_000
     static let maxAttachmentBytes = 500_000_000
     static func isImage(_ ext: String) -> Bool { imageExtensions.contains(ext) && UTType(filenameExtension: ext)?.conforms(to: .image) == true }
-    /// Images only (used by the image checks); the same code path as every other attachment.
-    func importImage(_ source: AttachmentSource, noteFolder: String) throws -> String {
-        try importAttachment(source, noteFolder: noteFolder, imagesOnly: true)
-    }
     /// The one import path for images and documents (drop, paste, toolbar): copies the file into
     /// `<noteFolder>/Attachments/` inside the vault and returns its note-relative path ("Attachments/name.ext").
     /// Bytes are copied (never linked or referenced in place); existing files are never overwritten.
-    func importAttachment(_ source: AttachmentSource, noteFolder: String, imagesOnly: Bool = false) throws -> String {
+    func importAttachment(_ source: AttachmentSource, noteFolder: String) throws -> String {
         let ext: String, base: String, write: (URL) throws -> Void, expected: Int?
         switch source {
         case .file(let url):
             let file = url.standardizedFileURL.resolvingSymlinksInPath()
             ext = file.pathExtension.lowercased()
             let image = Self.isImage(ext)
-            if imagesOnly && !image { throw ObbyError("\(url.lastPathComponent) isn’t a supported image.") }
             let limit = image ? Self.maxImageBytes : Self.maxAttachmentBytes
             let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values.isRegularFile == true, (values.fileSize ?? 0) <= limit else {
@@ -205,7 +217,7 @@ extension Vault {
         // inserted after this returns, and an existing attachment is never overwritten.
         let temp = try resolve(folder + "/.obby-import-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: temp) }
-        try write(temp)
+        do { try write(temp) } catch { throw Self.saveError(base + (ext.isEmpty ? "" : "." + ext), error) }
         let copied = (try? fm.attributesOfItem(atPath: temp.path)[.size] as? NSNumber)?.intValue
         guard copied != nil, expected == nil || copied == expected else { throw ObbyError("The file couldn’t be copied completely. Nothing was added.") }
         let suffix = ext.isEmpty ? "" : "." + ext
@@ -215,6 +227,7 @@ extension Vault {
             if fm.fileExists(atPath: target.path) { continue }
             do { try fm.moveItem(at: temp, to: target) } // Fails rather than replace a file created meanwhile.
             catch let error as CocoaError where error.code == .fileWriteFileExists { continue }
+            catch { throw Self.saveError(name, error) }
             guard fm.fileExists(atPath: target.path) else { throw ObbyError("The file couldn’t be added.") }
             return "Attachments/" + name
         }

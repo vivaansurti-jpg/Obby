@@ -55,7 +55,12 @@ extension AppModel {
         let data = try? JSONSerialization.data(withJSONObject: ["call": call, "response": response], options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         let raw = data.flatMap { String(data: $0, encoding: .utf8) }
         let summary = ActionPresentation.summary(name, arguments: arguments, result: result, failed: failed)
-        let line = ChatLine(role: "Action", text: summary, rawAction: raw, unsuccessful: failed || summary == "Deletion cancelled.", undo: failed ? nil : undo)
+        // The same failure again right after itself: one line with a count ("Couldn’t create X. ×3").
+        if failed, let last = chat.indices.last, chat[last].role == "Action", chat[last].unsuccessful, !chat[last].notice, chat[last].base == summary {
+            chat[last].repeats += 1; chat[last].text = summary + " ×\(chat[last].repeats)"; chat[last].rawAction = raw
+            return
+        }
+        let line = ChatLine(role: "Action", text: summary, rawAction: raw, unsuccessful: failed || summary == "Deletion cancelled.", undo: failed ? nil : undo, base: summary)
         chat = ChatMemory.trimDisplay(chat + [line])
     }
     /// A compact informational line in the action list (not sent to the model).
@@ -82,7 +87,7 @@ enum ActionPresentation {
         let heading = arg("heading").trimmingCharacters(in: CharacterSet(charactersIn: "# "))
         if failed { // "Couldn’t update TOK.md." plus Obby's own short reason; never raw exceptions, JSON or full Mac paths.
             let reason = result.hasPrefix("Error: ") ? String(result.dropFirst(7)) : ""
-            let safeReason = reason.isEmpty || reason.contains("/Users/") || reason.contains("/private/") || reason.hasPrefix("/") || reason.contains("{") ? "" : reason
+            let safeReason = reason.isEmpty || reason.contains("/Users/") || reason.contains("/private/") || reason.hasPrefix("/") || reason.contains("{") || reason.contains("obby-tmp") || reason.contains("obby-import") ? "" : reason
             if tool == "read_attachment" || tool == "read_file", !safeReason.isEmpty { return safeReason }
             let path = arg("path").isEmpty ? arg("oldPath") : arg("path")
             let verbs = ["write_file": "update", "append_to_file": "update", "replace_section": "update", "append_to_section": "update", "replace_text": "update", "read_section": "read", "create_file": "create", "create_directory": "create",
@@ -771,6 +776,16 @@ extension AppModel {
 /// tools they are offered even when nobody asked). Decided from the request's wording: changing tools only when the
 /// wording asks for a change; read-only tools when nothing matches; no tools at all for small talk.
 enum ToolRouting {
+    /// Identity of a tool call for the repeat guard: its name and arguments (key order ignored).
+    static func callKey(_ name: String, _ arguments: [String: Any]) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys])
+        return name + (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+    }
+    /// The reply when repeated failures stop a request: what was done and what wasn't.
+    static func stopSummary(done: [String], notDone: [String]) -> String {
+        "I stopped because several actions kept failing. " + (done.isEmpty ? "Nothing was changed." : "Done: " + done.joined(separator: " "))
+            + (notDone.isEmpty ? "" : " Not done: " + notDone.joined(separator: " "))
+    }
     static let reading: Set<String> = ["read_file", "read_section", "search_notes", "list_directory"]
     static let changing: Set<String> = ["write_file", "append_to_file", "replace_section", "append_to_section", "replace_text", "create_file", "create_directory", "move_path", "rename_path", "delete_path"]
     static let baseline: Set<String> = ["read_file", "read_section", "search_notes"]

@@ -255,12 +255,19 @@ struct InlineTitleEditor: NSViewRepresentable {
     }
 }
 
+private struct PromptHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct AIView: View {
     @EnvironmentObject var model: AppModel
     @State var prompt = ""
     @State var showMemory = false
     @FocusState private var promptFocused: Bool
     @StateObject private var speech = SpeechInput()
+    @State private var atBottom = true // The end of the chat is on screen; streamed text is followed only then.
+    @State private var promptHeight: CGFloat = 36
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
@@ -377,10 +384,21 @@ struct AIView: View {
                                 }
                             }
                         }
+                        Color.clear.frame(height: 1).id("chatEnd")
+                            .onAppear { atBottom = true }.onDisappear { atBottom = false }
                     }
-                }.onChange(of: model.chat.last?.id) { _ in if let id = model.chat.last?.id { proxy.scrollTo(id, anchor: .bottom) } }
+                }.onChange(of: model.chat.last?.id) { _ in proxy.scrollTo("chatEnd", anchor: .bottom) }
+                // A streamed reply grows in place; follow it unless the user has scrolled up to read.
+                .onChange(of: model.chat.last?.text) { _ in if atBottom { proxy.scrollTo("chatEnd", anchor: .bottom) } }
                 .onAppear { // Shown again: return to the latest message of the same chat.
-                    DispatchQueue.main.async { if let id = model.chat.last?.id { proxy.scrollTo(id, anchor: .bottom) } }
+                    DispatchQueue.main.async { proxy.scrollTo("chatEnd", anchor: .bottom) }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if !atBottom && !model.chat.isEmpty {
+                        Button { withAnimation { proxy.scrollTo("chatEnd", anchor: .bottom) } } label: {
+                            Image(systemName: "arrow.down.circle.fill").font(.title2).foregroundStyle(.secondary)
+                        }.buttonStyle(.plain).padding(6).help("Scroll to latest").accessibilityLabel("Scroll to latest")
+                    }
                 }
             }
             if model.busy { HStack { ProgressView().controlSize(.small); Text(model.isLocalProvider ? "Working locally…" : "Working…").font(.caption); Spacer(); Button("Stop") { model.aiTask?.cancel() } } }
@@ -389,7 +407,21 @@ struct AIView: View {
                 Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
             }
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Ask Obby…", text: $prompt, axis: .vertical).lineLimit(2...6).textFieldStyle(.plain).focused($promptFocused).onSubmit { submit() }
+                // The prompt grows to about seven lines, then scrolls; text added at the end (typing, dictation) stays in view.
+                ScrollViewReader { promptProxy in
+                    ScrollView(.vertical) {
+                        VStack(spacing: 0) {
+                            TextField("Ask Obby…", text: $prompt, axis: .vertical).lineLimit(2...).textFieldStyle(.plain).focused($promptFocused).onSubmit { submit() }
+                                .background(GeometryReader { Color.clear.preference(key: PromptHeightKey.self, value: $0.size.height) })
+                            Color.clear.frame(height: 1).id("promptEnd")
+                        }
+                    }
+                    .frame(height: min(max(promptHeight, 20), 140))
+                    .onPreferenceChange(PromptHeightKey.self) { promptHeight = $0 }
+                    .onChange(of: prompt) { [prompt] new in
+                        if new.count > prompt.count, new.hasPrefix(prompt) { promptProxy.scrollTo("promptEnd", anchor: .bottom) }
+                    }
+                }
                 // In-app speech input (on-device when available): live text, Obby's own indicator, no system chime.
                 // Falls back to macOS Dictation if speech or microphone access is declined or unavailable.
                 Button {
@@ -659,19 +691,21 @@ struct WindowCloseGuard: NSViewRepresentable {
 
     func toggle(current: String, update: @escaping (String) -> Void, fallback: @escaping () -> Void) {
         if listening { stop(); return }
+        // On-device only: if this Mac can't recognise speech locally, use macOS Dictation instead, so no audio goes to a server.
+        guard let recognizer = SFSpeechRecognizer(), recognizer.supportsOnDeviceRecognition else { fallback(); return }
         Task { @MainActor in
             let speechAllowed = await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
                 SFSpeechRecognizer.requestAuthorization { done.resume(returning: $0 == .authorized) }
             }
             let micAllowed = speechAllowed ? await AVCaptureDevice.requestAccess(for: .audio) : false
-            guard speechAllowed, micAllowed, let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else { fallback(); return }
+            guard speechAllowed, micAllowed, recognizer.isAvailable else { fallback(); return }
             start(recognizer, current: current, update: update, fallback: fallback)
         }
     }
     private func start(_ recognizer: SFSpeechRecognizer, current: String, update: @escaping (String) -> Void, fallback: () -> Void) {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+        request.requiresOnDeviceRecognition = true // Never sent to Apple's servers.
         let input = engine.inputNode
         var buffers = 0
         input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buffer, _ in

@@ -59,7 +59,6 @@ extension AppModel {
         }
     }
     var isLocalProvider: Bool { provider == .ollama || (provider == .openAI && RemoteHTTP.isLoopback(openAIBaseURL)) }
-    var providerBadge: String { "\(provider.label) (\(isLocalProvider ? "Local" : "Cloud"))" }
     /// True when quitting should unload the active Ollama model: the setting is on and this session actually used it.
     var needsUnloadOnQuit: Bool { unloadOnQuit && provider == .ollama && !selectedModel.isEmpty && usedOllamaModels.contains(selectedModel) }
     /// One unload request (keep_alive 0) when Obby terminates. Short timeout; Ollama itself keeps running.

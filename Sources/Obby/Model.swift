@@ -89,7 +89,6 @@ import AppKit
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } }
         Task { await connect() } // One read-only status check at launch; no repeating AI timers (the 1.5 s timer above only watches note files).
     }
-    var folderTitle: String { "Obby" }
     func restoreSavedFolder() {
         guard let data = UserDefaults.standard.data(forKey: "bookmark") else { clearVault(); return }
         var stale = false
@@ -387,7 +386,7 @@ import AppKit
     func search() { perform { results = try vault?.search(query) ?? [] } }
     func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: provider.modelKey); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe"); UserDefaults.standard.set(streamReplies, forKey: "streamReplies") }
 }
-struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil }
+struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil; var base = ""; var repeats = 1 }
 /// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.
 /// `previous == nil` means the AI created the note, so undo moves it to the Trash.
 struct UndoEdit { let path: String; let previous: String?; let after: String }

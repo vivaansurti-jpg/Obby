@@ -73,7 +73,7 @@ struct QuickActionsMenu: View {
     var body: some View {
         Menu {
             ForEach(QuickAction.allCases, id: \.rawValue) { action in
-                Button(action.title) { model.runQuickAction(action, save: save) }
+                Button { model.runQuickAction(action, save: save) } label: { Label(action.title, systemImage: action.symbol) }
             }
             Divider()
             Toggle("Save results as a new note", isOn: $save)

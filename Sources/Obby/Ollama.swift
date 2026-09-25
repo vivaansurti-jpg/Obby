@@ -67,7 +67,7 @@ extension AppModel {
             ("replace_section", "Replace the text under one heading of a note; the heading and all other sections stay unchanged.", ["path", "heading", "content"]),
             ("append_to_section", "Add Markdown at the end of the section under a heading, keeping what is already there.", ["path", "heading", "content"]),
             ("replace_text", "Replace one exact passage of a note with new text. The passage must appear exactly once; copy it exactly.", ["path", "find", "replace"]),
-            ("create_file", "Create a new Markdown note. Parent folder must exist. \"/\" separates folders; if the note's title itself contains a slash, write it as \"／\" (U+FF0F) in the file name, e.g. Biology ／ Enzymes.md.", ["path", "content"]),
+            ("create_file", "Create a new Markdown note (path ends in .md); missing parent folders are created. \"/\" separates folders; if the note's title itself contains a slash, write it as \"／\" (U+FF0F) in the file name, e.g. Biology ／ Enzymes.md.", ["path", "content"]),
             ("create_directory", "Create a folder and missing parent folders.", ["path"]),
             ("rename_path", "Rename a note or folder to a relative destination path. Write a slash inside a note title as \"／\" (U+FF0F); \"/\" separates folders.", ["oldPath", "newPath"]),
             ("move_path", "Move a note or folder to a relative destination path.", ["oldPath", "newPath"]),
@@ -106,6 +106,7 @@ extension AppModel {
             return try NavigationContext.page(vault.searchPage(arg("query"), folder: arguments["path"] as? String ?? "", offset: offset, limit: 51), offset: offset)
         case "create_file":
             let path = try arg("path"), content = try arg("content")
+            if (path as NSString).pathExtension.isEmpty { throw ObbyError("\(path) is not a note name. To make a folder use create_directory; notes must end in .md.") }
             try vault.write(path, content: content, create: true); feedback = "Created \(path)"
             recordUndo(path, previous: nil, after: content)
         case "write_file":
@@ -253,6 +254,8 @@ extension AppModel {
                 messages.append(["role": "user", "content": userMessage])
                 let current = previousHistory.count
                 var invalidCalls = 0
+                var failCounts: [String: Int] = [:], lastErrors: [String: String] = [:], streak: [String] = [] // Repeat guard.
+                var done: [String] = [], notDone: [String] = []
                 for _ in 0..<20 {
                     try Task.checkCancellation()
                     NavigationContext.compact(&messages)
@@ -336,27 +339,43 @@ extension AppModel {
                     for call in toolCalls {
                         try Task.checkCancellation()
                         let result: String
-                        var failed = false
+                        var failed = false, blocked = false
                         pendingUndo = nil
-                        do { // Same sandboxed Swift tools for every provider; attachment text is extracted off the main thread.
-                            result = readsAttachment(call) ? try await readAttachment(toolAttachmentLink(call.arguments["path"] as? String ?? "")) : try executeTool(call.name, arguments: call.arguments)
+                        let key = ToolRouting.callKey(call.name, call.arguments)
+                        if failCounts[key, default: 0] >= 2, let previous = lastErrors[key] { // The same call failed twice: never run it again.
+                            failed = true; blocked = true; result = previous
+                        } else {
+                            do { // Same sandboxed Swift tools for every provider; attachment text is extracted off the main thread.
+                                result = readsAttachment(call) ? try await readAttachment(toolAttachmentLink(call.arguments["path"] as? String ?? "")) : try executeTool(call.name, arguments: call.arguments)
+                            }
+                            catch { failed = true; result = "Error: \(error.localizedDescription)" }
                         }
-                        catch { failed = true; result = "Error: \(error.localizedDescription)" }
-                        var content = result
+                        if failed {
+                            failCounts[key, default: 0] += 1; lastErrors[key] = result; streak.append(key)
+                            let missed = ActionPresentation.summary(call.name, arguments: call.arguments, result: "", failed: true)
+                            if !notDone.contains(missed) { notDone.append(missed) }
+                        } else { streak.removeAll() }
+                        var content = blocked ? "Error: This exact call already failed twice; try a different approach or stop and tell the user." : result
                         if !failed, call.name == "read_file" || readsAttachment(call), ContextBudget.tokens(result) > budget * 3 / 5 { // A long note or document read by a tool.
                             content = try await condenseLongText(result, title: call.arguments["path"] as? String ?? "note", request: prompt, provider: provider, window: window, allowance: budget * 3 / 5)
                         }
                         if !failed { // Remember files by path and completed changes; never their contents.
                             for key in ["path", "newPath"] { if let path = call.arguments[key] as? String, call.name != "search_notes", call.name != "list_directory" { memory.remember(file: readsAttachment(call) ? ((try? resolveAttachment(toolAttachmentLink(path)).path) ?? path) : path) } }
                             if !["read_file", "read_section", "read_attachment", "list_directory", "search_notes"].contains(call.name) {
-                                memory.remember(action: ActionPresentation.summary(call.name, arguments: call.arguments, result: result, failed: false))
+                                let summary = ActionPresentation.summary(call.name, arguments: call.arguments, result: result, failed: false)
+                                memory.remember(action: summary); done.append(summary)
                             }
                         }
                         let toolResponse: [String: Any] = ["role": "tool", "tool_name": call.name, "tool_call_id": call.id, "content": content]
-                        appendAction(call: call.raw, name: call.name, arguments: call.arguments, response: toolResponse, failed: failed, undo: pendingUndo)
+                        appendAction(call: call.raw, name: call.name, arguments: call.arguments, response: blocked ? toolResponse.merging(["content": result]) { $1 } : toolResponse, failed: failed, undo: pendingUndo) // A blocked repeat shows as the same failure (collapsed).
                         pendingUndo = nil
                         // Text calls have no provider tool-call id, so their results go back as a plain message.
                         messages.append(textCalls ? ["role": "user", "content": "[Obby ran \(call.name)]\n\(content)"] : toolResponse)
+                        // Three different calls failing in a row (or five failures of any kind): stop and say what happened.
+                        if Set(streak).count >= 3 || streak.count >= 5 {
+                            if session == chatSession { appendChat(role: "Obby", text: ToolRouting.stopSummary(done: done, notDone: notDone)); persistChat() }
+                            return
+                        }
                     }
                 }
                 throw ObbyError("Stopped after 20 tool rounds. You can ask Obby to continue.")

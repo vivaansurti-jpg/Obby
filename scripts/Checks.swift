@@ -140,7 +140,7 @@ import AppKit
         blocked("AI cannot read outside the notes folder") { _ = try folderModel.executeTool("read_file", arguments: ["path": "../Outside.md"]) }
         try FileManager.default.moveItem(at: second, to: root.appendingPathComponent("Moved Folder"))
         folderModel.refresh()
-        check(folderModel.vault == nil && folderModel.tree.isEmpty && folderModel.note == nil && folderModel.folderTitle == "Obby", "moved root clears sidebar and editor")
+        check(folderModel.vault == nil && folderModel.tree.isEmpty && folderModel.note == nil, "moved root clears sidebar and editor")
         check(UserDefaults.standard.data(forKey: "bookmark") == nil && UserDefaults.standard.string(forKey: "rootPath") == nil, "invalid root clears saved reference")
         folderModel.openVault(first)
         try FileManager.default.removeItem(at: first)
@@ -367,11 +367,11 @@ import AppKit
         let pixel = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!.representation(using: .png, properties: [:])!
         let outsideImage = root.deletingLastPathComponent().appendingPathComponent("obby-check-\(UUID().uuidString) diagram.png")
         try pixel.write(to: outsideImage); defer { try? FileManager.default.removeItem(at: outsideImage) }
-        let firstImage = try vault.importImage(.file(outsideImage), noteFolder: "School")
-        let secondImage = try vault.importImage(.file(outsideImage), noteFolder: "School")
+        let firstImage = try vault.importAttachment(.file(outsideImage), noteFolder: "School")
+        let secondImage = try vault.importAttachment(.file(outsideImage), noteFolder: "School")
         check(firstImage.hasPrefix("Attachments/") && secondImage.hasSuffix("-2.png") && !firstImage.contains(" ") && FileManager.default.fileExists(atPath: root.appendingPathComponent("School/" + firstImage).path), "image copied into Attachments with safe, unique names")
-        check(try vault.importImage(.data(pixel, "png"), noteFolder: "") == "Attachments/pasted-image.png", "pasted image data saved at the root's Attachments")
-        blocked("non-image rejected") { _ = try vault.importImage(.data(Data("not an image".utf8), "png"), noteFolder: "") }
+        check(try vault.importAttachment(.data(pixel, "png"), noteFolder: "") == "Attachments/pasted-image.png", "pasted image data saved at the root's Attachments")
+        blocked("non-image rejected") { _ = try vault.importAttachment(.data(Data("not an image".utf8), "png"), noteFolder: "") }
         // Tool calls written as text: executed through the sandboxed tools, never shown as prose.
         func textCall(_ text: String) -> [ToolCall]? { if case .calls(let calls, _) = TextToolCall.parse(text) { return calls }; return nil }
         check(textCall(##"write_file{"path":"TOK.md","content":"# Hi"}"##)?.first?.name == "write_file", "name{json} text call parsed")
@@ -634,6 +634,53 @@ import AppKit
         var deliveries: [String] = []
         let whole = try await WholeReplyProvider().chatStream(ChatRequest(model: "m", system: "", messages: [], tools: nil, temperature: 0, contextWindow: 4_096, keepAlive: 0)) { deliveries.append($0) }
         check(whole.text == "Whole reply" && deliveries == ["Whole reply"], "other providers are unchanged: the whole reply arrives once")
+        model.clearChat()
+
+        // Failing tool calls: missing parent folders, clean save errors, the create_directory hint, the repeat guard.
+        try model.vault!.write("New/Sub/a.md", content: "A", create: true)
+        check(FileManager.default.fileExists(atPath: model.vault!.root.appendingPathComponent("New/Sub/a.md").path), "creating a note in missing folders creates the folders")
+        let locked = model.vault!.root.appendingPathComponent("Locked")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: locked.path)
+        var saveMessage = ""
+        do { try model.vault!.write("Locked/b.md", content: "B", create: true) } catch { saveMessage = error.localizedDescription }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path)
+        check(saveMessage.hasPrefix("Couldn’t save b.md.") && !saveMessage.contains("obby-tmp"), "save errors name the note, never a temporary file")
+        var hint = ""
+        do { _ = try model.executeTool("create_file", arguments: ["path": "X", "content": "x"]) } catch { hint = error.localizedDescription }
+        check(hint == "X is not a note name. To make a folder use create_directory; notes must end in .md.", "create_file without .md gets the create_directory hint")
+        func toolCall(_ name: String, _ arguments: [String: Any]) -> [String: Any] {
+            ["message": ["role": "assistant", "content": "", "tool_calls": [["function": ["name": name, "arguments": arguments]]]]]
+        }
+        var sentBodies: [[String: Any]] = []
+        model.streamReplies = false; model.toolSupport = [:]
+        model.requestOverride = { route, body in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            guard route == "/api/chat" else { return [:] }
+            sentBodies.append(body)
+            return toolCall("create_file", ["path": "X", "content": "Una historia."])
+        }
+        model.clearChat()
+        model.send("create five folders Z to V, each with a story note")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let toolMessages = sentBodies.last.flatMap { $0["messages"] as? [[String: Any]] }?.filter { $0["role"] as? String == "tool" }.compactMap { $0["content"] as? String } ?? []
+        check(toolMessages.count >= 3 && toolMessages[2].contains("already failed twice") && !toolMessages[1].contains("already failed twice"), "an identical failing call is blocked on the third attempt")
+        let failureLines = model.chat.filter { $0.role == "Action" && $0.unsuccessful }
+        check(failureLines.count == 1 && failureLines[0].text.hasPrefix("Couldn’t create X.") && failureLines[0].text.hasSuffix("×5"), "repeated failure lines collapse into one with a count")
+        var plan: [[String: Any]] = [toolCall("create_directory", ["path": "Z"]), toolCall("create_file", ["path": "A", "content": "a"]), toolCall("create_file", ["path": "B", "content": "b"]), toolCall("create_file", ["path": "C", "content": "c"])]
+        var failRounds = 0
+        model.requestOverride = { route, _ in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            guard route == "/api/chat" else { return [:] }
+            failRounds += 1
+            return plan.isEmpty ? ["message": ["role": "assistant", "content": "Done."]] : plan.removeFirst()
+        }
+        model.clearChat()
+        model.send("create five folders Z to V, each with a story note")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let stopReply = model.chat.last(where: { $0.role == "Obby" })?.text ?? ""
+        check(failRounds == 4 && stopReply.hasPrefix("I stopped because several actions kept failing.") && stopReply.contains("Done: Created the Z folder.") && stopReply.contains("Couldn’t create C."), "three different failures in a row stop the loop with a summary")
+        model.streamReplies = true
         model.clearChat()
 
         // Chat memory: saved per chat, restored, kept across model switches, cleared without touching notes.

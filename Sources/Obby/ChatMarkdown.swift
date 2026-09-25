@@ -296,7 +296,7 @@ struct CopyButton: View {
         } label: {
             Image(systemName: copied ? "checkmark" : "doc.on.doc")
                 .imageScale(.small)
-                .frame(width: 18, height: 16)
+                .frame(minWidth: 18, minHeight: 16)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
@@ -338,8 +338,9 @@ struct ChatImageView: View {
                 }
             }
             .task(id: url) {
-                let loaded = await Task.detached(priority: .utility) { NSImage(contentsOf: url) }.value
-                if let loaded, loaded.isValid { image = loaded } else { failed = true }
+                // The bytes are read off the main actor (Data is Sendable); the NSImage is made here, on the main actor.
+                let data = await Task.detached(priority: .utility) { try? Data(contentsOf: url) }.value
+                if let data, let loaded = NSImage(data: data), loaded.isValid { image = loaded } else { failed = true }
             }
         }
     }
@@ -462,7 +463,7 @@ struct MemoryPopover: View {
             }
             .padding(14)
         }
-        .frame(width: 340, height: 440)
+        .frame(minWidth: 340, idealWidth: 340, minHeight: 300, idealHeight: 440) // Content scrolls; nothing clips with taller controls.
         .onAppear { goal = model.memory.currentGoal }
         .onDisappear { saveGoal() }
     }
@@ -572,7 +573,7 @@ struct MemorySettingsSheet: View {
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }.padding(12)
         }
-        .frame(width: 520, height: 560)
+        .frame(minWidth: 520, idealWidth: 520, minHeight: 460, idealHeight: 560) // The list scrolls; the footer always stays visible.
         .onAppear { reloadTasks() }
         .onChange(of: model.globalMemory) { memory in memory.save() } // Every edit is saved straight away.
         .onDisappear { model.globalMemory.aboutMe.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }; model.globalMemory.preferences.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }; model.reloadSavedChats() }

@@ -256,7 +256,7 @@ struct InlineTitleEditor: NSViewRepresentable {
 }
 
 private struct PromptHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
+    static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
@@ -471,7 +471,7 @@ struct SettingsView: View {
             aiTab.tabItem { Label("AI", systemImage: "sparkles") }
             memoryTab.tabItem { Label("Memory", systemImage: "brain") }
             advancedTab.tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
-        }.frame(width: 560, height: 580)
+        }.frame(minWidth: 560, idealWidth: 580, minHeight: 520)
             .sheet(isPresented: $showMemory) { MemorySettingsSheet().environmentObject(model) }
             .task { syncDrafts(); await model.connect() }
             .onChange(of: model.selectedModel) { value in manualModel = value }

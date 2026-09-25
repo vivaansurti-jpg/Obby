@@ -387,14 +387,22 @@ struct ActionGroupView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .accessibilityElement(children: .combine)
-                if showRaw {
-                    Text(line.rawAction ?? "Raw details were discarded to keep session memory small.")
+                if showRaw && !line.notice {
+                    DisclosureGroup("Request and result (read-only)") {
+                    if let raw = line.rawAction {
+                    HStack { Spacer(); CopyButton(text: raw, label: "Copy action details") }
+                    Text(raw)
                         .font(.system(.caption2, design: .monospaced))
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(6)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+                    } else {
+                        Text("Details for this action are no longer available. Older details are removed to limit memory use.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    }.font(.caption)
                 }
             }
         }
@@ -411,12 +419,13 @@ struct MemoryPopover: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 Text("This task’s memory").font(.headline)
-                Text("Kept on this Mac and sent with each request, whichever model you use. Notes are read from disk, not copied here.")
+                Text("Edit the goal below or remove remembered items. Your notes are not changed.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Goal").font(.caption.weight(.semibold))
                     TextField("What this task is for", text: $goal, axis: .vertical).textFieldStyle(.roundedBorder).font(.caption)
                         .onSubmit { saveGoal() }
+                    Button("Save goal") { saveGoal() }.font(.caption)
                 }
                 list("Pinned", \.pinned)
                 if !model.memory.summary.isEmpty {
@@ -449,8 +458,7 @@ struct MemoryPopover: View {
                         }
                     }
                 }
-                Divider()
-                Button("Clear this task’s memory", role: .destructive) { model.clearCurrentChatMemory() }.font(.caption).disabled(model.busy)
+                MemoryDangerZone(includeAll: false) { goal = "" }
             }
             .padding(14)
         }
@@ -479,7 +487,7 @@ struct MemoryPopover: View {
         }
     }
     func remove(_ action: @escaping () -> Void) -> some View {
-        Button { action(); model.persistChat() } label: { Image(systemName: "minus.circle") }
+        Button("Remove") { action(); model.persistChat() }
             .buttonStyle(.borderless).help("Remove from memory")
     }
 }
@@ -521,8 +529,8 @@ struct MemorySettingsSheet: View {
                     ForEach(keys, id: \.self) { key in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(folderLabel(key)).font(.caption).foregroundStyle(.secondary)
-                            editableRow(Binding(get: { model.globalMemory.folders[key] ?? "" }, set: { model.globalMemory.folders[key] = String($0.prefix(500)) }),
-                                        remove: { model.globalMemory.folders.removeValue(forKey: key) })
+                            TextField("Edit folder context", text: Binding(get: { model.globalMemory.folders[key] ?? "" }, set: { model.globalMemory.folders[key] = String($0.prefix(500)) }))
+                                .textFieldStyle(.roundedBorder)
                         }
                     }
                 }
@@ -536,15 +544,30 @@ struct MemorySettingsSheet: View {
                                 Text("Last used " + task.updatedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button { ChatStore.delete(task.id); reloadTasks() } label: { Image(systemName: "minus.circle") }
-                                .buttonStyle(.borderless).help("Forget this task (notes are not affected)")
                         }
+                    }
+                }
+                Section {
+                    DangerZone {
+                        Text("These actions remove saved context. Your notes and attachments are kept.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach(model.globalMemory.folders.keys.sorted(), id: \.self) { key in
+                            ConfirmRemovalButton(title: "Delete context: \(folderLabel(key))", warning: "Deletes the standing instructions for this folder. The folder and its notes are kept.") {
+                                model.globalMemory.folders.removeValue(forKey: key)
+                            }
+                        }
+                        ForEach(tasks) { task in
+                            ConfirmRemovalButton(title: "Forget task: \(task.title.isEmpty ? "Untitled task" : task.title)", warning: "Deletes this task's saved conversation and memory. Your notes are kept.") {
+                                ChatStore.delete(task.id); reloadTasks()
+                            }
+                        }
+                        MemoryDangerZone(includeAll: true, showHeading: false) { reloadTasks() }
                     }
                 }
             }
             Divider()
             HStack {
-                Text("Kept on this Mac. Removing memory never deletes notes or attachments.").font(.caption).foregroundStyle(.secondary)
+                Text("Edits save automatically. Removing memory never deletes notes or attachments.").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }.padding(12)
@@ -556,8 +579,8 @@ struct MemorySettingsSheet: View {
     }
     func editableRow(_ text: Binding<String>, remove: @escaping () -> Void) -> some View {
         HStack {
-            TextField("", text: text)
-            Button(action: remove) { Image(systemName: "minus.circle") }.buttonStyle(.borderless).help("Remove")
+            TextField("Edit memory", text: text).textFieldStyle(.roundedBorder)
+            Button("Remove", action: remove).buttonStyle(.borderless).help("Remove from memory")
         }
     }
     func addRow(_ placeholder: String, text: Binding<String>, add: @escaping () -> Void) -> some View {
@@ -581,3 +604,56 @@ struct MemorySettingsSheet: View {
     }
 }
 
+/// Shared presentation for destructive settings, kept below the editing controls.
+struct DangerZone<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Rectangle().fill(Color.red).frame(height: 1)
+            Label("Danger zone", systemImage: "exclamationmark.triangle").font(.headline).foregroundStyle(.red)
+            content
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 8)
+    }
+}
+
+struct ConfirmRemovalButton: View {
+    let title: String
+    let warning: String
+    let action: () -> Void
+    @State private var confirming = false
+    var body: some View {
+        Button(title, role: .destructive) { confirming = true }
+            .foregroundStyle(.red)
+            .alert(title + "?", isPresented: $confirming) {
+                Button("Cancel", role: .cancel) {}
+                Button(title, role: .destructive, action: action)
+            } message: { Text(warning + " This cannot be undone.") }
+    }
+}
+
+struct MemoryDangerZone: View {
+    @EnvironmentObject var model: AppModel
+    var includeAll: Bool
+    var showHeading = true
+    var didClear: () -> Void = {}
+    var body: some View {
+        Group {
+            if showHeading { DangerZone { controls } }
+            else { controls }
+        }.disabled(model.busy)
+    }
+    var controls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Clearing memory also removes saved chat history. Notes and attachments are kept.")
+                .font(.caption).foregroundStyle(.secondary)
+            ConfirmRemovalButton(title: "Clear this task's memory", warning: "Clears the current task's conversation and memory.") {
+                model.clearCurrentChatMemory(); didClear()
+            }
+            if includeAll {
+                ConfirmRemovalButton(title: "Clear all AI memory", warning: "Clears every saved task, personal fact, preference and folder context.") {
+                    model.clearAllChatMemory(); didClear()
+                }
+            }
+        }
+    }
+}

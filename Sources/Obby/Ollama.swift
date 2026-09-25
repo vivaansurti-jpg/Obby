@@ -148,15 +148,20 @@ extension AppModel {
         guard !busy, !switchingModel, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !selectedModel.isEmpty, vault != nil, save() else { return }
         directoryResults.removeAll()
         busy = true; appendChat(role: "You", text: prompt); persistSettings()
-        // Chat memory: title and starting goal from the first request (compaction refreshes the goal), the open note as a relevant file.
-        let firstLine = prompt.replacingOccurrences(of: "\n", with: " ")
-        if memory.title.isEmpty { memory.title = String(firstLine.prefix(60)) }
-        if memory.currentGoal.isEmpty { memory.currentGoal = String(firstLine.prefix(240)) }
+        // Chat memory: only the first real request (not small talk or a memory question) sets the title and starting goal;
+        // the memory update refreshes both after real work.
+        if ToolRouting.classify(prompt) == .work {
+            let request = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let firstLine = request.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? request
+            if memory.title.isEmpty { memory.title = String(firstLine.prefix(60)).trimmingCharacters(in: .whitespaces) }
+            if memory.currentGoal.isEmpty { memory.currentGoal = String(request.replacingOccurrences(of: "\n", with: " ").prefix(240)) }
+        }
         if let note { memory.remember(file: note) }
         pinFromRequest(prompt) // "Remember that…" is pinned by Obby itself.
         let session = chatSession
         aiTask = Task {
             defer { guardWrites = false; pendingUndo = nil; if session == chatSession { busy = false; aiTask = nil; directoryResults.removeAll() }; Task { await refreshModelStatus() } }
+            let live = LiveReply() // The streamed reply's chat line, if one is on screen.
             do {
                 if self.provider == .ollama { // Starts Ollama.app if needed (setting permitting); loads no model by itself.
                     let wasConnected = connected
@@ -264,7 +269,22 @@ extension AppModel {
                         : smallTalk ? baseSystem + "\n\n" + memoryText
                         : baseSystem + "\n\nTask memory kept by Obby for this chat (it may have started with another model; continue from it):\n" + memoryText
                     contextUsage = (fit.used, window)
-                    let reply = try await provider.chat(ChatRequest(model: selectedModel, system: system, messages: trimmed, tools: tools, temperature: temperature, contextWindow: window, keepAlive: keepAlive.apiValue, format: actionFormat ? ToolRouting.actionSchema(actionNames) : nil))
+                    let chatRequest = ChatRequest(model: selectedModel, system: system, messages: trimmed, tools: tools, temperature: temperature, contextWindow: window, keepAlive: keepAlive.apiValue, format: actionFormat ? ToolRouting.actionSchema(actionNames) : nil)
+                    // Ollama replies appear as they are written (about 10 updates a second). Anything that may be a tool call
+                    // is held back until the reply is complete; the JSON action format is never streamed to screen.
+                    let reply: ChatReply
+                    if provider.kind == .ollama, streamReplies, !actionFormat {
+                        live.lastShown = .distantPast
+                        reply = try await provider.chatStream(chatRequest) { [weak self] text in
+                            guard let self, session == self.chatSession else { return }
+                            let visible = TextToolCall.visiblePrefix(text)
+                            guard !visible.isEmpty, Date().timeIntervalSince(live.lastShown) >= 0.1 else { return }
+                            live.lastShown = Date()
+                            self.showLive(visible, live)
+                        }
+                    } else {
+                        reply = try await provider.chat(chatRequest)
+                    }
                     try Task.checkCancellation()
                     // A tool call is executed, never displayed: native calls, or (for models without reliable native
                     // calling) a reply that is a call to a known Obby tool written as text. Only prose is rendered.
@@ -285,6 +305,7 @@ extension AppModel {
                             invalidCalls += 1
                             guard invalidCalls <= 2 else { throw ObbyError("The model kept sending actions Obby couldn’t read. Try again, or choose a model with tool support.") }
                             messages.append(["role": "user", "content": "Obby could not run that tool call: \(reason). Call the tool again with valid JSON arguments, or answer in plain text."])
+                            removeLive(live)
                             continue
                         case .notACall: break
                         }
@@ -295,7 +316,10 @@ extension AppModel {
                         toolCalls = []; textCalls = false; prose = ActionPresentation.reply(reply.text)
                     }
                     messages.append(textCalls ? ["role": "assistant", "content": reply.text] : reply.message)
-                    if !prose.isEmpty { appendChat(role: "Obby", text: prose) }
+                    if let id = live.lineID, let index = chat.firstIndex(where: { $0.id == id }) { // The streamed line becomes the final reply.
+                        if prose.isEmpty { chat.remove(at: index) } else { chat[index].text = prose }
+                        live.lineID = nil
+                    } else if !prose.isEmpty { appendChat(role: "Obby", text: prose) }
                     guard !toolCalls.isEmpty else {
                         let kept = ChatMemory.retainingExchange(previousHistory, prompt: prompt, reply: prose)
                         let dropped = (previousHistory + [["role": "user", "content": prompt], ["role": "assistant", "content": prose]]).dropLast(kept.count)
@@ -337,7 +361,15 @@ extension AppModel {
                 }
                 throw ObbyError("Stopped after 20 tool rounds. You can ask Obby to continue.")
             } catch {
-                if session == chatSession { appendChat(role: "Obby", text: Task.isCancelled ? "Stopped." : describe(error)) }
+                if session == chatSession {
+                    if Task.isCancelled, let id = live.lineID, let index = chat.firstIndex(where: { $0.id == id }), !chat[index].text.isEmpty {
+                        chat[index].text += " (stopped)" // Keep what already arrived.
+                        live.lineID = nil
+                    } else {
+                        removeLive(live)
+                        appendChat(role: "Obby", text: Task.isCancelled ? "Stopped." : describe(error))
+                    }
+                }
             }
         }
     }
@@ -368,9 +400,46 @@ extension AppModel {
         if !noteFolder.isEmpty, value.hasPrefix(noteFolder + "/"), (try? resolveAttachment(value)) == nil { return String(value.dropFirst(noteFolder.count + 1)) }
         return value
     }
+    /// Shows (or updates) the streamed reply's chat line.
+    func showLive(_ text: String, _ live: LiveReply) {
+        if let id = live.lineID, let index = chat.firstIndex(where: { $0.id == id }) { chat[index].text = text; return }
+        let line = ChatLine(role: "Obby", text: text)
+        chat = ChatMemory.trimDisplay(chat + [line])
+        live.lineID = line.id
+    }
+    func removeLive(_ live: LiveReply) {
+        if let id = live.lineID { chat.removeAll { $0.id == id } }
+        live.lineID = nil
+    }
+    /// Reads a streaming Ollama response, one JSON object per line (URLSession.bytes, same private session settings).
+    func streamLines(_ route: String, body: [String: Any]) -> AsyncThrowingStream<[String: Any], Error> {
+        if let streamOverride { return streamOverride(route, body) }
+        return AsyncThrowingStream { continuation in
+            let work = Task { @MainActor in
+                do {
+                    var request = URLRequest(url: try self.localURL(route)); request.timeoutInterval = 300
+                    request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    let config = URLSessionConfiguration.ephemeral
+                    config.connectionProxyDictionary = [:]; config.urlCache = nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
+                    config.httpCookieStorage = nil; config.urlCredentialStorage = nil
+                    let session = URLSession(configuration: config, delegate: NoRedirect(), delegateQueue: nil)
+                    defer { session.finishTasksAndInvalidate() }
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw ObbyError("Ollama request failed.") }
+                    for try await line in bytes.lines {
+                        guard let data = line.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                        continuation.yield(object)
+                    }
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { _ in work.cancel() }
+        }
+    }
     /// The system prompt for tool-capable models (kept short: every sentence is sent with every request).
     static func toolSystemPrompt(isLocal: Bool, note: String?, folder: String) -> String {
-        "You are Obby, a\(isLocal ? " local" : "") notes assistant. All paths are relative to the selected notes folder. Use the provided tools to actually perform requested file operations. Never claim an action happened unless its tool succeeded. Read notes before editing them. Do not invent note contents. Find notes with search_notes by content or name; only list folders when the user asks about organising them. Only use tools when the user asks you to find, read or change notes. For greetings or general conversation, just reply. Current note path: \(note ?? "none"). Selected folder: \(folder.isEmpty ? "/" : folder)."
+        "You are Obby, a\(isLocal ? " local" : "") notes assistant. All paths are relative to the selected notes folder. Use the provided tools to actually perform requested file operations. Never claim an action happened unless its tool succeeded. Read notes before editing them. Do not invent note contents. Find notes with search_notes by content or name; only list folders when the user asks about organising them. Only use tools when the user asks you to find, read or change notes. For greetings or general conversation, just reply. If the request has several steps, complete every step before your final reply, then list what you did. Current note path: \(note ?? "none"). Selected folder: \(folder.isEmpty ? "/" : folder)."
     }
     /// Keeps the note's previous text so the action line can offer Undo (session only; very large notes are skipped).
     func recordUndo(_ path: String, previous: String?, after: String) {
@@ -409,3 +478,6 @@ extension AppModel {
 final class NoRedirect: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
 }
+/// The streamed reply's chat line and when it was last redrawn (for throttling).
+@MainActor final class LiveReply { var lineID: UUID?; var lastShown = Date.distantPast }
+

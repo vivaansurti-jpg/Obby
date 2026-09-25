@@ -65,6 +65,8 @@ import AppKit
     var pendingUndo: UndoEdit? // Set by executeTool for the action line it is about to produce.
     var readThisRequest: Set<String> = [] // Notes the model has read (or was given) during the current AI request.
     var shrinkOverride: ((String) -> Bool)? // The checks answer the shrink question without a dialog.
+    var streamOverride: ((String, [String: Any]) -> AsyncThrowingStream<[String: Any], Error>)? // The checks' fake Ollama stream.
+    @Published var streamReplies = UserDefaults.standard.object(forKey: "streamReplies") as? Bool ?? true
     var guardWrites = false // True during an AI request: whole-note rewrites require the note to have been read first.
     let noteIndex = NoteIndex() // In-memory keyword index for "related notes" (never written to disk).
     @Published var relatedNotesLocal = UserDefaults.standard.object(forKey: "relatedNotesLocal") as? Bool ?? true
@@ -383,7 +385,7 @@ import AppKit
         } catch { self.error = error.localizedDescription }
     }
     func search() { perform { results = try vault?.search(query) ?? [] } }
-    func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: provider.modelKey); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe") }
+    func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: provider.modelKey); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe"); UserDefaults.standard.set(streamReplies, forKey: "streamReplies") }
 }
 struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil }
 /// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.

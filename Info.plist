@@ -12,5 +12,7 @@
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
+<key>NSMicrophoneUsageDescription</key><string>Obby listens only while the microphone button in the AI panel is on, to turn your speech into text on this Mac.</string>
+<key>NSSpeechRecognitionUsageDescription</key><string>Obby turns your speech into text for the AI prompt, on this Mac when possible.</string>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

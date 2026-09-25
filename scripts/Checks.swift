@@ -442,6 +442,10 @@ import AppKit
         let unclear = ToolRouting.tools(for: "tell me more about the second idea please", hasAttachments: false)
         check(!unclear.isEmpty && unclear.isDisjoint(with: ToolRouting.changing), "unmatched wording gets read-only tools, never changing ones")
         check(ToolRouting.tools(for: "Where is the needle?", hasAttachments: false).contains("search_notes"), "short find request is not small talk")
+        let multiStep = ToolRouting.tools(for: "make 5 notes, labelled random animals, and then delete greeting.md", hasAttachments: false)
+        check(multiStep.contains("create_file") && multiStep.contains("delete_path"), "multi-step request gets create and delete tools")
+        check(ToolRouting.tools(for: "add two notes about cells", hasAttachments: false).contains("create_file"), "\"add two notes\" gets create tools")
+        check(ToolRouting.tools(for: "hi", hasAttachments: false).isEmpty && ToolRouting.tools(for: "hi, thanks", hasAttachments: false).isEmpty, "\"hi\" still gets no tools")
         model.relatedNotesLocal = true
         let relatedForHi = await model.relatedNotes(for: "hi there", allowance: 10_000)
         let relatedForThanks = await model.relatedNotes(for: "thanks!", allowance: 10_000)
@@ -519,7 +523,8 @@ import AppKit
         let toolPrompt = AppModel.toolSystemPrompt(isLocal: true, note: "School/TOK.md", folder: "School")
         for sentence in ["Use the provided tools to actually perform requested file operations.", "Never claim an action happened unless its tool succeeded.",
                          "Read notes before editing them. Do not invent note contents.", "Only use tools when the user asks you to find, read or change notes. For greetings or general conversation, just reply.",
-                         "All paths are relative to the selected notes folder.", "Current note path: School/TOK.md.", "Selected folder: School."] {
+                         "All paths are relative to the selected notes folder.", "Current note path: School/TOK.md.", "Selected folder: School.",
+                         "If the request has several steps, complete every step before your final reply, then list what you did."] {
             check(toolPrompt.contains(sentence), "tool prompt keeps: \(sentence)")
         }
         check(ContextBudget.tokens(toolPrompt) <= 190, "tool prompt trimmed")
@@ -538,6 +543,97 @@ import AppKit
         _ = model.memoryPacket()
         check(!model.memory.relevantFiles.contains("Gone-old.md") && model.memory.relevantFiles.contains("Gone-new.md") && model.memory.missingSince["Gone-new.md"] != nil, "files missing over 7 days expire; newer ones are kept and marked")
         check(model.memory.pinned == ["Exam on 12 May"], "pins are never cleaned up")
+        model.clearChat()
+
+        // Titles and goals come from the first real request, never from small talk.
+        var titleReply = "Hello!"
+        model.toolSupport = [:]
+        model.requestOverride = { route, _ in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            guard route == "/api/chat" else { return [:] }
+            return ["message": ["role": "assistant", "content": titleReply]]
+        }
+        model.clearAllChatMemory()
+        model.send("hi there")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(model.memory.title.isEmpty && model.memory.currentGoal.isEmpty && !FileManager.default.fileExists(atPath: ChatStore.file(model.memory.id).path), "a chat of only small talk has no title or goal and isn't saved")
+        model.send("summarise Cells.md")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(model.memory.title == "summarise Cells.md" && model.memory.currentGoal == "summarise Cells.md", "title and goal come from the first real request")
+        titleReply = #"{"summary":"Summarised cells.","title":"Cell biology summary"}"#
+        let titleProvider = try model.makeProvider()
+        await model.updateMemory(provider: titleProvider, window: 8_192, budget: 6_000, prompt: "summarise Cells.md", didWork: true)
+        check(model.memory.title == "Cell biology summary", "memory update can give a better short title")
+        let oldTask = Data(#"{"id":"\#(UUID().uuidString)","title":"hi there","currentGoal":"hi there","summary":"x"}"#.utf8)
+        let decodedOld = try JSONDecoder().decode(ChatRecord.self, from: oldTask)
+        check(decodedOld.title.isEmpty && decodedOld.currentGoal.isEmpty, "old task titled \"hi there\" is cleared on load")
+        check(!ToolRouting.isGreeting("Cell biology") && ToolRouting.isGreeting("how are you"), "real short titles are not mistaken for greetings")
+        model.clearAllChatMemory()
+
+        // Streaming (Ollama only): chunks join, tool calls never shown, fallback, Stop keeps text, setting off, others unchanged.
+        func chunks(_ pieces: [String]) -> AsyncThrowingStream<[String: Any], Error> {
+            AsyncThrowingStream { stream in
+                for piece in pieces { stream.yield(["message": ["role": "assistant", "content": piece]]) }
+                stream.yield(["done": true]); stream.finish()
+            }
+        }
+        var streamRound = 0, plainChats = 0
+        model.toolSupport = [:]; model.streamReplies = true
+        model.requestOverride = { route, _ in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            guard route == "/api/chat" else { return [:] }
+            plainChats += 1
+            return ["message": ["role": "assistant", "content": "Fallback reply"]]
+        }
+        model.streamOverride = { _, _ in streamRound += 1; return chunks(["Photo", "synthesis ", "makes sugar."]) }
+        model.clearChat()
+        model.send("explain photosynthesis in a few sentences please")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(model.chat.filter { $0.role == "Obby" }.map(\.text) == ["Photosynthesis makes sugar."] && model.history.last?["content"] as? String == "Photosynthesis makes sugar.", "streamed chunks join into one final reply")
+        check(TextToolCall.visiblePrefix("read_") == "" && TextToolCall.visiblePrefix(#"write_file{"pa"#) == "" && TextToolCall.visiblePrefix("Sure.\n```json\n{") == "Sure." && TextToolCall.visiblePrefix("Cells divide") == "Cells divide", "possible tool calls are held back while streaming")
+        streamRound = 0
+        model.streamOverride = { _, _ in streamRound += 1; return streamRound == 1 ? chunks(["read_", #"file{"path":"Current.md"}"#]) : chunks(["It says ", "TOK."]) }
+        model.clearChat()
+        model.send("read Current.md and tell me what it says")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(!model.chat.contains { $0.role == "Obby" && $0.text.contains("read_") } && model.chat.contains { $0.text == "Read Current.md." } && model.chat.last(where: { $0.role == "Obby" })?.text == "It says TOK.", "streamed tool call runs and is never shown as text")
+        plainChats = 0
+        model.streamOverride = { _, _ in AsyncThrowingStream { $0.finish(throwing: ObbyError("connection reset")) } }
+        model.clearChat()
+        model.send("explain osmosis in a few sentences please")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(model.chat.last(where: { $0.role == "Obby" })?.text == "Fallback reply" && plainChats >= 1, "a failure before the first chunk falls back to the normal request")
+        model.streamOverride = { _, _ in
+            AsyncThrowingStream { stream in
+                stream.yield(["message": ["role": "assistant", "content": "Partial answer"]])
+                let wait = Task { try? await Task.sleep(nanoseconds: 5_000_000_000); stream.finish() }
+                stream.onTermination = { _ in wait.cancel() }
+            }
+        }
+        model.clearChat()
+        model.send("explain diffusion in a few sentences please")
+        try await Task.sleep(nanoseconds: 400_000_000)
+        model.aiTask?.cancel()
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(model.chat.last(where: { $0.role == "Obby" })?.text == "Partial answer (stopped)", "Stop keeps the text that already arrived")
+        model.streamReplies = false; streamRound = 0; plainChats = 0
+        model.streamOverride = { _, _ in streamRound += 1; return chunks(["streamed"]) }
+        model.clearChat()
+        model.send("explain respiration in a few sentences please")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(streamRound == 0 && plainChats >= 1 && model.chat.last(where: { $0.role == "Obby" })?.text == "Fallback reply", "\"Stream replies\" off uses the normal request")
+        model.streamReplies = true; model.streamOverride = nil
+        struct WholeReplyProvider: AIProvider {
+            var kind: ProviderKind { .anthropic }
+            var isLocal: Bool { false }
+            func listModels() async throws -> [String] { [] }
+            func supportsTools(_ model: String) async -> Bool { false }
+            func contextLimit(_ model: String) async -> Int? { nil }
+            func chat(_ request: ChatRequest) async throws -> ChatReply { ChatReply(text: "Whole reply", toolCalls: [], message: [:]) }
+        }
+        var deliveries: [String] = []
+        let whole = try await WholeReplyProvider().chatStream(ChatRequest(model: "m", system: "", messages: [], tools: nil, temperature: 0, contextWindow: 4_096, keepAlive: 0)) { deliveries.append($0) }
+        check(whole.text == "Whole reply" && deliveries == ["Whole reply"], "other providers are unchanged: the whole reply arrives once")
         model.clearChat()
 
         // Chat memory: saved per chat, restored, kept across model switches, cleared without touching notes.

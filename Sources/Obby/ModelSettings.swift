@@ -40,14 +40,14 @@ extension AppModel {
     var modelChoices: [String] { selectedModel.isEmpty || models.contains(selectedModel) ? models : [selectedModel] + models }
     var modelStatus: String {
         guard provider == .ollama else {
-            if provider != .openAI && !hasAPIKey { return "\(provider.label) · API key needed" }
-            guard !selectedModel.isEmpty else { return "\(provider.label) · No model selected" }
-            return "\(selectedModel) · \(connected ? "Ready" : "Not verified")"
+            if provider != .openAI && !hasAPIKey { return "\(provider.label): API key needed" }
+            guard !selectedModel.isEmpty else { return "\(provider.label): No model selected" }
+            return "\(selectedModel): \(connected ? "Ready" : "Not verified")"
         }
         if startingOllama { return "Starting Ollama…" }
-        guard connected else { return autoStartOllama && ollamaIssue == nil && !selectedModel.isEmpty ? "Ollama · Starts when needed" : "Ollama · Offline" }
-        guard !selectedModel.isEmpty else { return "Ollama · No model selected" }
-        return "\(selectedModel) · \(loadedModels.contains(selectedModel) ? "Loaded" : "Unloaded")"
+        guard connected else { return autoStartOllama && ollamaIssue == nil && !selectedModel.isEmpty ? "Ollama starts when needed" : "Ollama is offline" }
+        guard !selectedModel.isEmpty else { return "Ollama: No model selected" }
+        return "\(selectedModel): \(loadedModels.contains(selectedModel) ? "Loaded" : "Unloaded")"
     }
     /// Whether AI is usable right now; notes never depend on this.
     var aiConfigured: Bool {
@@ -59,7 +59,7 @@ extension AppModel {
         }
     }
     var isLocalProvider: Bool { provider == .ollama || (provider == .openAI && RemoteHTTP.isLoopback(openAIBaseURL)) }
-    var providerBadge: String { "\(isLocalProvider ? "Local" : "Cloud") · \(provider.label)" }
+    var providerBadge: String { "\(provider.label) (\(isLocalProvider ? "Local" : "Cloud"))" }
     /// True when quitting should unload the active Ollama model: the setting is on and this session actually used it.
     var needsUnloadOnQuit: Bool { unloadOnQuit && provider == .ollama && !selectedModel.isEmpty && usedOllamaModels.contains(selectedModel) }
     /// One unload request (keep_alive 0) when Obby terminates. Short timeout; Ollama itself keeps running.
@@ -156,7 +156,7 @@ extension AppModel {
 
     func makeProvider() throws -> AIProvider {
         switch provider {
-        case .ollama: return OllamaProvider(send: { try await self.request($0, body: $1) })
+        case .ollama: return OllamaProvider(send: { try await self.request($0, body: $1) }, stream: { self.streamLines($0, body: $1) })
         case .openAI: return OpenAICompatibleProvider(base: try RemoteHTTP.validatedBase(openAIBaseURL), apiKey: apiKey(for: .openAI), toolsEnabled: openAITools)
         case .anthropic:
             guard let key = apiKey(for: .anthropic) else { throw ObbyError("Add an Anthropic API key in Settings.") }

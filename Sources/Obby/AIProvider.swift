@@ -65,6 +65,15 @@ struct ChatReply {
     /// Maximum context the provider reports for this model, if it can be discovered. nil = unknown.
     func contextLimit(_ model: String) async -> Int?
     func chat(_ request: ChatRequest) async throws -> ChatReply
+    /// Streaming path: `onText` receives the reply text so far. Only Ollama streams; others deliver it once.
+    func chatStream(_ request: ChatRequest, onText: @escaping @MainActor (String) -> Void) async throws -> ChatReply
+}
+extension AIProvider {
+    @MainActor func chatStream(_ request: ChatRequest, onText: @escaping @MainActor (String) -> Void) async throws -> ChatReply {
+        let reply = try await chat(request)
+        if !reply.text.isEmpty { onText(reply.text) }
+        return reply
+    }
 }
 
 func neutralAssistant(_ text: String, _ calls: [ToolCall], native: Any? = nil) -> [String: Any] {
@@ -83,6 +92,7 @@ private func functionParts(_ tool: [String: Any]) -> (String, String, Any) {
 
 struct OllamaProvider: AIProvider {
     let send: (String, [String: Any]?) async throws -> [String: Any]
+    var stream: ((String, [String: Any]) -> AsyncThrowingStream<[String: Any], Error>)? = nil // One JSON object per line.
     var kind: ProviderKind { .ollama }
     var isLocal: Bool { true }
     func listModels() async throws -> [String] {
@@ -116,6 +126,37 @@ struct OllamaProvider: AIProvider {
         try ChatMemory.checkSize(body, window: request.contextWindow)
         let response = try await send("/api/chat", body)
         guard let message = response["message"] as? [String: Any] else { throw ObbyError("Ollama returned no message.") }
+        return try reply(from: message)
+    }
+    /// "stream": true — content chunks are appended as they arrive, tool calls collected from any chunk, until "done".
+    /// If the stream fails before anything arrives, the normal request is tried once instead.
+    func chatStream(_ request: ChatRequest, onText: @escaping @MainActor (String) -> Void) async throws -> ChatReply {
+        guard let stream else { let reply = try await chat(request); if !reply.text.isEmpty { onText(reply.text) }; return reply }
+        var body = body(request)
+        body["stream"] = true
+        try ChatMemory.checkSize(body, window: request.contextWindow)
+        var text = "", calls: [[String: Any]] = [], received = false
+        do {
+            for try await chunk in stream("/api/chat", body) {
+                if let error = chunk["error"] as? String { throw ObbyError(error) }
+                if let message = chunk["message"] as? [String: Any] {
+                    if let piece = message["content"] as? String, !piece.isEmpty { text += piece; received = true; onText(text) }
+                    if let more = message["tool_calls"] as? [[String: Any]], !more.isEmpty { calls += more; received = true }
+                }
+                if chunk["done"] as? Bool == true { break }
+            }
+            try Task.checkCancellation() // Stop: the stream ends early; keep the partial text via the caller.
+        } catch let error as CancellationError { throw error }
+        catch {
+            if Task.isCancelled { throw CancellationError() }
+            guard !received else { throw error }
+            return try await chat(request)
+        }
+        var message: [String: Any] = ["role": "assistant", "content": text]
+        if !calls.isEmpty { message["tool_calls"] = calls }
+        return try reply(from: message)
+    }
+    func reply(from message: [String: Any]) throws -> ChatReply {
         var context = message
         context.removeValue(forKey: "thinking")
         let calls = try (message["tool_calls"] as? [[String: Any]] ?? []).enumerated().map { index, call -> ToolCall in

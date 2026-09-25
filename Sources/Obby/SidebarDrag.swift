@@ -86,7 +86,7 @@ struct NativeFileSidebar: NSViewRepresentable {
         init(_ model: AppModel) { self.model = model }
         func update() {
             guard let outline else { return }
-            let entries = model.query.isEmpty ? model.tree : model.results
+            let entries = [Entry(path: "", isDirectory: true)] + (model.query.isEmpty ? model.tree : model.results)
             updating = true
             defer { updating = false }
             if entries != previous {
@@ -107,7 +107,8 @@ struct NativeFileSidebar: NSViewRepresentable {
                     if let node = nodes[path] { outline.expandItem(node) }
                 }
             }
-            if let selected = model.selection, let node = nodes[selected] {
+            if let node = nodes[model.selection ?? ""] {
+                let selected = model.selection ?? ""
                 let ancestors = selected.split(separator: "/").dropLast()
                 var path = ""
                 for component in ancestors {
@@ -120,10 +121,10 @@ struct NativeFileSidebar: NSViewRepresentable {
         }
         func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int { (item as? Node)?.children.count ?? roots.count }
         func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any { ((item as? Node)?.children ?? roots)[index] }
-        func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool { (item as? Node)?.entry.isDirectory == true }
+        func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool { guard let node = item as? Node else { return false }; return node.entry.isDirectory && !node.entry.path.isEmpty }
         func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
             guard let node = item as? Node else { return nil }
-            let label = NSTextField(labelWithString: node.entry.name)
+            let label = NSTextField(labelWithString: node.entry.path.isEmpty ? "All Notes" : node.entry.name)
             label.font = .systemFont(ofSize: NSFont.systemFontSize)
             label.lineBreakMode = .byTruncatingTail
             let icon = NSImageView(image: NSImage(systemSymbolName: node.entry.isDirectory ? "folder" : "doc.text", accessibilityDescription: nil)!)
@@ -141,11 +142,11 @@ struct NativeFileSidebar: NSViewRepresentable {
             guard !updating, let outline else { return }
             let node = outline.item(atRow: outline.selectedRow) as? Node
             guard let node else { model.selection = nil; return }
-            if node.entry.isDirectory { model.selectFolder(node.entry.path) } // Closes the open note.
+            if node.entry.isDirectory { model.selectFolder(node.entry.path.isEmpty ? nil : node.entry.path) } // Closes the open note.
             else { model.selection = node.entry.path; model.openNote(node.entry.path) }
         }
         func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
-            guard let node = item as? Node, let drag = model.beginSidebarDrag(node.entry.path), let data = try? JSONEncoder().encode(drag) else { return nil }
+            guard let node = item as? Node, !node.entry.path.isEmpty, let drag = model.beginSidebarDrag(node.entry.path), let data = try? JSONEncoder().encode(drag) else { return nil }
             let pasteboard = NSPasteboardItem()
             pasteboard.setData(data, forType: Self.pasteboardType)
             return pasteboard
@@ -172,7 +173,7 @@ struct NativeFileSidebar: NSViewRepresentable {
             return moved
         }
         func outlineView(_ outlineView: NSOutlineView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) { model.sidebarDrag = nil }
-        var contextPath: String? { guard let outline else { return nil }; return (outline.item(atRow: outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow) as? Node)?.entry.path }
+        var contextPath: String? { guard let outline, let path = (outline.item(atRow: outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow) as? Node)?.entry.path, !path.isEmpty else { return nil }; return path }
         @objc func rename() { if let path = contextPath { model.relocate(path, rename: true) } }
         @objc func move() { if let path = contextPath { model.relocate(path, rename: false) } }
         @objc func remove() { if let path = contextPath { model.remove(path) } }

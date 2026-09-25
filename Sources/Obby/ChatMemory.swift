@@ -197,6 +197,8 @@ struct ChatRecord: Codable, Identifiable, Equatable {
     var earlierActionCount = 0 // Completed actions older than the last 8, folded into a count.
     var missingSince: [String: Date] = [:] // When a remembered file was first found missing (dropped after 7 days).
     var isEmpty: Bool { recentMessages.isEmpty && summary.isEmpty && pinned.isEmpty }
+    /// A chat with a real request (it has a title), a pin or completed work. Chats of only small talk are not saved.
+    var isWorthSaving: Bool { !title.isEmpty || !pinned.isEmpty || !completedActions.isEmpty || earlierActionCount > 0 }
     /// Structured memory items (for the small "Memory · N items" indicator).
     var itemCount: Int { (currentGoal.isEmpty ? 0 : 1) + (summary.isEmpty ? 0 : 1) + pinned.count + decisions.count + completedActions.count + openQuestions.count + preferences.count + relevantFiles.count }
     /// The compact memory sent with a request (only this chat's, never the whole store).
@@ -282,6 +284,9 @@ extension ChatRecord {
         pinned = try c.decodeIfPresent([String].self, forKey: .pinned) ?? []
         earlierActionCount = try c.decodeIfPresent(Int.self, forKey: .earlierActionCount) ?? 0
         missingSince = try c.decodeIfPresent([String: Date].self, forKey: .missingSince) ?? [:]
+        // Older tasks titled by small talk ("hi there"): clear the title and goal so the next real request sets them.
+        if ToolRouting.isGreeting(currentGoal) { currentGoal = "" }
+        if ToolRouting.isGreeting(title) { title = "" }
     }
 }
 
@@ -408,7 +413,7 @@ extension AppModel {
         memory.recentMessages = history.map { ChatRecord.Message(role: $0["role"] as? String ?? "", content: $0["content"] as? String ?? "") }
         memory.notesRoot = vault?.root.path ?? ""
         memory.updatedAt = Date()
-        guard rememberChats, !memory.isEmpty, !memory.notesRoot.isEmpty else { return }
+        guard rememberChats, !memory.isEmpty, !memory.notesRoot.isEmpty, memory.isWorthSaving else { return } // Small talk alone isn't saved.
         ChatStore.save(memory)
         reloadSavedChats()
     }
@@ -458,6 +463,7 @@ extension AppModel {
         "decisions" (array, at most 8), "openQuestions" (array, at most 6 unresolved next steps), \
         "preferences" (array, at most 5: how the user wants THIS task done, only if they said so), \
         "globalPreferences" (array, at most 3: only preferences the user explicitly said apply from now on or always; otherwise []), \
+        "title" (at most 6 words naming the task, e.g. "Biology cell revision"), \
         "aboutUser" (array, at most 3 short facts the user explicitly STATED about themselves in their own messages, such as their subjects, \
         exam dates or how they like to work; never guesses, never note contents, never health, money, passwords or ID numbers; otherwise []). \
         Mention notes by path only; never copy note contents.
@@ -478,6 +484,11 @@ extension AppModel {
                 (json[key] as? [Any]).map { Array($0.compactMap { $0 as? String }.map { ChatMemory.clipped($0, limit: 200) }.prefix(limit)) }
             }
             if let summary = json["summary"] as? String, !summary.isEmpty { memory.summary = ChatMemory.clipped(summary, limit: 1_200); updated = true }
+            if didWork, let raw = json["title"] as? String { // A better short title after real work.
+                let title = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'.#*")))
+                let words = title.split(whereSeparator: { $0.isWhitespace }).count
+                if (1...6).contains(words), title.count <= 60, !ToolRouting.isGreeting(title) { memory.title = title }
+            }
             if let goal = json["currentGoal"] as? String, !goal.isEmpty { memory.currentGoal = ChatMemory.clipped(goal, limit: 240) }
             if let decisions = items("decisions", 8) { memory.decisions = decisions }
             if let questions = items("openQuestions", 6) { memory.openQuestions = questions }
@@ -577,6 +588,18 @@ enum TextToolCall {
         guard let object = jsonValue(rest) as? [String: Any] else { return nil }
         if let nested = object["arguments"] ?? object["parameters"] { return (name, ToolCall.arguments(nested)) }
         return (name, object)
+    }
+    /// What may be shown of a reply while it is still streaming: everything before the first line that could be the
+    /// start of a tool call (JSON, a code fence, a tool name, or a partly written tool name). The full reply replaces it.
+    static func visiblePrefix(_ text: String) -> String {
+        var kept: [String] = []
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let partialName = trimmed.count >= 4 && trimmed.allSatisfy({ $0.isLetter || $0 == "_" }) && required.keys.contains { $0.hasPrefix(trimmed) }
+            if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") || trimmed.hasPrefix("```") || trimmed.hasPrefix("`") || leadingToolName(trimmed) != nil || partialName { break }
+            kept.append(line)
+        }
+        return kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
     /// A known tool name immediately followed by `{` or `(`.
     static func leadingToolName(_ text: String) -> String? {
@@ -751,6 +774,15 @@ enum ToolRouting {
     static let reading: Set<String> = ["read_file", "read_section", "search_notes", "list_directory"]
     static let changing: Set<String> = ["write_file", "append_to_file", "replace_section", "append_to_section", "replace_text", "create_file", "create_directory", "move_path", "rename_path", "delete_path"]
     static let baseline: Set<String> = ["read_file", "read_section", "search_notes"]
+    /// A greeting or pleasantry ("hi", "hello there", "how are you", "thanks") — never a task title. Narrower than
+    /// isSmallTalk, so short real titles like "Cell biology" are kept.
+    static func isGreeting(_ text: String) -> Bool {
+        let words = text.lowercased().replacingOccurrences(of: "’", with: "'").split(whereSeparator: { !$0.isLetter }).map(String.init)
+        let pleasantries: Set<String> = ["hi", "hello", "hey", "hiya", "yo", "sup", "there", "thanks", "thank", "you", "thx", "ok", "okay", "cool", "nice",
+                                         "great", "good", "morning", "afternoon", "evening", "how", "are", "doing", "what", "whats", "what's", "s", "up",
+                                         "bye", "goodbye", "obby", "test", "testing", "again", "all", "today", "u", "r"]
+        return !words.isEmpty && words.count <= 5 && words.allSatisfy(pleasantries.contains)
+    }
     /// The one classifier: conversation (no tools, no task memory), a question about the task's memory (memory, no
     /// tools), or work (full memory, routed tools).
     enum Kind { case chat, memoryQuestion, work }
@@ -780,7 +812,22 @@ enum ToolRouting {
         return matched(prompt, hasAttachments: hasAttachments).union(baseline)
     }
     /// Tools asked for by the request's wording (reading tools included when the wording is about finding or reading).
+    /// Multi-step requests ("make 5 notes … and then delete greeting.md") get every step's tools; if a step is unclear,
+    /// create and edit tools are included rather than dropped.
     static func matched(_ prompt: String, hasAttachments: Bool) -> Set<String> {
+        var chosen = matchedPart(prompt, hasAttachments: hasAttachments)
+        let parts = prompt.lowercased()
+            .replacingOccurrences(of: "(,|;|\\band then\\b|\\bthen\\b|\\balso\\b)", with: "\u{1F}", options: .regularExpression)
+            .split(separator: "\u{1F}").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard parts.count > 1 else { return chosen }
+        let found = parts.map { matchedPart($0, hasAttachments: hasAttachments) }
+        guard found.contains(where: { !$0.isEmpty }) else { return chosen } // "hi, thanks": still small talk.
+        for tools in found { chosen.formUnion(tools.isEmpty ? createTools.union(editTools) : tools) }
+        return chosen
+    }
+    static let createTools: Set<String> = ["create_file", "create_directory"]
+    static let editTools: Set<String> = ["append_to_file", "append_to_section", "replace_section", "replace_text", "write_file"]
+    static func matchedPart(_ prompt: String, hasAttachments: Bool) -> Set<String> {
         let lowered = prompt.lowercased()
         let words = Set(lowered.split(whereSeparator: { !$0.isLetter }).map(String.init))
         func mentions(_ keys: [String]) -> Bool {
@@ -790,7 +837,10 @@ enum ToolRouting {
         if mentions(["add", "append", "insert", "write", "edit", "update", "change", "rewrite", "replace", "fix", "correct", "put", "include", "expand", "shorten", "improve", "section", "paragraph", "heading", "reword", "format", "remove", "tidy"]) {
             chosen.formUnion(["append_to_file", "append_to_section", "replace_section", "replace_text", "write_file"])
         }
-        if mentions(["create", "new note", "new folder", "make a note", "make a folder", "save", "draft", "start a note"]) { chosen.formUnion(["create_file", "create_directory"]) }
+        if mentions(["create", "new note", "new folder", "make a note", "make a folder", "save", "draft", "start a note"]) { chosen.formUnion(createTools) }
+        // A create verb with a note/file/folder word anywhere ("make 5 notes", "add two notes about cells").
+        if !words.isDisjoint(with: ["create", "make", "add", "new", "write", "start", "draft", "save", "generate"]),
+           !words.isDisjoint(with: ["note", "notes", "file", "files", "folder", "folders"]) { chosen.formUnion(createTools) }
         if mentions(["move", "rename", "organise", "organize", "sort", "folder", "archive", "file it", "put it in"]) { chosen.formUnion(["create_directory", "move_path", "rename_path", "list_directory"]) }
         if mentions(["delete", "trash", "get rid"]) { chosen.insert("delete_path") }
         if mentions(["attach", "attached", "attachment", "pdf", "document", "image", "photo", "screenshot", "csv", "scan", "picture"]) || (hasAttachments && mentions(["file", "paper", "reading", "article"])) {

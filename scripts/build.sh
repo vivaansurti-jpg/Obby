@@ -55,6 +55,6 @@ cp Resources/AppIcon.icns build/Obby.app/Contents/Resources/AppIcon.icns
 SIGN_IDENTITY="${OBBY_SIGN_IDENTITY:--}"
 SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
 if [[ "$SIGN_IDENTITY" != "-" ]]; then
-  SIGN_ARGS+=(--options runtime --timestamp)
+  SIGN_ARGS+=(--options runtime --timestamp --entitlements Obby.entitlements) # Microphone for in-app speech input.
 fi
 codesign "${SIGN_ARGS[@]}" build/Obby.app

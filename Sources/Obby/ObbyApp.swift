@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import Speech
+import AVFoundation
 
 @main struct ObbyApp: App {
     @StateObject var model = AppModel()
@@ -87,18 +89,25 @@ struct ContentView: View {
                     sidebar.frame(minWidth: 180, idealWidth: 220, maxWidth: 400)
                     VStack(spacing: 0) {
                         if let note = model.note {
-                            HStack { NoteTitleField(path: note); Spacer() }.padding()
+                            HStack { NoteTitleField(path: note); Spacer() }.padding(.horizontal).padding(.vertical, 20)
                             HStack(spacing: 12) {
                                 Button { bridge.format(.bold) } label: { Image(systemName: "bold") }.help("Bold").keyboardShortcut("b")
                                 Button { bridge.format(.italic) } label: { Image(systemName: "italic") }.help("Italic").keyboardShortcut("i")
-                                Button { bridge.format(.underline) } label: { Image(systemName: "underline") }.help("Underline").keyboardShortcut("u")
-                                Menu("Text") { ForEach([Format.heading, .heading2, .heading3, .size], id: \.self) { style in Button(style.rawValue) { bridge.format(style) } } }.fixedSize()
-                                Button { bridge.format(.bullet) } label: { Image(systemName: "list.bullet") }.help("Bullets")
-                                Button { bridge.format(.numbered) } label: { Image(systemName: "list.number") }.help("Numbered list")
-                                Button { bridge.format(.checkbox) } label: { Image(systemName: "checklist") }.help("Checkboxes")
-                                Button { bridge.format(.checked) } label: { Image(systemName: "checkmark.square") }.help("Mark selected lines completed")
-                                Button { bridge.insertImage() } label: { Image(systemName: "photo") }.help("Insert image").accessibilityLabel("Insert image").disabled(model.note == nil)
-                                Button { bridge.attachDocument() } label: { Image(systemName: "paperclip") }.help("Attach document").accessibilityLabel("Attach document").disabled(model.note == nil)
+                                Menu("Text") {
+                                    Button("Underline") { bridge.format(.underline) }.keyboardShortcut("u")
+                                    Divider()
+                                    ForEach([Format.heading, .heading2, .heading3, .size], id: \.self) { style in Button(style.rawValue) { bridge.format(style) } }
+                                }.fixedSize()
+                                Menu("List") {
+                                    Button("Bullets") { bridge.format(.bullet) }
+                                    Button("Numbers") { bridge.format(.numbered) }
+                                    Button("Checklist") { bridge.format(.checkbox) }
+                                    Button("Mark done") { bridge.format(.checked) }
+                                }.fixedSize()
+                                Menu("Insert") {
+                                    Button("Image…") { bridge.insertImage() }
+                                    Button("Document…") { bridge.attachDocument() }
+                                }.fixedSize().disabled(model.note == nil)
                                 Spacer()
                             }.buttonStyle(.borderless).padding(.horizontal).padding(.bottom, 10)
                             Divider()
@@ -132,10 +141,9 @@ struct ContentView: View {
     }
     var sidebar: some View {
         VStack(spacing: 0) {
-            HStack { Text(model.folderTitle).font(.headline).lineLimit(1); Spacer(); Menu { Button("New Note") { model.create(directory: false) }; Button("New Folder") { model.create(directory: true) }; Divider(); Button("Choose Notes Folder…") { model.chooseFolder() }.disabled(model.busy) } label: { Image(systemName: "plus") }.menuStyle(.borderlessButton).fixedSize() }.padding()
+            HStack { Spacer(); Menu { Button("New Note") { model.create(directory: false) }; Button("New Folder") { model.create(directory: true) }; Divider(); Button("Choose Notes Folder…") { model.chooseFolder() }.disabled(model.busy) } label: { Image(systemName: "plus") }.menuStyle(.borderlessButton).fixedSize().help("New note or folder") }.padding()
             TextField("Search notes", text: $model.query).textFieldStyle(.roundedBorder).focused($searchFocused).padding(.horizontal).padding(.bottom, 8).onChange(of: model.query) { _ in model.search() }
             NativeFileSidebar(model: model)
-            HStack { Button("Root Folder") { model.selectFolder(nil) }; Spacer() }.buttonStyle(.borderless).font(.caption).padding(10)
         }
     }
 }
@@ -251,34 +259,90 @@ struct AIView: View {
     @EnvironmentObject var model: AppModel
     @State var prompt = ""
     @State var showMemory = false
+    @FocusState private var promptFocused: Bool
+    @StateObject private var speech = SpeechInput()
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack { Text("Obby AI").font(.headline); Text(model.providerBadge).font(.caption).foregroundStyle(.secondary).help(model.isLocalProvider ? "Requests stay on this Mac." : "Requests are sent to this cloud provider."); Spacer()
-                Toggle(isOn: $model.showRawActions) { Image(systemName: "chevron.left.forwardslash.chevron.right") }
-                    .toggleStyle(.button).help("Show raw actions").accessibilityLabel("Show raw actions")
+            HStack(spacing: 8) {
+                Text("Obby AI").font(.headline).fixedSize()
+                Spacer(minLength: 0)
+                Button { showMemory = true } label: {
+                    Image(systemName: "brain")
+                        .overlay(alignment: .topTrailing) {
+                            Text("\(model.memory.itemCount + model.globalMemory.preferences.count)").font(.system(size: 8, weight: .semibold))
+                                .padding(2).background(.regularMaterial, in: Capsule()).offset(x: 7, y: -7)
+                        }
+                }.buttonStyle(.plain).help("Memory").accessibilityLabel("Memory, \(model.memory.itemCount + model.globalMemory.preferences.count) items")
+                    .popover(isPresented: $showMemory, arrowEdge: .bottom) { MemoryPopover().environmentObject(model) }
                 if !model.savedChats.isEmpty {
                     Menu {
                         ForEach(model.savedChats) { record in
-                            Button("\(record.title.isEmpty ? "Untitled chat" : record.title) · \(record.updatedAt.formatted(date: .abbreviated, time: .shortened))") { model.openChat(record) }
+                            Button("\(record.title.isEmpty ? "Untitled chat" : record.title) (\(record.updatedAt.formatted(date: .abbreviated, time: .shortened)))") { model.openChat(record) }
                                 .disabled(record.id == model.memory.id)
                         }
                     } label: { Image(systemName: "clock") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().disabled(model.busy)
                     .help("Chat history").accessibilityLabel("Chat history")
                 }
-                Button { model.clearChat() } label: { Image(systemName: "square.and.pencil") }.help("New chat").accessibilityLabel("New chat") }
-            HStack { Circle().fill(model.connected ? .green : .secondary).frame(width: 6, height: 6); Text(model.modelStatus).font(.caption); Spacer(); Button { Task { await model.connect(launch: true) } } label: { Image(systemName: "arrow.clockwise") }.disabled(model.busy).help("Refresh").accessibilityLabel("Refresh") }
-            Picker("Model", selection: model.modelSelection) { Text("Select a model").tag(""); ForEach(model.modelChoices, id: \.self) { Text($0).tag($0) } }.disabled(model.busy || model.switchingModel)
+                Button { model.clearChat() } label: { Image(systemName: "square.and.pencil") }.buttonStyle(.plain).help("New chat").accessibilityLabel("New chat")
+                Menu {
+                    Toggle("Show technical action details", isOn: $model.showRawActions)
+                        .help("Shows the request and result for each action. This does not change your notes or what the AI can do.")
+                } label: { Image(systemName: "ellipsis") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("More").accessibilityLabel("More")
+            }
+            HStack(spacing: 6) {
+                Circle().fill(model.connected ? Color.green : Color.secondary).frame(width: 8, height: 8)
+                    .help(model.connected ? "Provider connected" : "Provider not connected")
+                Menu {
+                    ForEach(ProviderKind.allCases) { provider in
+                        Button {
+                            Task { await model.switchProvider(provider) }
+                        } label: {
+                            if provider == model.provider { Label(provider.label, systemImage: "checkmark") }
+                            else { Text(provider.label) }
+                        }.disabled(model.busy || model.switchingModel)
+                    }
+                    Divider()
+                    Button("Refresh connection and models") { Task { await model.connect(launch: true) } }
+                        .disabled(model.busy || model.switchingModel)
+                    Text(model.connected ? "Connected" : "Not connected")
+                    if model.busy { Text("Stop the current response to switch providers.") }
+                    if model.switchingModel { Text("Switching model. Please wait.") }
+                } label: { Text(model.provider.label).lineLimit(1) }
+                    .menuStyle(.borderlessButton).menuIndicator(.visible)
+                    .help("Choose AI provider")
+                Spacer(minLength: 0)
+                Text(model.connected ? "Connected" : "Not connected").font(.caption).foregroundStyle(.secondary)
+            }
+            Menu {
+                ForEach(model.modelChoices, id: \.self) { name in
+                    Button { model.modelSelection.wrappedValue = name } label: {
+                        if name == model.selectedModel { Label(name, systemImage: "checkmark") }
+                        else { Text(name) }
+                    }.disabled(model.busy || model.switchingModel)
+                }
+                if model.modelChoices.isEmpty { Text("No models found. Refresh the connection.") }
+                Divider()
+                Button("Refresh models") { Task { await model.connect(launch: true) } }
+                    .disabled(model.busy || model.switchingModel)
+                Text(model.modelStatus)
+                if model.busy { Text("Stop the current response to switch models.") }
+                if model.switchingModel { Text("Switching model. Please wait.") }
+            } label: {
+                Text(model.selectedModel.isEmpty ? "Choose a model" : model.selectedModel)
+                    .lineLimit(1).truncationMode(.middle).frame(maxWidth: .infinity, alignment: .leading)
+            }.menuStyle(.borderlessButton).menuIndicator(.visible).help("Choose AI model")
             if model.provider == .ollama, let issue = model.ollamaIssue { OllamaIssueView(issue: issue) }
             if !model.toolsAvailable && !model.selectedModel.isEmpty {
-                Text("Chat only · can work with the current note, but cannot use vault tools").font(.caption).foregroundStyle(.secondary)
+                Text("Chat only: can work with the current note, but cannot use vault tools").font(.caption).foregroundStyle(.secondary)
             }
-            if model.memory.itemCount + model.globalMemory.preferences.count > 0 {
-                Button { showMemory = true } label: {
-                    Text("Memory · \(model.memory.itemCount + model.globalMemory.preferences.count) items").font(.caption2).foregroundStyle(.secondary)
+            if model.showRawActions {
+                HStack(alignment: .top) {
+                    Text("Technical details are on. Expand an action below to see its request and result.").font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Button("Hide details") { model.showRawActions = false }.buttonStyle(.link).font(.caption)
                 }
-                .buttonStyle(.plain).help("See and edit what this task remembers")
-                .popover(isPresented: $showMemory, arrowEdge: .bottom) { MemoryPopover().environmentObject(model) }
             }
             if let usage = model.contextUsage {
                 Text("Context: \(ContextBudget.label(usage.used)) / \(ContextBudget.windowLabel(usage.window))").font(.caption2).foregroundStyle(.secondary)
@@ -299,7 +363,7 @@ struct AIView: View {
                             if group.isActions {
                                 ActionGroupView(lines: group.lines, showRaw: model.showRawActions, onUndo: { model.undoAIEdit($0) }).id(group.id)
                             } else if let line = group.lines.first {
-                                let displayed = line.role == "Obby" && !model.showRawActions ? ActionPresentation.reply(line.text) : line.text
+                                let displayed = line.role == "Obby" ? ActionPresentation.reply(line.text) : line.text
                                 if !displayed.isEmpty {
                                     VStack(alignment: .leading, spacing: 5) {
                                         Text(line.role).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
@@ -321,14 +385,40 @@ struct AIView: View {
             }
             if model.busy { HStack { ProgressView().controlSize(.small); Text(model.isLocalProvider ? "Working locally…" : "Working…").font(.caption); Spacer(); Button("Stop") { model.aiTask?.cancel() } } }
             Divider()
-            TextField("Ask Obby…", text: $prompt, axis: .vertical).lineLimit(2...6).textFieldStyle(.roundedBorder).onSubmit { submit() }
-            HStack { Text("Only your Obby folder").font(.caption2).foregroundStyle(.secondary); Spacer(); QuickActionsMenu(); Button("Send") { submit() }.keyboardShortcut(.return, modifiers: .command).disabled(model.busy || model.switchingModel || model.selectedModel.isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+            if speech.listening {
+                Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Ask Obby…", text: $prompt, axis: .vertical).lineLimit(2...6).textFieldStyle(.plain).focused($promptFocused).onSubmit { submit() }
+                // In-app speech input (on-device when available): live text, Obby's own indicator, no system chime.
+                // Falls back to macOS Dictation if speech or microphone access is declined or unavailable.
+                Button {
+                    promptFocused = true
+                    speech.toggle(current: prompt, update: { prompt = $0 }, fallback: {
+                        DispatchQueue.main.async { NSApp.sendAction(Selector(("startDictation:")), to: nil, from: nil) }
+                    })
+                } label: {
+                    Image(systemName: speech.listening ? "mic.fill" : "mic")
+                        .foregroundStyle(speech.listening ? Color.red : Color.secondary)
+                        .scaleEffect(speech.listening ? 1 + CGFloat(speech.level) * 0.4 : 1)
+                        .animation(.easeOut(duration: 0.1), value: speech.level)
+                }
+                .buttonStyle(.borderless).help(speech.listening ? "Stop dictation" : "Dictate")
+                .accessibilityLabel(speech.listening ? "Stop dictation" : "Dictate").disabled(model.busy && !speech.listening)
+                QuickActionsMenu()
+                Button { submit() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
+                    .buttonStyle(.plain).help("Send").accessibilityLabel("Send")
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(model.busy || model.switchingModel || model.selectedModel.isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }.padding(10).background(.background, in: RoundedRectangle(cornerRadius: 8))
+                .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.separator) }
         }.padding(14)
         .onAppear { prompt = model.aiDraft } // An unsent draft survives hiding the panel.
-        .onDisappear { model.aiDraft = prompt }
+        .onDisappear { model.aiDraft = prompt; speech.stop() }
     }
     func submit() {
         guard !model.busy, !model.switchingModel, !model.selectedModel.isEmpty else { return }
+        speech.stop()
         if let quick = QuickAction.parse(prompt) { model.runQuickAction(quick.action, save: quick.save); prompt = ""; return } // "/flashcards", "/quiz save"…
         model.send(prompt); prompt = ""
     }
@@ -344,6 +434,17 @@ struct SettingsView: View {
         Binding(get: { model.provider }, set: { next in Task { await model.switchProvider(next); syncDrafts() } })
     }
     var body: some View {
+        TabView {
+            generalTab.tabItem { Label("Notes", systemImage: "folder") }
+            aiTab.tabItem { Label("AI", systemImage: "sparkles") }
+            memoryTab.tabItem { Label("Memory", systemImage: "brain") }
+            advancedTab.tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
+        }.frame(width: 560, height: 580)
+            .sheet(isPresented: $showMemory) { MemorySettingsSheet().environmentObject(model) }
+            .task { syncDrafts(); await model.connect() }
+            .onChange(of: model.selectedModel) { value in manualModel = value }
+    }
+    var generalTab: some View {
         Form {
             Section("Storage") {
                 // Obby does not own your content: notes and attachments are ordinary files in this folder.
@@ -355,45 +456,84 @@ struct SettingsView: View {
                     Button("Show in Finder") { if let root = model.vault?.root { NSWorkspace.shared.activateFileViewerSelecting([root]) } }.disabled(model.vault == nil)
                     Button("Change Folder…") { model.chooseFolder() }.disabled(model.busy)
                 }
-                Text("Notes, images and documents are normal files in this folder, so they stay usable from Finder and can be backed up with Time Machine, iCloud Drive, Dropbox or Git. Changing the folder never moves or deletes anything.")
+                Text("Your notes and attachments stay as ordinary files in this folder.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+        }.formStyle(.grouped)
+    }
+    var aiTab: some View {
+        Form {
             Section("AI Provider") {
                 Picker("AI provider", selection: providerSelection) {
                     ForEach(ProviderKind.allCases) { Text($0.label).tag($0) }
                 }.disabled(model.busy || model.switchingModel)
-                Text(model.providerBadge).font(.caption.weight(.semibold))
-                Text(model.isLocalProvider ? "Your AI requests stay on this Mac." : "Relevant note or attachment content may be sent to this provider when you ask Obby to work with it.")
+                Text(model.isLocalProvider ? "\(model.provider.label) runs on this Mac." : "Relevant notes may be sent to \(model.provider.label).")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Model") {
+                if model.provider == .ollama {
+                    Picker("Selected model", selection: model.modelSelection) {
+                        Text("Select a model").tag("")
+                        ForEach(model.modelChoices, id: \.self) { Text($0).tag($0) }
+                    }.disabled(model.busy || model.switchingModel)
+                } else {
+                    HStack {
+                        TextField("Model", text: $manualModel, prompt: Text("Type or choose a model")).onSubmit { applyModel() }
+                        if !model.models.isEmpty {
+                            Menu("Choose") { ForEach(model.models, id: \.self) { name in Button(name) { manualModel = name; applyModel() } } }.fixedSize()
+                        }
+                        Button("Apply") { applyModel() }.disabled(model.busy || model.switchingModel)
+                    }
+                }
+                if model.provider == .openAI {
+                    Toggle("Model supports tool calling", isOn: $model.openAITools)
+                        .onChange(of: model.openAITools) { _ in model.persistSettings(); Task { await model.refreshToolSupport() } }
+                }
+                Text(model.modelStatus + (model.toolsAvailable || model.selectedModel.isEmpty ? "" : " (chat only)")).font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Context") {
                 Toggle("Include related notes automatically", isOn: model.isLocalProvider ? $model.relatedNotesLocal : $model.relatedNotesCloud)
                     .onChange(of: model.relatedNotesLocal) { _ in model.persistSettings() }
                     .onChange(of: model.relatedNotesCloud) { _ in model.persistSettings() }
-                Text(model.isLocalProvider ? "Adds short excerpts from your most relevant notes to each request (on by default for local models)." : "Adds short excerpts from your most relevant notes to each request. Off by default for cloud providers, because those excerpts are sent to them.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .help("Adds short excerpts from relevant notes. Off by default for cloud providers.")
                 Picker("Context window", selection: $model.contextWindow) {
                     ForEach(ContextWindow.allCases) { Text($0.label).tag($0) }
                 }.onChange(of: model.contextWindow) { _ in model.persistSettings() }
-                Text(contextNote).font(.caption).foregroundStyle(.secondary)
+                    .help(contextNote)
             }
-            if model.provider == .ollama { ollamaSection } else { cloudSection }
-            Section("Memory") {
-                Button("Obby knows \(model.globalMemory.aboutMe.count + model.globalMemory.preferences.count) things about you · View") { showMemory = true }
-                    .buttonStyle(.link)
+        }.formStyle(.grouped)
+    }
+    var memoryTab: some View {
+        Form {
+            Section("View and edit") {
+                LabeledContent("Saved facts and preferences", value: "\(model.globalMemory.aboutMe.count + model.globalMemory.preferences.count)")
+                Button("View and edit memory…") { showMemory = true }.buttonStyle(.link)
+            }
+            Section("Remembering") {
                 Toggle("Learn about me from chats", isOn: $model.learnAboutMe)
                     .onChange(of: model.learnAboutMe) { _ in model.persistSettings() }
                 Toggle("Remember AI tasks between launches", isOn: $model.rememberChats)
                     .onChange(of: model.rememberChats) { on in model.persistSettings(); if on { model.persistChat() }; model.reloadSavedChats() }
-                HStack {
-                    Button("Clear current task memory") { model.clearCurrentChatMemory() }.disabled(model.busy)
-                    Button("Clear all AI memory") { model.clearAllChatMemory() }.disabled(model.busy)
-                }
-                Text("Task memory is a short summary kept on this Mac, separate from your notes. Clearing it never deletes notes or attachments.")
+            }
+            Section { MemoryDangerZone(includeAll: true) }
+        }.formStyle(.grouped)
+    }
+    var advancedTab: some View {
+        Form {
+            if model.provider == .ollama { ollamaSection } else { cloudSection }
+            Section("Action details") {
+                Toggle("Show technical action details", isOn: $model.showRawActions)
+                Text("Shows each action's request and result in the chat. This only changes the display.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }.formStyle(.grouped).frame(width: 520, height: 600)
-            .sheet(isPresented: $showMemory) { MemorySettingsSheet().environmentObject(model) }
-            .task { syncDrafts(); await model.connect() }
-            .onChange(of: model.selectedModel) { value in manualModel = value }
+            if model.provider != .ollama, model.hasAPIKey {
+                Section {
+                    DangerZone {
+                        ConfirmRemovalButton(title: "Remove API key", warning: "Removes the saved key for \(model.provider.label). You will need to add it again to use this provider.") { model.removeAPIKey() }
+                    }
+                }
+            }
+        }.formStyle(.grouped)
     }
     var cloudSection: some View {
         Section(model.provider.label) {
@@ -407,23 +547,9 @@ struct SettingsView: View {
                 SecureField("API key", text: $apiKey, prompt: Text(model.hasAPIKey ? "Saved in Keychain" : (model.provider == .openAI ? "Optional for local servers" : "Required")))
                     .onSubmit { saveKey() }
                 Button("Save") { saveKey() }.disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if model.hasAPIKey { Button("Remove") { model.removeAPIKey() } }
             }
-            HStack {
-                TextField("Model", text: $manualModel, prompt: Text("Type or choose a model")).onSubmit { applyModel() }
-                if !model.models.isEmpty {
-                    Menu("Choose") { ForEach(model.models, id: \.self) { name in Button(name) { manualModel = name; applyModel() } } }.fixedSize()
-                }
-                Button("Apply") { applyModel() }.disabled(model.busy || model.switchingModel)
-            }
-            if model.provider == .openAI {
-                Toggle("Model supports tool calling", isOn: $model.openAITools)
-                    .onChange(of: model.openAITools) { _ in model.persistSettings(); Task { await model.refreshToolSupport() } }
-            }
-            Text(model.modelStatus + (model.toolsAvailable || model.selectedModel.isEmpty ? "" : " · Chat only")).font(.caption).foregroundStyle(.secondary)
-            if let error = model.modelSettingsError { Text(error).font(.caption).foregroundStyle(.red) }
-            Text("Privacy: \(model.isLocalProvider ? "this server runs on your Mac" : "your messages go to \(model.provider.label)"). Obby sends only your message, recent chat, the open note when the model works with it, and any notes or search results its tools read for that request, never your whole vault. API keys are stored in your macOS Keychain.")
-                .font(.caption).foregroundStyle(.secondary)
+            if let error = model.modelSettingsError { Text(error).foregroundStyle(.red) }
+            Text("API keys are stored in your macOS Keychain.").font(.caption).foregroundStyle(.secondary)
         }
     }
     var contextNote: String {
@@ -449,28 +575,24 @@ struct SettingsView: View {
         } catch { model.modelSettingsError = error.localizedDescription }
     }
     var ollamaSection: some View {
-        Section("Ollama / Model") {
-            Picker("Selected model", selection: model.modelSelection) {
-                Text("Select a model").tag("")
-                ForEach(model.models, id: \.self) { Text($0).tag($0) }
-            }.disabled(model.busy || model.switchingModel)
+        Section("Ollama") {
             Toggle("Unload previous model when switching", isOn: $model.unloadPrevious)
                 .onChange(of: model.unloadPrevious) { _ in model.persistSettings() }
             Toggle("Unload model when Obby closes", isOn: $model.unloadOnQuit)
                 .onChange(of: model.unloadOnQuit) { _ in model.persistSettings() }
+            Toggle("Stream replies", isOn: $model.streamReplies)
+                .onChange(of: model.streamReplies) { _ in model.persistSettings() }
             Toggle("Start Ollama automatically when needed", isOn: $model.autoStartOllama)
                 .onChange(of: model.autoStartOllama) { _ in model.persistSettings() }
             if let issue = model.ollamaIssue { OllamaIssueView(issue: issue) }
             Picker("Model keep-alive", selection: $model.keepAlive) {
                 ForEach(ModelKeepAlive.allCases, id: \.self) { Text($0.label).tag($0) }
             }.onChange(of: model.keepAlive) { _ in model.persistSettings() }
-            Text(model.modelStatus).font(.caption).foregroundStyle(.secondary)
             HStack {
                 TextField("Ollama URL", text: $url).onSubmit { reconnect() }
                 Button("Apply") { reconnect() }.disabled(model.busy || model.switchingModel)
             }.disabled(model.busy || model.switchingModel)
-            if let error = model.modelSettingsError { Text(error).font(.caption).foregroundStyle(.red) }
-            if !model.toolsAvailable && !model.selectedModel.isEmpty { Text("Chat only · can work with the current note, but cannot use vault tools.").font(.caption).foregroundStyle(.secondary) }
+            if let error = model.modelSettingsError { Text(error).foregroundStyle(.red) }
         }
     }
     func reconnect() {
@@ -521,5 +643,76 @@ struct WindowCloseGuard: NSViewRepresentable {
         }
         override func responds(to selector: Selector!) -> Bool { super.responds(to: selector) || (original?.responds(to: selector) ?? false) }
         override func forwardingTarget(for selector: Selector!) -> Any? { original }
+    }
+}
+
+/// Speech-to-text for the AI prompt with Apple's Speech framework: starts instantly, shows words as you speak, and uses
+/// on-device recognition when the language supports it (audio then never leaves the Mac). Obby keeps no audio.
+/// Stops on a second click, on Send, or after about 2.5 seconds of silence. Nothing runs while it isn't listening.
+@MainActor final class SpeechInput: ObservableObject {
+    @Published var listening = false
+    @Published var level: Float = 0 // 0…1 input level, for the pulsing microphone.
+    private let engine = AVAudioEngine()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private var silence: Task<Void, Never>?
+
+    func toggle(current: String, update: @escaping (String) -> Void, fallback: @escaping () -> Void) {
+        if listening { stop(); return }
+        Task { @MainActor in
+            let speechAllowed = await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+                SFSpeechRecognizer.requestAuthorization { done.resume(returning: $0 == .authorized) }
+            }
+            let micAllowed = speechAllowed ? await AVCaptureDevice.requestAccess(for: .audio) : false
+            guard speechAllowed, micAllowed, let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else { fallback(); return }
+            start(recognizer, current: current, update: update, fallback: fallback)
+        }
+    }
+    private func start(_ recognizer: SFSpeechRecognizer, current: String, update: @escaping (String) -> Void, fallback: () -> Void) {
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+        let input = engine.inputNode
+        var buffers = 0
+        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buffer, _ in
+            request.append(buffer)
+            buffers += 1
+            guard buffers % 3 == 0, let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
+            var sum: Float = 0
+            for index in 0..<Int(buffer.frameLength) { sum += samples[index] * samples[index] }
+            let level = min(1, sqrt(sum / Float(buffer.frameLength)) * 20)
+            Task { @MainActor [weak self] in self?.level = level }
+        }
+        engine.prepare()
+        do { try engine.start() } catch { input.removeTap(onBus: 0); fallback(); return }
+        let prefix = current.isEmpty || current.hasSuffix(" ") || current.hasSuffix("\n") ? current : current + " "
+        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            let text = result?.bestTranscription.formattedString, finished = error != nil || result?.isFinal == true
+            Task { @MainActor [weak self] in
+                guard let self, self.listening else { return }
+                if let text { update(prefix + text); self.armSilenceStop() }
+                if finished { self.stop() }
+            }
+        }
+        self.request = request
+        listening = true
+        armSilenceStop()
+    }
+    private func armSilenceStop() {
+        silence?.cancel()
+        silence = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled else { return }
+            self?.stop()
+        }
+    }
+    func stop() {
+        silence?.cancel(); silence = nil
+        guard listening else { return }
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        request?.endAudio(); task?.finish()
+        request = nil; task = nil
+        listening = false; level = 0
     }
 }

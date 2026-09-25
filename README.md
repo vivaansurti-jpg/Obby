@@ -120,11 +120,15 @@ Any file can be attached and opened. The AI can read PDF (selectable text via PD
 5. Run `OBBY_NOTARY_PROFILE="your-notary-profile" ./scripts/notarize.sh`. This submits the DMG to Apple, waits for approval, staples the ticket, and verifies the finished artifact.
 6. On GitHub, open **Releases → Draft a new release**, create a tag such as `v1.0`, attach the notarized `build/Obby.dmg` (keep the name `Obby.dmg` so the download button always points to the latest release), and publish.
 
-## Chat memory
+## AI memory
 
-Each AI chat has its own compact memory, kept by Obby rather than by the model: a short summary, the current goal, decisions, relevant files (by path only), completed actions, open questions, and the most recent messages. Switching model or provider keeps the chat and sends the new model the same memory, so it can continue. With **Settings → Memory → Remember AI conversations between launches** (on by default), chats are saved as small JSON files in `~/Library/Application Support/Obby/Chats/` and the most recent chat for the notes folder comes back when Obby opens; the clock button in the AI panel lists earlier chats. **New chat** starts with empty memory.
+Memory belongs to Obby, not to the model, so switching model or provider continues the same task. Each chat (task) has its own compact memory: the current goal, a short summary, relevant files (by path only), decisions, completed actions, open next steps, preferences for that task, and the most recent messages. A small global memory holds only preferences you state as lasting ("from now on…", "always…", "I prefer…"); other details never move into it.
 
-Memory never copies note contents: notes are read from disk again when needed, so the filesystem stays the source of truth. When a chat's kept messages approach the context budget, Obby asks the current model once to fold the older messages into the summary (or uses a plain summary if that fails) and keeps the last few messages verbatim. Each request includes only that chat's memory, within the Context Window budget; the store itself is never uploaded, and it contains no API keys. **Clear current chat memory** and **Clear all AI memory** delete only these memory files, never notes or attachments.
+Everything is stored as small JSON files in `~/Library/Application Support/Obby/` (`Chats/` for tasks, `Memory.json` for global preferences). Memory never contains API keys, note contents, PDFs or raw tool output: files are remembered by path and read from disk again when needed, so the notes stay the source of truth.
+
+Obby updates a task's memory after meaningful work (files created, changed or moved, a document read or summarised), when you state a lasting preference, and when the kept messages approach the context budget, in which case older messages are folded into the summary and only the last few stay verbatim. That update is one request to the current model; compaction falls back to a plain summary if it fails. Each AI request includes the global preferences and the current task's memory, within the Context Window budget; the store itself is never uploaded.
+
+**Settings → Memory**: **Remember AI tasks between launches** (on by default) restores the latest task for the notes folder when Obby opens; the clock button in the AI panel lists earlier tasks. **Clear current task memory** and **Clear all AI memory** (which also clears global preferences) delete only memory files, never notes or attachments. Global preferences are listed there and can be removed one by one. **New chat** starts with fresh task memory; global preferences still apply. The AI panel shows a small "Memory · N items" line (hover to see what is included).
 
 ## Hiding the AI panel
 
@@ -133,3 +137,19 @@ The sidebar button at the top right of the window (or **View → Hide AI / Show 
 ## License
 
 Obby is available under the [Apache License 2.0](LICENSE).
+
+## Your files
+
+Obby does not own your content; it is an interface over a normal folder you choose. Every note, folder, image, PDF and attachment lives in that folder as an ordinary file, so it stays fully usable from Finder if Obby is deleted, and it can be backed up with Time Machine, iCloud Drive, Dropbox, an external drive or Git. There is no proprietary backup system and no hidden copy of any note, photo, PDF or attachment. `~/Library/Application Support/Obby/` holds only compact AI memory (paths and short summaries, never file contents); app settings live in macOS preferences and API keys in the Keychain.
+
+- **Settings → Storage** shows the current notes location with **Show in Finder** and **Change Folder…**. Changing the folder only switches which folder Obby opens; nothing is moved or deleted.
+- **Saves** write a temporary file beside the note, check it, then atomically replace the note. A failed save leaves the previous version intact; leftover temporary files from an interrupted save are removed the next time the folder opens.
+- **Imports** copy the original (which is never changed or removed) to a temporary file in `Attachments/`, check that it arrived complete, then move it to a free, collision-safe name. The Markdown link is inserted only after that succeeds; existing attachments are never overwritten.
+- **Deleting** a note or folder moves it to the macOS Trash. The AI can only request a deletion, which always asks for your confirmation, and it has no permanent-delete tool. All AI file access goes through Obby's own sandboxed file layer inside the notes folder.
+- **Settings → AI Provider** shows whether requests are **Local · Ollama** ("Your AI requests stay on this Mac.") or **Cloud · provider** ("Relevant note or attachment content may be sent to this provider when you ask Obby to work with it.").
+
+## How AI actions are handled
+
+If the model wants to do something, Obby does it; if it wants to say something, Obby renders it. Native tool calls are executed through Obby's sandboxed file layer. Some smaller local models write a tool call as text instead (for example `write_file{"path":"TOK.md","content":"…"}` or `{"tool":"write_file",…}`); Obby recognises this only when the reply is (or ends in) a call to a known Obby tool with all required arguments, and runs it through the same checks. Ordinary JSON, code, prose and unknown tool names are never executed. A call Obby can't read is reported as "Couldn't run the requested action" and the model is asked once or twice to retry; it is never shown as text.
+
+With **Show raw actions** off, the chat shows only compact summaries (✓ Updated TOK.md, ✓ Created the Test folder) and failures such as "Couldn't update TOK.md." with a short reason; raw calls, IDs, JSON and payloads appear only when it is on. Tool payloads never reach the Markdown renderer. `append_to_file` adds to the end of a note while keeping its existing content, so "add this to TOK.md" doesn't require rewriting the note. Before any tool runs, pending editor changes are saved; after an AI edit to the open note, the editor reloads the new text straight away, so autosave can't overwrite the AI's change.

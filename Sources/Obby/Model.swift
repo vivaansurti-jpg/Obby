@@ -54,6 +54,7 @@ import AppKit
     @Published var memory = ChatRecord()
     @Published var savedChats: [ChatRecord] = [] // This notes folder's remembered chats, newest first (for the history menu).
     @Published var rememberChats = UserDefaults.standard.object(forKey: "rememberChats") as? Bool ?? true
+    @Published var globalMemory = GlobalMemory.load() // Durable, explicitly stated preferences shared by every task.
     /// The AI panel's visibility (View → Show/Hide AI, Cmd+Shift+A). Hiding only removes the panel from view: the chat,
     /// its memory, the provider/model and any running request are untouched.
     @Published var showAI = UserDefaults.standard.object(forKey: "showAI") as? Bool ?? true {
@@ -143,6 +144,7 @@ import AppKit
         note = nil; selection = nil; loading = true; text = ""; loading = false; dirty = false
         clearChat()
         restoreLatestChat() // Continue this folder's most recent chat (when remembering is on).
+        Task.detached(priority: .background) { chosen.removeStaleTemporaryFiles() } // Leftovers from an interrupted save or import, if any.
         if UserDefaults.standard.string(forKey: "rootPath") != chosen.root.path { UserDefaults.standard.removeObject(forKey: "lastNote") } // A different notes folder.
         UserDefaults.standard.set(chosen.root.path, forKey: "rootPath")
         UserDefaults.standard.set(true, forKey: "rootIsNotesFolder")

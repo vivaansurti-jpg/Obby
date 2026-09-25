@@ -61,7 +61,8 @@ extension AppModel {
             ("list_directory", "List only direct children of the specific folder needed; never recursive. Paths are relative to Obby. Use known paths directly. Optional offset pages through results.", ["path"]),
             ("read_file", "Read a specific relevant Markdown note. Use search_notes to locate unknown paths first; do not read unrelated notes.", ["path"]),
             ("read_attachment", "Read the text of a PDF, TXT, MD, CSV or image file attached to the current note (text in images and scanned pages is recognised by Obby). Pass the path exactly as listed by Obby or as written in the note's link (e.g. Attachments/Paper.pdf); Obby resolves it. Other file types cannot be read.", ["path"]),
-            ("write_file", "Replace an existing Markdown note with its complete updated content. Read it first.", ["path", "content"]),
+            ("write_file", "Replace an existing Markdown note with its complete updated content. Read it first. To add text to a note, use append_to_file instead.", ["path", "content"]),
+            ("append_to_file", "Add Markdown to the end of an existing note, keeping everything already in it.", ["path", "content"]),
             ("create_file", "Create a new Markdown note. Parent folder must exist. \"/\" separates folders; if the note's title itself contains a slash, write it as \"／\" (U+FF0F) in the file name, e.g. Biology ／ Enzymes.md.", ["path", "content"]),
             ("create_directory", "Create a folder and missing parent folders.", ["path"]),
             ("rename_path", "Rename a note or folder to a relative destination path. Write a slash inside a note title as \"／\" (U+FF0F); \"/\" separates folders.", ["oldPath", "newPath"]),
@@ -98,6 +99,10 @@ extension AppModel {
             return try NavigationContext.page(vault.searchPage(arg("query"), folder: arguments["path"] as? String ?? "", offset: offset, limit: 51), offset: offset)
         case "write_file", "create_file":
             let path = try arg("path"); try vault.write(path, content: arg("content"), create: name == "create_file"); feedback = "\(name == "create_file" ? "Created" : "Updated") \(path)"
+        case "append_to_file":
+            let path = try arg("path"), addition = try arg("content"), existing = try vault.read(path)
+            let separator = existing.isEmpty || existing.hasSuffix("\n\n") ? "" : existing.hasSuffix("\n") ? "\n" : "\n\n"
+            try vault.write(path, content: existing + separator + addition + (addition.hasSuffix("\n") ? "" : "\n")); feedback = "Added to \(path)"
         case "create_directory": let path = try arg("path"); try vault.mkdir(path); feedback = "Created folder \(path)"
         case "move_path", "rename_path": let old = try arg("oldPath"), new = try arg("newPath"); try vault.move(old, new); didMove(old, new); feedback = "Moved \(old) to \(new)"
         case "delete_path":
@@ -129,6 +134,7 @@ extension AppModel {
                     }
                     if !wasConnected { await connect() }
                 }
+                let actionsBefore = memory.completedActions.count // To tell afterwards whether this request did real work.
                 let provider = try makeProvider()
                 if provider.kind == .ollama { usedOllamaModels.insert(selectedModel) } // Remembered for the unload on quit.
                 await refreshToolSupport()
@@ -177,6 +183,7 @@ extension AppModel {
                 }
                 messages.append(["role": "user", "content": userMessage])
                 let current = previousHistory.count
+                var invalidCalls = 0
                 for _ in 0..<20 {
                     try Task.checkCancellation()
                     NavigationContext.compact(&messages)
@@ -184,7 +191,7 @@ extension AppModel {
                     var trimmed = messages
                     // This chat's compact memory (never more than about a quarter of the budget), then any history that
                     // did not fit this request, condensed. The same packet goes to whichever model or provider is selected.
-                    let packet = String(memory.packet.prefix(max(budget, 800)))
+                    let packet = String([globalMemory.packet, memory.packet].filter { !$0.isEmpty }.joined(separator: "\n\n").prefix(max(budget, 800)))
                     let fit = ContextBudget.fit(&trimmed, current: current, fixed: fixed + ContextBudget.tokens(packet), budget: budget)
                     let condensed = ContextBudget.compactSummary(fit.summary)
                     let memoryText = [packet, condensed.isEmpty ? "" : "Earlier in this chat (condensed):\n" + condensed].filter { !$0.isEmpty }.joined(separator: "\n\n")
@@ -192,9 +199,25 @@ extension AppModel {
                     contextUsage = (fit.used, window)
                     let reply = try await provider.chat(ChatRequest(model: selectedModel, system: system, messages: trimmed, tools: tools, temperature: temperature, contextWindow: window, keepAlive: keepAlive.apiValue))
                     try Task.checkCancellation()
-                    messages.append(reply.message)
-                    if !reply.text.isEmpty { appendChat(role: "Obby", text: reply.text) }
-                    guard !reply.toolCalls.isEmpty else {
+                    // A tool call is executed, never displayed: native calls, or (for models without reliable native
+                    // calling) a reply that is a call to a known Obby tool written as text. Only prose is rendered.
+                    var toolCalls = reply.toolCalls, textCalls = false, prose = reply.text
+                    if toolCalls.isEmpty {
+                        switch TextToolCall.parse(reply.text) {
+                        case .calls(let calls, let before): toolCalls = calls; textCalls = true; prose = before
+                        case .invalid(let reason):
+                            appendNotice("Couldn’t run the requested action: \(reason).", failed: true)
+                            messages.append(["role": "assistant", "content": reply.text])
+                            invalidCalls += 1
+                            guard invalidCalls <= 2 else { throw ObbyError("The model kept sending actions Obby couldn’t read. Try again, or choose a model with tool support.") }
+                            messages.append(["role": "user", "content": "Obby could not run that tool call: \(reason). Call the tool again with valid JSON arguments, or answer in plain text."])
+                            continue
+                        case .notACall: break
+                        }
+                    }
+                    messages.append(textCalls ? ["role": "assistant", "content": reply.text] : reply.message)
+                    if !prose.isEmpty { appendChat(role: "Obby", text: prose) }
+                    guard !toolCalls.isEmpty else {
                         let kept = ChatMemory.retainingExchange(previousHistory, prompt: prompt, reply: reply.text)
                         let dropped = (previousHistory + [["role": "user", "content": prompt], ["role": "assistant", "content": reply.text]]).dropLast(kept.count)
                         if !dropped.isEmpty { // Pairs beyond the kept history live on only as summary lines.
@@ -202,11 +225,12 @@ extension AppModel {
                             historySummary = ContextBudget.compactSummary((historySummary.isEmpty ? [] : [historySummary]) + lines)
                         }
                         history = kept; connected = true
-                        if session == chatSession { await compactMemoryIfNeeded(provider: provider, window: window, budget: budget) }
+                        let didWork = memory.completedActions.count != actionsBefore || !requested.isEmpty || prompt.lowercased().contains("summar")
+                        if session == chatSession { await updateMemory(provider: provider, window: window, budget: budget, prompt: prompt, didWork: didWork) }
                         if session == chatSession { persistChat() }
                         return
                     }
-                    for call in reply.toolCalls {
+                    for call in toolCalls {
                         try Task.checkCancellation()
                         let result: String
                         var failed = false
@@ -226,7 +250,8 @@ extension AppModel {
                         }
                         let toolResponse: [String: Any] = ["role": "tool", "tool_name": call.name, "tool_call_id": call.id, "content": content]
                         appendAction(call: call.raw, name: call.name, arguments: call.arguments, response: toolResponse, failed: failed)
-                        messages.append(toolResponse)
+                        // Text calls have no provider tool-call id, so their results go back as a plain message.
+                        messages.append(textCalls ? ["role": "user", "content": "[Obby ran \(call.name)]\n\(content)"] : toolResponse)
                     }
                 }
                 throw ObbyError("Stopped after 20 tool rounds. You can ask Obby to continue.")

@@ -8,8 +8,8 @@ import AppKit
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let vault = Vault(root)
-        ChatStore.directoryOverride = root.deletingLastPathComponent().appendingPathComponent("obby-chats-" + UUID().uuidString) // Never the real memory store.
-        defer { try? FileManager.default.removeItem(at: ChatStore.directory) }
+        ChatStore.rootOverride = root.deletingLastPathComponent().appendingPathComponent("obby-memory-" + UUID().uuidString) // Never the real memory store.
+        defer { try? FileManager.default.removeItem(at: ChatStore.root) }
         var count = 0
         func check(_ condition: Bool, _ name: String) { precondition(condition, name); count += 1; print("PASS \(name)") }
         func blocked(_ name: String, _ action: () throws -> Void) { do { try action(); fatalError("Not blocked: \(name)") } catch { count += 1; print("PASS \(name)") } }
@@ -287,7 +287,7 @@ import AppKit
         let toolResult = ((secondBody?["messages"] as? [[String: Any]])?.last?["content"] as? [[String: Any]])?.first
         check(remote.count == 2 && remote[0].1["x-api-key"] == "test-anthropic-key" && !remote[0].0.absoluteString.contains("test-anthropic-key"), "Anthropic key sent only in header")
         check((toolResult?["content"] as? String)?.contains("Nested/A/B/C/D/Target.md") == true && model.chat.last?.text == "Found it.", "cloud model uses Obby's sandboxed tools")
-        check((remote[0].2?["tools"] as? [[String: Any]])?.count == 10 && !(String(describing: remote[0].2 ?? [:])).contains("uniquenavneedle"), "tools offered; no vault contents sent up front")
+        check((remote[0].2?["tools"] as? [[String: Any]])?.count == 11 && !(String(describing: remote[0].2 ?? [:])).contains("uniquenavneedle"), "tools offered; no vault contents sent up front")
         remote = []; round = 1
         RemoteHTTP.override = { url, headers, body in remote.append((url, headers, body)); return ["candidates": [["content": ["role": "model", "parts": [["text": "Hi"]]]]]] }
         model.provider = .gemini; model.apiKeys[.gemini] = "test-gemini-key"; model.selectedModel = "gemini-test"
@@ -371,6 +371,33 @@ import AppKit
         check(firstImage.hasPrefix("Attachments/") && secondImage.hasSuffix("-2.png") && !firstImage.contains(" ") && FileManager.default.fileExists(atPath: root.appendingPathComponent("School/" + firstImage).path), "image copied into Attachments with safe, unique names")
         check(try vault.importImage(.data(pixel, "png"), noteFolder: "") == "Attachments/pasted-image.png", "pasted image data saved at the root's Attachments")
         blocked("non-image rejected") { _ = try vault.importImage(.data(Data("not an image".utf8), "png"), noteFolder: "") }
+        // Tool calls written as text: executed through the sandboxed tools, never shown as prose.
+        func textCall(_ text: String) -> [ToolCall]? { if case .calls(let calls, _) = TextToolCall.parse(text) { return calls }; return nil }
+        check(textCall(#"write_file{"path":"TOK.md","content":"# Hi"}"#)?.first?.name == "write_file", "name{json} text call parsed")
+        check(textCall(#"{"tool":"append_to_file","path":"TOK.md","content":"x"}"#)?.first?.arguments["path"] as? String == "TOK.md", "flat JSON text call parsed")
+        check(textCall("Sure.\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"TOK.md\"}}\n```")?.first?.name == "read_file", "prose then fenced call parsed")
+        check(textCall(#"{"name":"Bob","age":3}"#) == nil && textCall(#"rm_rf{"path":"x"}"#) == nil && textCall("Use write_file to save notes.") == nil, "ordinary JSON, unknown names and prose are not calls")
+        if case .invalid = TextToolCall.parse(#"write_file{"path":"TOK.md"}"#) { check(true, "call missing arguments is refused") } else { check(false, "call missing arguments is refused") }
+        check(ActionPresentation.reply(#"write_file{"path":"a.md","content":"# A
+long"}"#).isEmpty && ActionPresentation.reply("# Title\n\n- item") == "# Title\n\n- item", "raw tool syntax hidden, Markdown kept")
+        var textRound = 0
+        model.clearChat(); model.toolSupport = [:]
+        model.requestOverride = { route, _ in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            guard route == "/api/chat" else { return [:] }
+            textRound += 1
+            return ["message": ["role": "assistant", "content": textRound == 1 ? #"write_file{"path":"Current.md","content":"# TOK
+Added line"}"# : "Added it to Current.md."]]
+        }
+        model.openNote("Current.md")
+        model.send("Add this to Current.md")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(try vault.read("Current.md") == "# TOK\nAdded line" && model.text == "# TOK\nAdded line" && !model.dirty, "text tool call edits the note and the open editor refreshes")
+        check(model.chat.contains { $0.text == "Updated Current.md." } && !model.chat.contains { $0.role == "Obby" && $0.text.contains("write_file") }, "compact summary shown, no raw tool syntax")
+        _ = try model.executeTool("append_to_file", arguments: ["path": "Current.md", "content": "More"])
+        check(try vault.read("Current.md") == "# TOK\nAdded line\n\nMore\n", "append keeps existing content")
+        model.clearChat()
+
         // Chat memory: saved per chat, restored, kept across model switches, cleared without touching notes.
         model.clearChat()
         model.history = [["role": "user", "content": "Plan Biology revision"], ["role": "assistant", "content": "Start with enzymes."]]
@@ -384,8 +411,12 @@ import AppKit
         check(model.history.count == 2 && model.memory.packet.contains("School/Revision.md"), "saved chat restored")
         await model.selectModel("switched-model")
         check(model.history.count == 2 && model.memory.id == savedID, "switching model keeps the chat and its memory")
+        check(GlobalMemory.statesLastingPreference("From now on use bullet points") && !GlobalMemory.statesLastingPreference("Summarise this note"), "only lasting preferences reach global memory")
+        model.globalMemory.preferences = ["Concise bullet points"]; model.globalMemory.save()
         model.clearAllChatMemory()
-        check(ChatStore.files().isEmpty && (try? vault.read("School/Revision.md")) != nil, "clearing memory keeps notes")
+        check(ChatStore.files().isEmpty && model.globalMemory.preferences.isEmpty && !FileManager.default.fileExists(atPath: GlobalMemory.file.path) && (try? vault.read("School/Revision.md")) != nil, "clearing memory keeps notes")
+        let legacy = Data(#"{"id":"\#(UUID().uuidString)","title":"Old","summary":"Earlier task"}"#.utf8)
+        check((try? JSONDecoder().decode(ChatRecord.self, from: legacy))?.summary == "Earlier task", "older memory files still load")
         print("All \(count) checks passed")
     }
     /// A one-page PDF with selectable text (Helvetica), written by hand so the checks need no fixtures.

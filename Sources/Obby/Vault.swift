@@ -73,7 +73,29 @@ final class Vault {
         let url = try markdown(path)
         if create && fm.fileExists(atPath: url.path) { throw ObbyError("A file already exists at \(path).") }
         if !create && !fm.fileExists(atPath: url.path) { throw ObbyError("The note no longer exists.") }
-        try content.write(to: url, atomically: true, encoding: .utf8)
+        try atomicWrite(Data(content.utf8), to: url, create: create)
+    }
+    /// Safe save: write a temporary file beside the note, confirm its size, then atomically move it into place (or
+    /// replace the old version). If anything fails the previous version is untouched and the temporary file is removed.
+    func atomicWrite(_ data: Data, to url: URL, create: Bool) throws {
+        let temp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).obby-tmp-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: temp) } // Gone already after a successful move; removed if anything failed.
+        try data.write(to: temp, options: .withoutOverwriting)
+        guard (try? fm.attributesOfItem(atPath: temp.path)[.size] as? NSNumber)?.intValue == data.count else {
+            throw ObbyError("The note couldn’t be saved completely. The previous version was kept.")
+        }
+        if create { try fm.moveItem(at: temp, to: url) } // Never replaces an existing file.
+        else { _ = try fm.replaceItemAt(url, withItemAt: temp) }
+    }
+    /// Removes temporary files left by an interrupted save or import (for example after a crash).
+    func removeStaleTemporaryFiles() {
+        guard let walker = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsPackageDescendants]) else { return }
+        for case let url as URL in walker {
+            let name = url.lastPathComponent
+            guard name.hasPrefix("."), name.contains(".obby-tmp-") || name.hasPrefix(".obby-import-"),
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            try? fm.removeItem(at: url)
+        }
     }
     func mkdir(_ path: String) throws { try fm.createDirectory(at: resolve(path), withIntermediateDirectories: true) }
     func validateMove(_ old: String, _ new: String, checkConflict: Bool = true) throws {
@@ -147,7 +169,7 @@ extension Vault {
     /// `<noteFolder>/Attachments/` inside the vault and returns its note-relative path ("Attachments/name.ext").
     /// Bytes are copied (never linked or referenced in place); existing files are never overwritten.
     func importAttachment(_ source: AttachmentSource, noteFolder: String, imagesOnly: Bool = false) throws -> String {
-        let ext: String, base: String, write: (URL) throws -> Void
+        let ext: String, base: String, write: (URL) throws -> Void, expected: Int?
         switch source {
         case .file(let url):
             let file = url.standardizedFileURL.resolvingSymlinksInPath()
@@ -165,24 +187,35 @@ extension Vault {
                 try Self.validateImage(data)
                 base = Self.attachmentStem(stem)
                 write = { try data.write(to: $0, options: .withoutOverwriting) }
+                expected = data.count
             } else {
                 base = Self.documentStem(stem)
-                write = { try FileManager.default.copyItem(at: file, to: $0) } // Fails instead of replacing an existing file.
+                write = { try FileManager.default.copyItem(at: file, to: $0) } // Reads the original; never changes it.
+                expected = values.fileSize
             }
         case .data(let bytes, let type):
             try Self.validateImage(bytes)
             ext = type.lowercased(); base = "pasted-image"
             write = { try bytes.write(to: $0, options: .withoutOverwriting) }
+            expected = bytes.count
         }
         let folder = noteFolder.isEmpty ? "Attachments" : noteFolder + "/Attachments"
         try mkdir(folder) // Through resolve(): stays inside the vault and refuses a symlinked Attachments folder.
+        // Copy into a temporary file first and check it, then move it to a free name. The Markdown link is only
+        // inserted after this returns, and an existing attachment is never overwritten.
+        let temp = try resolve(folder + "/.obby-import-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: temp) }
+        try write(temp)
+        let copied = (try? fm.attributesOfItem(atPath: temp.path)[.size] as? NSNumber)?.intValue
+        guard copied != nil, expected == nil || copied == expected else { throw ObbyError("The file couldn’t be copied completely. Nothing was added.") }
         let suffix = ext.isEmpty ? "" : "." + ext
         for number in 1...9_999 {
             let name = number == 1 ? base + suffix : "\(base)-\(number)" + suffix
             let target = try resolve(folder + "/" + name)
             if fm.fileExists(atPath: target.path) { continue }
-            do { try write(target) }
-            catch let error as CocoaError where error.code == .fileWriteFileExists { continue } // Created meanwhile.
+            do { try fm.moveItem(at: temp, to: target) } // Fails rather than replace a file created meanwhile.
+            catch let error as CocoaError where error.code == .fileWriteFileExists { continue }
+            guard fm.fileExists(atPath: target.path) else { throw ObbyError("The file couldn’t be added.") }
             return "Attachments/" + name
         }
         throw ObbyError("Too many attachments with that name.")

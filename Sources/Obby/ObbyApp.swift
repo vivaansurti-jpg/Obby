@@ -60,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             guard let model else { return .terminateNow }
             if model.save() == false { return .terminateCancel }
-            model.persistChat() // Saved only when "Remember AI conversations" is on.
+            model.persistChat() // Saved only when "Remember AI tasks between launches" is on.
             model.clearChat()
             guard model.needsUnloadOnQuit else { return .terminateNow }
             // Unload the active Ollama model once, then quit. Never hold shutdown for more than ~3 seconds.
@@ -272,6 +272,10 @@ struct AIView: View {
             if !model.toolsAvailable && !model.selectedModel.isEmpty {
                 Text("Chat only · can work with the current note, but cannot use vault tools").font(.caption).foregroundStyle(.secondary)
             }
+            if model.memory.itemCount + model.globalMemory.preferences.count > 0 {
+                Text("Memory · \(model.memory.itemCount + model.globalMemory.preferences.count) items").font(.caption2).foregroundStyle(.secondary)
+                    .help([model.globalMemory.packet, model.memory.packet].filter { !$0.isEmpty }.joined(separator: "\n\n"))
+            }
             if let usage = model.contextUsage {
                 Text("Context: \(ContextBudget.label(usage.used)) / \(ContextBudget.windowLabel(usage.window))").font(.caption2).foregroundStyle(.secondary)
                     .help("Estimated size of the last request. Part of the window is always kept free for the answer.")
@@ -328,11 +332,26 @@ struct SettingsView: View {
     }
     var body: some View {
         Form {
+            Section("Storage") {
+                // Obby does not own your content: notes and attachments are ordinary files in this folder.
+                LabeledContent("Notes location") {
+                    Text(model.vault.map { ($0.root.path as NSString).abbreviatingWithTildeInPath } ?? "No folder chosen")
+                        .textSelection(.enabled).lineLimit(2).truncationMode(.middle)
+                }
+                HStack {
+                    Button("Show in Finder") { if let root = model.vault?.root { NSWorkspace.shared.activateFileViewerSelecting([root]) } }.disabled(model.vault == nil)
+                    Button("Change Folder…") { model.chooseFolder() }.disabled(model.busy)
+                }
+                Text("Notes, images and documents are normal files in this folder, so they stay usable from Finder and can be backed up with Time Machine, iCloud Drive, Dropbox or Git. Changing the folder never moves or deletes anything.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("AI Provider") {
                 Picker("AI provider", selection: providerSelection) {
                     ForEach(ProviderKind.allCases) { Text($0.label).tag($0) }
                 }.disabled(model.busy || model.switchingModel)
-                Text(model.providerBadge).font(.caption).foregroundStyle(.secondary)
+                Text(model.providerBadge).font(.caption.weight(.semibold))
+                Text(model.isLocalProvider ? "Your AI requests stay on this Mac." : "Relevant note or attachment content may be sent to this provider when you ask Obby to work with it.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("Context window", selection: $model.contextWindow) {
                     ForEach(ContextWindow.allCases) { Text($0.label).tag($0) }
                 }.onChange(of: model.contextWindow) { _ in model.persistSettings() }
@@ -340,16 +359,19 @@ struct SettingsView: View {
             }
             if model.provider == .ollama { ollamaSection } else { cloudSection }
             Section("Memory") {
-                Toggle("Remember AI conversations between launches", isOn: $model.rememberChats)
+                Toggle("Remember AI tasks between launches", isOn: $model.rememberChats)
                     .onChange(of: model.rememberChats) { on in model.persistSettings(); if on { model.persistChat() }; model.reloadSavedChats() }
                 HStack {
-                    Button("Clear current chat memory") { model.clearCurrentChatMemory() }.disabled(model.busy)
+                    Button("Clear current task memory") { model.clearCurrentChatMemory() }.disabled(model.busy)
                     Button("Clear all AI memory") { model.clearAllChatMemory() }.disabled(model.busy)
                 }
-                Text("Chat memory is a short summary kept on this Mac, separate from your notes. Clearing it never deletes notes or attachments.")
+                ForEach(model.globalMemory.preferences, id: \.self) { item in // Durable preferences you stated ("from now on…").
+                    HStack { Text(item).font(.caption).lineLimit(2); Spacer(); Button { model.forgetGlobalPreference(item) } label: { Image(systemName: "minus.circle") }.buttonStyle(.borderless).help("Forget this preference") }
+                }
+                Text("Task memory is a short summary kept on this Mac, separate from your notes. Clearing it never deletes notes or attachments.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }.formStyle(.grouped).frame(width: 500, height: 540)
+        }.formStyle(.grouped).frame(width: 520, height: 600)
             .task { syncDrafts(); await model.connect() }
             .onChange(of: model.selectedModel) { value in manualModel = value }
     }

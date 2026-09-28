@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // Chat presentation only. The model's reply stays raw Markdown in `ChatLine.text`; Obby renders it here.
 // Tool activity is summarised by `ActionPresentation.summary` (Swift, deterministic) and shown compactly.
@@ -129,6 +130,12 @@ enum ChatMarkdown {
         for range in unsafe { styled[range].link = nil }
         return styled
     }
+    static func paragraph(_ text: String) -> AttributedString {
+        text.components(separatedBy: "\n").enumerated().reduce(into: AttributedString()) { result, line in
+            if line.offset > 0 { result.append(AttributedString("\n")) }
+            result.append(inline(line.element))
+        }
+    }
     static func isWebLink(_ url: URL) -> Bool { ["http", "https"].contains(url.scheme?.lowercased() ?? "") }
 }
 
@@ -179,7 +186,7 @@ struct ChatMarkdownView: View {
     @ViewBuilder func blockView(_ block: MarkdownBlock) -> some View {
         switch block {
         case .paragraph(let text):
-            wrapped(Text(ChatMarkdown.inline(text)))
+            wrapped(Text(ChatMarkdown.paragraph(text)))
         case .heading(let level, let text):
             wrapped(Text(ChatMarkdown.inline(text)))
                 .font(level == 1 ? .title3.weight(.semibold) : level == 2 ? .headline : .subheadline.weight(.semibold))
@@ -427,7 +434,7 @@ struct MemoryPopover: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                Text("This task’s memory").font(.headline)
+                Text("Active Chat Memory").font(.headline)
                 Text("Edit the goal below or remove remembered items. Your notes are not changed.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 VStack(alignment: .leading, spacing: 4) {
@@ -437,6 +444,7 @@ struct MemoryPopover: View {
                     Button("Save goal") { saveGoal() }.font(.caption)
                 }
                 list("Pinned", \.pinned)
+                list("Key points", \.keyPoints)
                 if !model.memory.summary.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack { Text("Summary").font(.caption.weight(.semibold)); Spacer(); remove { model.memory.summary = "" } }
@@ -489,7 +497,10 @@ struct MemoryPopover: View {
                     HStack(alignment: .top) {
                         Text(item).font(.caption).fixedSize(horizontal: false, vertical: true)
                         Spacer()
-                        remove { if index < model.memory[keyPath: key].count { model.memory[keyPath: key].remove(at: index) } }
+                        remove {
+                            if key == \ChatRecord.keyPoints { model.memory.removeKeyPoint(item) }
+                            else if index < model.memory[keyPath: key].count { model.memory[keyPath: key].remove(at: index) }
+                        }
                     }
                 }
             }
@@ -506,110 +517,128 @@ struct MemorySettingsSheet: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var newFact = ""
-    @State private var newPreference = ""
-    @State private var tasks: [ChatRecord] = []
+    @State private var showActive = false
+    @State private var showProcedures = false
     var body: some View {
         VStack(spacing: 0) {
             List {
-                Section("About me") {
-                    ForEach(model.globalMemory.aboutMe.indices, id: \.self) { index in
-                        editableRow(Binding(get: { index < model.globalMemory.aboutMe.count ? model.globalMemory.aboutMe[index] : "" },
-                                            set: { if index < model.globalMemory.aboutMe.count { model.globalMemory.aboutMe[index] = String($0.prefix(GlobalMemory.aboutMeLength)) } }),
-                                    remove: { model.globalMemory.aboutMe.remove(at: index) })
+                Section("Permanent Memory") {
+                    Text("Only these approved facts, preferences and standing folder instructions carry across chats.").font(.caption).foregroundStyle(.secondary)
+                    permanentItems("Explicitly remembered", \.remembered)
+                    permanentItems("About me", \.aboutMe)
+                    permanentItems("Lasting preferences", \.preferences)
+                    HStack {
+                        TextField("Remember for future chats…", text: $newFact)
+                        Button("Add") {
+                            let fact = newFact.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !fact.isEmpty, fact.count <= 500, !GlobalMemory.isSensitive(fact) else { model.error = "Enter a non-sensitive fact of at most 500 characters."; return }
+                            var updated = model.globalMemory
+                            guard updated.remembered.count < 100 else { model.error = "Permanent Memory is full. Remove an item first."; return }
+                            if !updated.remembered.contains(fact) { updated.remembered.append(fact) }
+                            if updated.save() { model.globalMemory = updated; newFact = "" }
+                        }.disabled(newFact.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                    addRow("Add a fact about you…", text: $newFact) {
-                        model.globalMemory.aboutMe = GlobalMemory.merge(model.globalMemory.aboutMe, [newFact])
-                    }
-                }
-                Section("Lasting preferences") {
-                    ForEach(model.globalMemory.preferences.indices, id: \.self) { index in
-                        editableRow(Binding(get: { index < model.globalMemory.preferences.count ? model.globalMemory.preferences[index] : "" },
-                                            set: { if index < model.globalMemory.preferences.count { model.globalMemory.preferences[index] = String($0.prefix(200)) } }),
-                                    remove: { model.globalMemory.preferences.remove(at: index) })
-                    }
-                    addRow("Add a preference…", text: $newPreference) {
-                        let item = newPreference.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !item.isEmpty, !model.globalMemory.preferences.contains(item) { model.globalMemory.preferences = Array((model.globalMemory.preferences + [String(item.prefix(200))]).suffix(10)) }
-                    }
-                }
-                Section("Folder contexts") {
-                    let keys = model.globalMemory.folders.keys.sorted()
-                    if keys.isEmpty { Text("None yet. Right-click a folder in the sidebar and choose Folder Context…").foregroundStyle(.secondary) }
-                    ForEach(keys, id: \.self) { key in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(folderLabel(key)).font(.caption).foregroundStyle(.secondary)
-                            TextField("Edit folder context", text: Binding(get: { model.globalMemory.folders[key] ?? "" }, set: { model.globalMemory.folders[key] = String($0.prefix(500)) }))
-                                .textFieldStyle(.roundedBorder)
-                        }
-                    }
-                }
-                Section("Saved tasks") {
-                    if tasks.isEmpty { Text("No saved tasks for this notes folder.").foregroundStyle(.secondary) }
-                    ForEach(tasks) { task in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                TextField("Task title", text: Binding(get: { tasks.first { $0.id == task.id }?.title ?? "" },
-                                                                      set: { title in rename(task.id, title) }))
-                                Text("Last used " + task.updatedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                        }
-                    }
-                }
-                Section {
-                    DangerZone {
-                        Text("These actions remove saved context. Your notes and attachments are kept.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        ForEach(model.globalMemory.folders.keys.sorted(), id: \.self) { key in
-                            ConfirmRemovalButton(title: "Delete context: \(folderLabel(key))", warning: "Deletes the standing instructions for this folder. The folder and its notes are kept.") {
-                                model.globalMemory.folders.removeValue(forKey: key)
+                    ForEach(model.globalMemory.folders.keys.sorted(), id: \.self) { key in
+                        VStack(alignment: .leading) {
+                            Text("Folder instructions: " + key.components(separatedBy: "|").last!).font(.caption)
+                            TextField("Instructions", text: Binding(get: { model.globalMemory.folders[key] ?? "" }, set: { value in
+                                var updated = model.globalMemory; updated.folders[key] = String(value.prefix(500))
+                                if updated.save() { model.globalMemory = updated }
+                            }))
+                            Button("Remove instructions", role: .destructive) {
+                                var updated = model.globalMemory; updated.folders.removeValue(forKey: key)
+                                if updated.save() { model.globalMemory = updated }
                             }
                         }
-                        ForEach(tasks) { task in
-                            ConfirmRemovalButton(title: "Forget task: \(task.title.isEmpty ? "Untitled task" : task.title)", warning: "Deletes this task's saved conversation and memory. Your notes are kept.") {
-                                if ChatStore.delete(task.id) { reloadTasks() }
+                    }
+                }
+                Section("Active Chat Memory") {
+                    Text(model.memory.summary.isEmpty ? "Temporary working context for the current chat." : model.memory.summary).font(.caption)
+                    Button("View Active Chat Memory…") { showActive = true }
+                    if !model.memory.pendingPermanentItems.isEmpty {
+                        Text("Pending Permanent Memory — must be saved or explicitly removed before reset.").font(.caption).foregroundStyle(.secondary)
+                        ForEach(Array(model.memory.pendingPermanentItems.enumerated()), id: \.offset) { index, _ in
+                            HStack {
+                                TextField("Clarify the fact to remember", text: Binding(get: {
+                                    model.memory.pendingPermanentItems.indices.contains(index) ? model.memory.pendingPermanentItems[index] : ""
+                                }, set: { value in
+                                    if model.memory.pendingPermanentItems.indices.contains(index) { model.memory.pendingPermanentItems[index] = value; model.persistChat() }
+                                }))
+                                Button("Remove", role: .destructive) {
+                                    if model.memory.pendingPermanentItems.indices.contains(index) { model.memory.pendingPermanentItems.remove(at: index); model.persistChat() }
+                                }
                             }
                         }
-                        MemoryDangerZone(includeAll: true, showHeading: false) { reloadTasks() }
+                        Button("Save pending Permanent Memory") { if model.flushPermanentMemory() { model.persistChat() } }
                     }
+                }
+                Section("Procedural History") {
+                    Text("Completed actions only. No prompts, responses or note contents. The newest 1,000 records are retained; adjacent repeated actions are grouped.").font(.caption)
+                    Button("View Procedural History…") { showProcedures = true }
+                }
+                Section { MemoryDangerZone(includeAll: true) }
+            }
+            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }.padding(12)
+        }.frame(minWidth: 520, minHeight: 500)
+        .sheet(isPresented: $showActive) { VStack { MemoryPopover(); Button("Done") { showActive = false }.padding() }.frame(width: 440) }
+        .sheet(isPresented: $showProcedures) { ProcedureHistoryView() }
+    }
+    @ViewBuilder func permanentItems(_ title: String, _ key: WritableKeyPath<GlobalMemory, [String]>) -> some View {
+        if !model.globalMemory[keyPath: key].isEmpty {
+            Text(title).font(.caption.weight(.semibold))
+            ForEach(Array(model.globalMemory[keyPath: key].enumerated()), id: \.offset) { index, _ in
+                HStack {
+                    TextField("Edit memory", text: Binding(get: {
+                        let items = model.globalMemory[keyPath: key]; return items.indices.contains(index) ? items[index] : ""
+                    }, set: { value in
+                        var updated = model.globalMemory
+                        guard updated[keyPath: key].indices.contains(index), value.count <= 500 else { return }
+                        updated[keyPath: key][index] = value
+                        if updated.save() { model.globalMemory = updated }
+                    }))
+                    Button("Remove", role: .destructive) {
+                        var updated = model.globalMemory
+                        guard updated[keyPath: key].indices.contains(index) else { return }
+                        updated[keyPath: key].remove(at: index)
+                        if updated.save() { model.globalMemory = updated }
+                    }.buttonStyle(.borderless)
                 }
             }
-            Divider()
-            HStack {
-                Text("Edits save automatically. Removing memory never deletes notes or attachments.").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
-            }.padding(12)
-        }
-        .frame(minWidth: 520, idealWidth: 520, minHeight: 460, idealHeight: 560) // The list scrolls; the footer always stays visible.
-        .onAppear { reloadTasks() }
-        .onChange(of: model.globalMemory) { memory in memory.save() } // Every edit is saved straight away.
-        .onDisappear { model.globalMemory.aboutMe.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }; model.globalMemory.preferences.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }; model.reloadSavedChats() }
-    }
-    func editableRow(_ text: Binding<String>, remove: @escaping () -> Void) -> some View {
-        HStack {
-            TextField("Edit memory", text: text).textFieldStyle(.roundedBorder)
-            Button("Remove", action: remove).buttonStyle(.borderless).help("Remove from memory")
         }
     }
-    func addRow(_ placeholder: String, text: Binding<String>, add: @escaping () -> Void) -> some View {
-        HStack {
-            TextField(placeholder, text: text).onSubmit { add(); text.wrappedValue = "" }
-            Button("Add") { add(); text.wrappedValue = "" }.disabled(text.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty)
-        }
+}
+
+struct ProcedureHistoryView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var records: [ProcedureRecord] = []
+    @State private var failure: String?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Procedural History").font(.headline)
+            if let failure { Text(failure).foregroundStyle(.red) }
+            if records.isEmpty { Text("No recorded actions for this notes folder.").foregroundStyle(.secondary) }
+            List(records.reversed()) { record in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(record.timestamp, format: .dateTime.year().month().day().hour().minute()).font(.caption).foregroundStyle(.secondary)
+                    Text(record.description + (record.repetitions > 1 ? " ×\(record.repetitions)" : ""))
+                    Text(record.paths.joined(separator: " → ")).font(.caption).foregroundStyle(.secondary)
+                    Text("Chat " + String(record.chatID.uuidString.prefix(8))).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            DangerZone {
+                ConfirmRemovalButton(title: "Clear Procedural History", warning: "Permanently removes Obby's stored record of past file actions across notes folders. Notes and Permanent Memory are not affected.") {
+                    if model.clearProceduralHistory() { reload() }
+                }
+            }
+            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+        }.padding().frame(minWidth: 540, minHeight: 450).onAppear { reload() }
     }
-    func folderLabel(_ key: String) -> String {
-        let parts = key.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-        let root = ((parts.first ?? "") as NSString).lastPathComponent
-        let folder = parts.count > 1 ? parts[1] : ""
-        return folder.isEmpty ? root + " (whole folder)" : root + " › " + folder
-    }
-    func reloadTasks() { tasks = model.vault.map { ChatStore.all(root: $0.root.path) } ?? [] }
-    func rename(_ id: UUID, _ title: String) {
-        guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
-        tasks[index].title = String(title.prefix(80))
-        guard ChatStore.save(tasks[index]) else { return }
-        if model.memory.id == id { model.memory.title = tasks[index].title }
+    func reload() {
+        do {
+            records = try ProcedureStore.merge(model.memory.pendingProcedures, into: ProcedureStore.load()).filter { $0.notesRoot == model.vault?.root.path }
+            failure = nil
+        } catch { failure = "History could not be read: " + error.localizedDescription }
     }
 }
 
@@ -653,16 +682,105 @@ struct MemoryDangerZone: View {
     }
     var controls: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Clearing memory also removes saved chat history. Notes and attachments are kept.")
-                .font(.caption).foregroundStyle(.secondary)
-            ConfirmRemovalButton(title: "Clear this task's memory", warning: "Clears the current task's conversation and memory.") {
-                model.clearCurrentChatMemory(); didClear()
+            ConfirmRemovalButton(title: "Clear Current Chat Memory", warning: "Deletes this chat's messages, compressed context, goal and task-specific memory after saving pending permanent items and completed actions. Notes, Permanent Memory and Procedural History are kept.") {
+                if model.resetChat() { didClear() }
             }
             if includeAll {
-                ConfirmRemovalButton(title: "Clear all AI memory", warning: "Clears every saved task, personal fact, preference and folder context.") {
-                    model.clearAllChatMemory(); didClear()
+                ConfirmRemovalButton(title: "Clear Permanent Memory", warning: "Deletes approved profile facts, explicit memories, lasting preferences and standing folder instructions, including pending promotions. Notes, active chat context and Procedural History are kept.") {
+                    if model.clearPermanentMemory() { didClear() }
+                }
+                ConfirmRemovalButton(title: "Clear Procedural History", warning: "Permanently removes Obby's stored record of past file actions across notes folders. Notes and Permanent Memory are not affected.") {
+                    if model.clearProceduralHistory() { didClear() }
                 }
             }
         }
+    }
+}
+
+@MainActor extension AppModel {
+    /// Save first; the system alone decides which sharing service handles the local Markdown file.
+    func shareNote() {
+        guard let note, let vault, save() else { return }
+        perform {
+            let url = try vault.resolve(note)
+            guard let view = NSApp.keyWindow?.contentView else { throw ObbyError("Open a note window before sharing.") }
+            NSSharingServicePicker(items: [url]).show(relativeTo: NSRect(x: view.bounds.maxX - 40, y: view.bounds.maxY - 60, width: 1, height: 1), of: view, preferredEdge: .minY)
+        }
+    }
+
+    /// AppKit paginates the rendered text and local images. No HTML or remote resources are loaded.
+    func exportNotePDF() {
+        guard let note, let vault, save() else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = (note as NSString).lastPathComponent.replacingOccurrences(of: ".md", with: ".pdf")
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        let content = NotePDF.render(text, vault: vault, folder: (note as NSString).deletingLastPathComponent)
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 468, height: 648))
+        view.textContainerInset = .zero
+        view.textContainer?.lineFragmentPadding = 0
+        view.textStorage?.setAttributedString(content)
+        view.layoutManager?.ensureLayout(for: view.textContainer!)
+        let height = view.layoutManager!.usedRect(for: view.textContainer!).height
+        view.setFrameSize(NSSize(width: 468, height: max(648, ceil(height))))
+        let info = NSPrintInfo()
+        info.paperSize = NSSize(width: 612, height: 792)
+        info.topMargin = 72; info.bottomMargin = 72; info.leftMargin = 72; info.rightMargin = 72
+        info.horizontalPagination = .fit; info.verticalPagination = .automatic
+        info.isVerticallyCentered = false
+        info.jobDisposition = .save
+        info.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = destination
+        let operation = NSPrintOperation(view: view, printInfo: info)
+        operation.showsPrintPanel = false; operation.showsProgressPanel = true
+        if !operation.run() { error = "The PDF could not be exported." }
+    }
+}
+
+@MainActor enum NotePDF {
+    static func render(_ markdown: String, vault: Vault, folder: String) -> NSAttributedString {
+        let output = NSMutableAttributedString(string: "")
+        func append(_ text: String, size: CGFloat = 12, mono: Bool = false) {
+            let value = NSMutableAttributedString(attributedString: NSAttributedString(ChatMarkdown.paragraph(text)))
+            value.addAttribute(.font, value: mono ? NSFont.monospacedSystemFont(ofSize: size, weight: .regular) : NSFont.systemFont(ofSize: size), range: NSRange(location: 0, length: value.length))
+            output.append(value)
+            output.append(NSAttributedString(string: "\n\n"))
+        }
+        func image(_ source: String, alt: String) {
+            if case .local(let url) = ChatImageSource.resolve(source, vault: vault, noteFolder: folder), let image = NSImage(contentsOf: url), image.size.width > 0, image.size.height > 0 {
+                let scale = min(1, min(468 / image.size.width, 600 / image.size.height))
+                image.size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+                let attachment = NSTextAttachment()
+                attachment.attachmentCell = NSTextAttachmentCell(imageCell: image)
+                output.append(NSAttributedString(attachment: attachment))
+                output.append(NSAttributedString(string: "\n\n"))
+            } else { append(alt.isEmpty ? "Image unavailable" : alt) }
+        }
+        for block in ChatMarkdown.blocks(markdown) {
+            switch block {
+            case .paragraph(let text):
+                // Inline images also render, preserving the surrounding text.
+                let source = text as NSString
+                var cursor = 0
+                for link in NoteLinks.links(in: text) where link.isImage {
+                    let start = link.titleRange.location - 1
+                    let end = NSMaxRange(link.destinationRange) + 1
+                    if start > cursor { append(source.substring(with: NSRange(location: cursor, length: start - cursor))) }
+                    image(link.destination, alt: source.substring(with: link.titleRange))
+                    cursor = end
+                }
+                if cursor < source.length { append(source.substring(from: cursor)) }
+            case .heading(let level, let text): append(text, size: CGFloat(24 - level * 2))
+            case .bullet(_, let text): append("• " + text)
+            case .numbered(_, let marker, let text): append(marker + " " + text)
+            case .code(let text):
+                output.append(NSAttributedString(string: text + "\n\n", attributes: [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)]))
+            case .quote(let text): append(text)
+            case .table(let header, let rows):
+                append(([header] + rows).map { $0.joined(separator: "    |    ") }.joined(separator: "\n"), mono: true)
+            case .image(let alt, let source): image(source, alt: alt)
+            case .rule: append("────────────────────────────")
+            }
+        }
+        return output
     }
 }

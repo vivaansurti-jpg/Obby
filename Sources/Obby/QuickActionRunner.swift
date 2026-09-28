@@ -36,10 +36,12 @@ extension AppModel {
                 let content = try await condenseLongText(source, title: (note as NSString).lastPathComponent, request: action.instruction, provider: selectedProvider, window: window, allowance: budget * 3 / 4)
                 try Task.checkCancellation()
                 guard session == chatSession else { return }
-                let reply = try await selectedProvider.chat(ChatRequest(model: modelName, system: action.instruction, messages: [["role": "user", "content": content]], tools: nil, temperature: temperature, contextWindow: window, keepAlive: keepAlive.apiValue))
+                let reply = try await selectedProvider.chat(ChatRequest(model: modelName, system: action.instruction + "\n\n" + memoryPacket(), messages: [["role": "user", "content": content]], tools: nil, temperature: temperature, contextWindow: window, keepAlive: keepAlive.apiValue))
                 try Task.checkCancellation()
                 guard session == chatSession else { return }
+                recordProcedure("generate_" + action.rawValue, arguments: ["path": note])
                 appendChat(role: "Obby", text: reply.text)
+                memory.captureKeyPoints([["role": "user", "content": prompt], ["role": "assistant", "content": reply.text]])
                 history = ChatMemory.retainingExchange(history, prompt: prompt, reply: reply.text)
                 memory.remember(file: note)
                 if memory.title.isEmpty { memory.title = action.title + ": " + (note as NSString).lastPathComponent }
@@ -47,6 +49,7 @@ extension AppModel {
                     let existing = Set(flattenedPaths(try vault.tree()))
                     let path = QuickAction.noteName(for: note, action: action, existing: existing)
                     try vault.write(path, content: reply.text, create: true)
+                    recordProcedure("create_file", arguments: ["path": path])
                     refresh()
                     let name = (path as NSString).lastPathComponent
                     appendNotice("Saved \(name).")

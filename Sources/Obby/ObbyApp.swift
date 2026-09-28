@@ -33,6 +33,8 @@ import UniformTypeIdentifiers
             CommandGroup(replacing: .appSettings) { Button("Settings…") { model.showSettings = true }.keyboardShortcut(",") }
             CommandGroup(replacing: .saveItem) {
                 Button("Save") { model.save() }.keyboardShortcut("s")
+                Button("Share") { model.shareNote() }.disabled(model.note == nil)
+                if !model.noteAttachments.isEmpty { Button("Export as PDF…") { model.exportNotePDF() } }
                 Button("Save Recovery Copy…") { model.saveRecoveryCopy() }.disabled(!model.dirty)
             }
             CommandGroup(after: .sidebar) {
@@ -108,7 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if model.save() == false { return .terminateCancel }
             model.persistChat() // Saved only when "Remember AI tasks between launches" is on.
             model.stopStatusTimers() // No status checks keep running once Obby quits.
-            model.clearChat()
+            guard model.clearChat() else { return .terminateCancel }
             guard model.needsUnloadOnQuit else { return .terminateNow }
             // Unload the active Ollama model once, then quit. Never hold shutdown for more than ~3 seconds.
             let once = QuitReply()
@@ -138,7 +140,12 @@ struct ContentView: View {
                         .onDrop(of: [.fileURL], isTargeted: nil) { MarkdownDrop.load($0) { model.importNotes($0) } }
                     VStack(spacing: 0) {
                         if let note = model.note {
-                            HStack { NoteTitleField(path: note); Spacer() }.padding(.horizontal).padding(.vertical, 20)
+                            HStack {
+                                NoteTitleField(path: note); Spacer()
+                                if !model.noteAttachments.isEmpty { Button("Export as PDF…") { model.exportNotePDF() }.buttonStyle(.borderless) }
+                                Button { model.shareNote() } label: { Image(systemName: "square.and.arrow.up") }
+                                    .buttonStyle(.borderless).help("Share").accessibilityLabel("Share")
+                            }.padding(.horizontal).padding(.vertical, 20)
                             HStack(spacing: 12) {
                                 Button { bridge.format(.bold) } label: { Image(systemName: "bold") }.help("Bold").keyboardShortcut("b")
                                 Button { bridge.format(.italic) } label: { Image(systemName: "italic") }.help("Italic").keyboardShortcut("i")
@@ -360,7 +367,7 @@ struct AIView: View {
                     Button {
                         DispatchQueue.main.async { showMemory = true } // After the menu closes, so the popover can open.
                     } label: { Label("Memory (\(model.memory.itemCount + model.globalMemory.preferences.count) items)…", systemImage: "brain") }
-                    Button { model.clearChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
+                    Button { model.resetChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
                     if !model.savedChats.isEmpty {
                         Menu {
                             ForEach(model.savedChats) { record in
@@ -447,7 +454,7 @@ struct AIView: View {
                                         }
                                         else { Text(displayed).textSelection(.enabled) }
                                     }.frame(maxWidth: .infinity, alignment: .leading).id(group.id)
-                                    .contextMenu { Button("Pin to Memory") { model.pin(line.text) } }
+                                    .contextMenu { Button("Pin to Active Chat Memory") { model.pin(line.text) } }
                                 }
                             }
                         }
@@ -591,6 +598,7 @@ struct AIView: View {
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @State var showMemory = false
+    @State var showProcedures = false
     @State var url = ""
     @State var baseURL = ""
     @State var apiKey = ""
@@ -633,6 +641,7 @@ struct SettingsView: View {
             }.frame(maxWidth: .infinity, maxHeight: .infinity) // Each tab's Form scrolls inside the fixed sheet size.
         }
             .sheet(isPresented: $showMemory) { MemorySettingsSheet().environmentObject(model) }
+            .sheet(isPresented: $showProcedures) { ProcedureHistoryView().environmentObject(model) }
             .task { syncDrafts(); await model.connect() }
             .onChange(of: model.selectedModel) { value in manualModel = value }
     }
@@ -707,9 +716,17 @@ struct SettingsView: View {
     }
     var memoryTab: some View {
         Form {
-            Section("View and edit") {
-                LabeledContent("Saved facts and preferences", value: "\(model.globalMemory.aboutMe.count + model.globalMemory.preferences.count)")
-                Button("View and edit memory…") { showMemory = true }.buttonStyle(.link)
+            Section("Permanent Memory") {
+                LabeledContent("Saved items", value: "\(model.globalMemory.remembered.count + model.globalMemory.aboutMe.count + model.globalMemory.preferences.count)")
+                Button("View and edit Permanent Memory…") { showMemory = true }
+            }
+            Section("Active Chat Memory") {
+                Text(model.memory.summary.isEmpty ? "Working context belongs only to this chat." : model.memory.summary).font(.caption)
+                Button("View Active Chat Memory…") { showMemory = true }
+            }
+            Section("Procedural History") {
+                Text("A local record of completed actions, retrieved by AI only when you ask about past activity.").font(.caption)
+                Button("View Procedural History…") { showProcedures = true }
             }
             Section("Remembering") {
                 Toggle("Learn about me from chats", isOn: $model.learnAboutMe)
@@ -897,7 +914,8 @@ struct WindowCloseGuard: NSViewRepresentable {
         func windowShouldClose(_ sender: NSWindow) -> Bool {
             guard model.save() else { return false }
             guard original?.windowShouldClose?(sender) ?? true else { return false }
-            if model.rememberChats { model.persistChat() } else { model.clearChat() } // Remembered chats stay open.
+            guard model.finalizeMemory() else { return false }
+            if model.rememberChats { model.persistChat() } else { guard model.clearChat() else { return false } } // Remembered chats stay open.
             return true
         }
         override func responds(to selector: Selector!) -> Bool { super.responds(to: selector) || (original?.responds(to: selector) ?? false) }

@@ -159,7 +159,7 @@ import AppKit
         sidebarDrag = nil
         rootWatcher?.cancel(); rootWatcher = nil
         saveTask?.cancel(); saveTask = nil
-        clearChat()
+        guard clearChat() else { return }
         vault = nil; tree = []; results = []; query = ""; selection = nil; note = nil
         loading = true; text = ""; loading = false
         diskText = ""; dirty = false; status = ""; error = nil; saveConflict = false
@@ -190,7 +190,7 @@ import AppKit
     /// Opens a notes folder: the folder itself is the notes root, and existing notes load as they are.
     func openVault(_ url: URL) {
         _ = validateRoot()
-        guard save() else { return }
+        guard save(), finalizeMemory() else { return }
         scopedURL?.stopAccessingSecurityScopedResource()
         _ = url.startAccessingSecurityScopedResource(); scopedURL = url
         guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
@@ -529,6 +529,7 @@ import AppKit
                 guard alert.runModal() == .alertFirstButtonReturn else { return }
             }
             try applyUndo(edit, vault: vault)
+            recordProcedure("undo", arguments: ["path": edit.path])
             if let index = chat.firstIndex(where: { $0.id == line.id }) { chat[index].undo = nil }
             appendNotice("Undid the AI change to \(name).")
             memory.remember(action: "Undid the AI change to \(name).")
@@ -551,7 +552,8 @@ import AppKit
         for line in lines.reversed() {
             do {
                 guard let edit = chat.first(where: { $0.id == line.id })?.undo else { continue }
-                try applyUndo(edit, vault: vault); undone += 1
+                try applyUndo(edit, vault: vault)
+                recordProcedure("undo", arguments: ["path": edit.path]); undone += 1
                 if let index = chat.firstIndex(where: { $0.id == line.id }) { chat[index].undo = nil }
             } catch { appendNotice("Couldn’t undo the change to \((line.undo!.path as NSString).lastPathComponent): \(error.localizedDescription)", failed: true) }
         }

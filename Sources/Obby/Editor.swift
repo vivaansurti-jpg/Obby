@@ -229,7 +229,7 @@ final class PlainTextView: NSTextView {
         window?.makeFirstResponder(self)
         return true // Never fall back to inserting the original file path.
     }
-    /// The one path for drop, paste and both toolbar buttons: import into Attachments, insert the Markdown reference.
+    /// The one path for drop, paste and both toolbar buttons: import into the root Attachments folder, insert a note-relative Markdown reference.
     /// One undoable replacement of formatted text, restyled and followed by the normal change notification.
     func replace(_ range: NSRange, with text: NSAttributedString, select: NSRange) {
         guard let storage = textStorage, shouldChangeText(in: range, replacementString: text.string) else { return }

@@ -26,6 +26,107 @@ import AppKit
         model.provider = .ollama; model.selectedModel = "test"; model.streamReplies = false; model.connected = true
         model.planOverride = { _ in true }
 
+        model.globalMemory = GlobalMemory()
+        model.pinFromRequest("Remember that Biology is my priority.")
+        model.memory.currentGoal = "ordinary task goal"
+        model.memory.summary = "compressed active context"
+        model.memory.decisions = ["task decision"]
+        model.memory.keyPoints = ["temporary detail"]
+        model.history = [["role": "user", "content": "ordinary conversation"]]
+        let firstChat = model.memory.id
+        _ = try model.executeTool("create_file", arguments: ["path": "History/Revision.md", "content": "PRIVATE NOTE CONTENT"])
+        check(try ProcedureStore.load().last?.action == "create_file", "successful tool actions enter Procedural History")
+        check(model.resetChat(), "New Chat completes durable writes before reset")
+        check(model.memory.id != firstChat && model.history.isEmpty && model.chat.isEmpty && model.memory.packet.isEmpty, "ordinary context, compressed summary, decisions and recent messages are wiped")
+        check(GlobalMemory.load().remembered.contains("Biology is my priority."), "explicit permanent information survives New Chat on disk")
+        check(try ProcedureStore.load().count == 1, "Procedural History survives New Chat")
+        check(!model.memoryPacket().contains("Created Revision.md") && model.procedurePacket(for: "Find notes about plants").isEmpty, "ordinary memory packet excludes Procedural History")
+        check(model.procedurePacket(for: "What happened in that chat?").contains("Created Revision.md"), "explicit previous-chat question retrieves relevant actions")
+        var memoryRequests: [String] = []
+        model.requestOverride = { route, body in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            if route == "/api/chat" { memoryRequests.append(String(describing: body ?? [:])); return ["message": ["role": "assistant", "content": "Noted."]] }
+            return [:]
+        }
+        model.send("Find notes about plants")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(!memoryRequests.isEmpty && memoryRequests.allSatisfy { !$0.contains("Procedural History retrieved") && !$0.contains("Created Revision.md") }, "actual ordinary AI requests contain zero procedural history")
+        memoryRequests = []
+        model.send("What happened in that chat?")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(memoryRequests.contains { $0.contains("Procedural History retrieved") && $0.contains("Created Revision.md") }, "actual activity request receives retrieved records")
+        _ = model.resetChat()
+        _ = try model.executeTool("move_path", arguments: ["oldPath": "History/Revision.md", "newPath": "History/Renamed.md"])
+        check(try ProcedureStore.load().first?.paths == ["History/Renamed.md"], "procedural references follow a renamed note")
+        let encodedHistory = try String(contentsOf: ProcedureStore.file, encoding: .utf8)
+        check(!encodedHistory.contains("PRIVATE NOTE CONTENT") && !encodedHistory.contains("Find notes about plants") && !encodedHistory.contains("Noted.") && !encodedHistory.contains("content"), "procedural schema excludes note contents, full prompts, responses and raw payloads")
+        check(model.clearProceduralHistory(), "procedural clearing succeeds independently")
+        check(try ProcedureStore.load().isEmpty && vault.read("History/Renamed.md") == "PRIVATE NOTE CONTENT" && !GlobalMemory.load().remembered.isEmpty, "clearing history preserves notes and Permanent Memory")
+        model.recordProcedure("read_file", arguments: ["path": "History/Renamed.md", "content": "NEVER STORE THIS"])
+        check(model.clearPermanentMemory(), "permanent clearing succeeds independently")
+        check(try ProcedureStore.load().count == 1 && GlobalMemory.load().packet.isEmpty, "clearing Permanent Memory preserves procedures")
+
+        // A directory at the destination makes the atomic write fail without touching real user storage.
+        try fm.createDirectory(at: GlobalMemory.file, withIntermediateDirectories: true)
+        model.memory.summary = "preserve on failure"
+        let blockedChat = model.memory.id
+        model.pinFromRequest("Save this to memory: Use concise answers.")
+        check(!model.resetChat() && model.memory.id == blockedChat && model.memory.summary == "preserve on failure" && !model.memory.pendingPermanentItems.isEmpty, "failed permanent promotion blocks reset before active context is erased")
+        try fm.removeItem(at: GlobalMemory.file)
+        check(model.resetChat() && GlobalMemory.load().remembered.contains("Use concise answers."), "retry stores pending Permanent Memory before resetting")
+        try fm.removeItem(at: ProcedureStore.file)
+        try fm.createDirectory(at: ProcedureStore.file, withIntermediateDirectories: true)
+        model.memory.summary = "keep after history failure"
+        model.recordProcedure("read_file", arguments: ["path": "History/Renamed.md"])
+        check(!model.resetChat() && model.memory.summary == "keep after history failure" && GlobalMemory.load().remembered.contains("Use concise answers."), "history failure keeps active state and cannot corrupt Permanent Memory")
+        try fm.removeItem(at: ProcedureStore.file)
+        check(model.resetChat() && (try? ProcedureStore.load().count) == 1, "history retry finalizes pending actions")
+        let seed = try ProcedureStore.load()[0]
+        var repeated = seed; repeated.id = UUID()
+        let duplicates = (0..<1500).map { _ -> ProcedureRecord in var value = repeated; value.id = UUID(); return value }
+        let collapsed = ProcedureStore.merge(duplicates, into: [])
+        check(collapsed.count == 1 && collapsed[0].repetitions == 1500, "repetitive actions are deduplicated")
+        let distinct = (0..<1500).map { index -> ProcedureRecord in var value = seed; value.id = UUID(); value.paths = ["file-\(index).md"]; return value }
+        check(ProcedureStore.merge(distinct, into: []).count == ProcedureStore.limit, "procedural retention is bounded for distinct actions")
+        let otherRoot = ProcedureRecord(chatID: UUID(), notesRoot: "different root", action: "read_file", paths: ["private.md"], description: "Read private.md")
+        check(ProcedureStore.retrieve([otherRoot], prompt: "What did Obby do yesterday?", root: root.path, current: model.memory.id).isEmpty, "retrieval does not cross notes folders")
+        _ = model.clearProceduralHistory(); _ = model.clearPermanentMemory(); _ = model.resetChat()
+        model.error = nil; model.requestOverride = nil
+
+        check(String(ChatMarkdown.paragraph("a\nb").characters) == "a\nb", "single paragraph newline renders literally")
+        check(ChatMarkdown.blocks("\n\na\n\n\n\nb\n\n").count == 2, "blank lines collapse and outer blank lines disappear")
+        if case .code(let code) = ChatMarkdown.blocks("```\na\n\n\n\nb\n```").first! {
+            check(code == "a\n\n\n\nb", "fenced code retains every newline")
+        } else { preconditionFailure("missing code block") }
+        var remembered = ChatRecord()
+        remembered.pinned = ["Pinned constraint"]
+        remembered.decisions = ["Decision to preserve"]
+        var longHistory: [[String: Any]] = [["role": "user", "content": "Use Early.md with 42 entries by May 2027. Don't rename the folder Archive.\n**Important phrase**\n" + String(repeating: "context ", count: 1500)]]
+        longHistory += (0..<39).map { _ in ["role": "assistant", "content": String(repeating: "ordinary prose ", count: 1500)] }
+        longHistory.append(["role": "user", "content": "Continue the note"])
+        _ = ContextBudget.fit(&longHistory, current: 40, fixed: 0, budget: 2000, beforeDropping: { remembered.captureKeyPoints($0) })
+        check(remembered.packet.contains("Early.md") && remembered.packet.contains("42") && remembered.packet.contains("Don't rename") && remembered.packet.contains("May 2027"), "forty long messages retain early filenames, dates, numbers and instructions in request memory")
+        check(remembered.packet.contains("Pinned constraint") && remembered.packet.contains("Decision to preserve"), "protected memory survives history compression")
+        remembered.captureKeyPoints([["role": "user", "content": "**Duplicate** **duplicate**"]])
+        check(remembered.keyPoints.filter { $0.lowercased() == "duplicate" }.count == 1, "key points deduplicate case-insensitively")
+        for index in 0..<40 { remembered.captureKeyPoints([["role": "assistant", "content": "**item \(index)**"]]) }
+        check(remembered.keyPoints.count == 30 && remembered.keyPoints.last == "item 39" && !remembered.keyPoints.contains("item 0"), "key points retain newest thirty")
+        check(ContextBudget.keyPoints([["role": "user", "content": "Hello there"], ["role": "assistant", "content": "Thanks, have a lovely day!"]]).isEmpty, "small talk creates no key points")
+        check(try JSONDecoder().decode(ChatRecord.self, from: JSONEncoder().encode(remembered)).keyPoints == remembered.keyPoints, "key points persist")
+        remembered.removeKeyPoint("item 39")
+        remembered.captureKeyPoints([["role": "assistant", "content": "**item 39**"]])
+        check(!remembered.keyPoints.contains("item 39"), "removed key points are not reintroduced by later compaction")
+        try vault.mkdir("Nested/Deep")
+        let attachmentSource = root.appendingPathComponent("source.pdf")
+        try Data("sample document".utf8).write(to: attachmentSource)
+        let imported = try vault.importAttachment(.file(attachmentSource), noteFolder: "Nested/Deep")
+        check(imported == "../../Attachments/source.pdf", "nested import points to root attachments")
+        check(try vault.importAttachment(.file(attachmentSource), noteFolder: "Nested/Deep") == "../../Attachments/source-2.pdf", "root imports are collision safe")
+        try vault.write("Nested/Deep/import.md", content: "[paper](\(imported))", create: true)
+        try vault.move("Nested/Deep/import.md", "import.md")
+        let movedAttachment = NoteLinks.links(in: try vault.read("import.md")).first!.destination
+        check(try vault.resolveAttachment(movedAttachment, inFolder: "").path == "Attachments/source.pdf", "moving a nested note preserves its root attachment")
+
         try vault.write("draft.md", content: "before", create: true)
         model.openNote("draft.md"); model.text = "unsaved changes"
         let movedRoot = root.appendingPathExtension("moved")

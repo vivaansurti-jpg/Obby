@@ -67,7 +67,12 @@ extension AppModel {
     func appendNotice(_ text: String, failed: Bool = false) {
         chat = ChatMemory.trimDisplay(chat + [ChatLine(role: "Action", text: text, unsuccessful: failed, notice: true)])
     }
-    func clearChat() {
+    @discardableResult func clearChat() -> Bool {
+        guard finalizeMemory() else { return false }
+        wipeActiveChat()
+        return true
+    }
+    private func wipeActiveChat() {
         memory = ChatRecord() // A new chat starts with fresh memory; saved chats stay on disk.
         contextUsage = nil; lastWorkPrompt = ""
         chatSession = UUID()
@@ -76,7 +81,7 @@ extension AppModel {
         directoryResults.removeAll(keepingCapacity: false)
         history.removeAll(keepingCapacity: false)
         chat.removeAll(keepingCapacity: false)
-        busy = false
+        busy = false; aiDraft = ""
     }
 }
 
@@ -159,9 +164,10 @@ enum ActionPresentation {
 // Keep tool-call/response pairing intact, but retire obsolete navigation payloads.
 enum NavigationContext {
     static let tools: Set<String> = ["list_directory", "search_notes"]
-    static func compact(_ messages: inout [[String: Any]]) {
+    static func compact(_ messages: inout [[String: Any]], beforeDropping: ([[String: Any]]) -> Void = { _ in }) {
         let results = messages.indices.filter { messages[$0]["role"] as? String == "tool" && tools.contains(messages[$0]["tool_name"] as? String ?? "") }
         for index in results.dropLast(2) {
+            beforeDropping([messages[index]])
             messages[index]["content"] = "Earlier navigation results omitted. Use paths already found; search narrowly if more information is needed."
         }
     }
@@ -180,10 +186,10 @@ enum NavigationContext {
 
 // MARK: Persistent chat memory
 // NOTES (.md files) are the user's data; CHAT MEMORY is this compact, Obby-managed task state; MODEL CONTEXT is the
-// temporary subset assembled for one request. Memory never copies note contents: files are remembered by path and
-// read from disk again when needed.
+// temporary subset assembled for one request. Active memory can contain compact excerpts; procedural history
+// contains only action metadata. Files are read from disk again when needed.
 
-/// One chat's memory, saved as Application Support/Obby/Chats/<id>.json. No API keys, no note contents.
+/// One chat's working context, saved as Application Support/Obby/Chats/<id>.json.
 struct ChatRecord: Codable, Identifiable, Equatable {
     struct Message: Codable, Equatable { var role: String; var content: String }
     var id = UUID()
@@ -191,6 +197,11 @@ struct ChatRecord: Codable, Identifiable, Equatable {
     var createdAt = Date()
     var updatedAt = Date()
     var notesRoot = "" // Chats are listed per notes folder, since their file paths are relative to it.
+    var pendingPermanentItems: [String] = []
+    var handledRememberRequests: [String] = []
+    var pendingProcedures: [ProcedureRecord] = []
+    var keyPoints: [String] = []
+    var removedKeyPoints: [String] = []
     var summary = ""
     var recentMessages: [Message] = []
     var relevantFiles: [String] = []
@@ -202,11 +213,11 @@ struct ChatRecord: Codable, Identifiable, Equatable {
     var pinned: [String] = [] // Facts the user pinned ("Pin to Memory", "Remember that…"). Never condensed away.
     var earlierActionCount = 0 // Completed actions older than the last 8, folded into a count.
     var missingSince: [String: Date] = [:] // When a remembered file was first found missing (dropped after 7 days).
-    var isEmpty: Bool { recentMessages.isEmpty && summary.isEmpty && pinned.isEmpty }
+    var isEmpty: Bool { recentMessages.isEmpty && summary.isEmpty && pinned.isEmpty && pendingPermanentItems.isEmpty && pendingProcedures.isEmpty }
     /// A chat with a real request (it has a title), a pin or completed work. Chats of only small talk are not saved.
-    var isWorthSaving: Bool { !title.isEmpty || !pinned.isEmpty || !completedActions.isEmpty || earlierActionCount > 0 }
+    var isWorthSaving: Bool { !pendingPermanentItems.isEmpty || !pendingProcedures.isEmpty || !title.isEmpty || !pinned.isEmpty || !completedActions.isEmpty || earlierActionCount > 0 }
     /// Structured memory items (for the small "Memory · N items" indicator).
-    var itemCount: Int { (currentGoal.isEmpty ? 0 : 1) + (summary.isEmpty ? 0 : 1) + pinned.count + decisions.count + completedActions.count + openQuestions.count + preferences.count + relevantFiles.count }
+    var itemCount: Int { (currentGoal.isEmpty ? 0 : 1) + (summary.isEmpty ? 0 : 1) + keyPoints.count + pinned.count + decisions.count + completedActions.count + openQuestions.count + preferences.count + relevantFiles.count }
     /// The compact memory sent with a request (only this chat's, never the whole store).
     var packet: String { packet(missing: []) }
     /// `missing`: remembered files that no longer exist (moved or deleted outside Obby), listed separately.
@@ -216,21 +227,33 @@ struct ChatRecord: Codable, Identifiable, Equatable {
         if !currentGoal.isEmpty { parts.append("Current goal: " + currentGoal) }
         if !summary.isEmpty { parts.append("Summary so far:\n" + summary) }
         func list(_ title: String, _ items: [String]) { if !items.isEmpty { parts.append(title + ":\n" + items.map { "- " + $0 }.joined(separator: "\n")) } }
+        list("Key points", keyPoints)
         list("Decisions", decisions)
-        list("Completed actions", completedActions)
-        if earlierActionCount > 0 { parts.append("(\(earlierActionCount) earlier action\(earlierActionCount == 1 ? "" : "s") not listed)") }
+
         list("Open questions and next steps", openQuestions)
         list("Preferences for this task", preferences)
         let present = relevantFiles.filter { !missing.contains($0) }
         if !present.isEmpty { parts.append("Relevant files (read them again if needed; they may have changed): " + present.joined(separator: ", ")) }
         let gone = relevantFiles.filter { missing.contains($0) }
         if !gone.isEmpty { parts.append("Files this task used that no longer exist (moved or deleted outside Obby): " + gone.joined(separator: ", ")) }
-        return parts.joined(separator: "\n\n")
+        return parts.isEmpty ? "" : "Active Chat Memory:\n" + parts.joined(separator: "\n\n")
+    }
+    mutating func captureKeyPoints(_ messages: [[String: Any]]) {
+        for item in ContextBudget.keyPoints(messages) {
+            guard !removedKeyPoints.contains(item.lowercased()) else { continue }
+            keyPoints.removeAll { $0.caseInsensitiveCompare(item) == .orderedSame }
+            keyPoints.append(item)
+        }
+        keyPoints = Array(keyPoints.suffix(30))
+    }
+    mutating func removeKeyPoint(_ item: String) {
+        keyPoints.removeAll { $0 == item }
+        if !removedKeyPoints.contains(item.lowercased()) { removedKeyPoints.append(item.lowercased()) }
     }
     mutating func pin(_ fact: String) {
         let text = fact.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !pinned.contains(text) else { return }
-        pinned.append(text); pinned = Array(pinned.suffix(20))
+        pinned.append(text)
     }
     mutating func remember(file: String) {
         guard !file.isEmpty else { return }
@@ -279,6 +302,11 @@ extension ChatRecord {
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
         notesRoot = try c.decodeIfPresent(String.self, forKey: .notesRoot) ?? ""
+        pendingPermanentItems = try c.decodeIfPresent([String].self, forKey: .pendingPermanentItems) ?? []
+        handledRememberRequests = try c.decodeIfPresent([String].self, forKey: .handledRememberRequests) ?? []
+        pendingProcedures = try c.decodeIfPresent([ProcedureRecord].self, forKey: .pendingProcedures) ?? []
+        removedKeyPoints = try c.decodeIfPresent([String].self, forKey: .removedKeyPoints) ?? []
+        keyPoints = Array((try c.decodeIfPresent([String].self, forKey: .keyPoints) ?? []).suffix(30))
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
         recentMessages = try c.decodeIfPresent([Message].self, forKey: .recentMessages) ?? []
         relevantFiles = try c.decodeIfPresent([String].self, forKey: .relevantFiles) ?? []
@@ -299,12 +327,14 @@ extension ChatRecord {
 /// Small global memory: only durable preferences the user explicitly stated as lasting ("from now on…").
 /// Saved as Application Support/Obby/Memory.json.
 struct GlobalMemory: Codable, Equatable {
+    var remembered: [String] = [] // Explicit cross-chat memories; separate from learned profile rules.
     var preferences: [String] = []
     var folders: [String: String] = [:] // Folder context, keyed "<notes root>|<folder path>".
     var aboutMe: [String] = [] // Facts the user stated about themselves ("I'm doing Biology HL"), newest last.
     init() {}
     init(from decoder: Decoder) throws { // Older Memory.json files may lack any of these.
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        remembered = try c.decodeIfPresent([String].self, forKey: .remembered) ?? []
         preferences = try c.decodeIfPresent([String].self, forKey: .preferences) ?? []
         folders = try c.decodeIfPresent([String: String].self, forKey: .folders) ?? [:]
         aboutMe = try c.decodeIfPresent([String].self, forKey: .aboutMe) ?? []
@@ -312,9 +342,10 @@ struct GlobalMemory: Codable, Equatable {
     /// Sent with every request (small talk too): who the user is, then their lasting preferences.
     var packet: String {
         var parts: [String] = []
+        if !remembered.isEmpty { parts.append("Explicit Permanent Memory:\n" + remembered.map { "- " + $0 }.joined(separator: "\n")) }
         if !aboutMe.isEmpty { parts.append("About the user:\n" + aboutMe.map { "- " + $0 }.joined(separator: "\n")) }
         if !preferences.isEmpty { parts.append("User preferences (apply to every task):\n" + preferences.map { "- " + $0 }.joined(separator: "\n")) }
-        return parts.joined(separator: "\n\n")
+        return parts.isEmpty ? "" : "Permanent Memory:\n" + parts.joined(separator: "\n\n")
     }
 
     // MARK: About me
@@ -426,7 +457,7 @@ extension AppModel {
         memory.notesRoot = vault?.root.path ?? ""
         memory.updatedAt = Date()
         guard rememberChats, !memory.isEmpty, !memory.notesRoot.isEmpty, memory.isWorthSaving else { return } // Small talk alone isn't saved.
-        ChatStore.save(memory)
+        if ChatStore.save(memory) { UserDefaults.standard.removeObject(forKey: "freshChat|" + memory.notesRoot) }
         reloadSavedChats()
     }
     func reloadSavedChats() {
@@ -435,8 +466,9 @@ extension AppModel {
     /// Returns to a saved chat: its memory and recent messages come back; notes are read from disk when needed.
     func openChat(_ record: ChatRecord) {
         guard !busy else { return }
-        clearChat()
+        guard clearChat() else { return }
         memory = record
+        UserDefaults.standard.removeObject(forKey: "freshChat|" + record.notesRoot)
         history = record.recentMessages.map { ["role": $0.role, "content": $0.content] }
         var lines = record.recentMessages.map { ChatLine(role: $0.role == "user" ? "You" : "Obby", text: $0.content) }
         if !record.summary.isEmpty { lines.insert(ChatLine(role: "Action", text: "Continuing “\(record.title)”. Earlier messages are kept as a short summary.", notice: true), at: 0) }
@@ -444,14 +476,15 @@ extension AppModel {
     }
     func restoreLatestChat() {
         reloadSavedChats()
+        if let root = vault?.root.path, UserDefaults.standard.bool(forKey: "freshChat|" + root) { return }
         if let latest = savedChats.first { openChat(latest) }
     }
     /// Settings: forget this chat's memory (starts a new chat). Notes and attachments are untouched.
-    func clearCurrentChatMemory() { guard ChatStore.delete(memory.id) else { return }; clearChat(); reloadSavedChats() }
+    func clearCurrentChatMemory() { _ = resetChat() }
     /// Settings: forget every remembered chat. Notes and attachments are untouched.
     func clearAllChatMemory() {
-        guard ChatStore.deleteAll(), MemoryStorage.perform("delete personal memory", { try MemoryStorage.remove(GlobalMemory.file) }) else { reloadSavedChats(); return }
-        globalMemory = GlobalMemory(); clearChat(); reloadSavedChats()
+        guard finalizeMemory(), ChatStore.deleteAll(), MemoryStorage.perform("delete personal memory", { try MemoryStorage.remove(GlobalMemory.file) }) else { reloadSavedChats(); return }
+        globalMemory = GlobalMemory(); wipeActiveChat(); reloadSavedChats()
     }
     func forgetGlobalPreference(_ item: String) { globalMemory.preferences.removeAll { $0 == item }; globalMemory.save() }
     /// Updates the task's structured memory, but only when it matters: after meaningful work (files changed, a
@@ -465,6 +498,7 @@ extension AppModel {
         let personal = learnAboutMe && GlobalMemory.statesPersonalFact(prompt) // "I'm doing Biology HL": worth learning, no extra request.
         guard compact || didWork || lasting || personal else { return }
         let older = compact ? Array(history.dropLast(8)) : [], recent = Array(history.suffix(compact ? 8 : 2))
+        memory.captureKeyPoints(older)
         func transcript(_ messages: [[String: Any]], limit: Int) -> String {
             String(messages.map { "\($0["role"] as? String ?? ""): \(ChatMemory.clipped($0["content"] as? String ?? "", limit: limit))" }
                 .joined(separator: "\n\n").suffix(max(budget * 2, 2_000)))
@@ -502,7 +536,7 @@ extension AppModel {
                 if (1...6).contains(words), title.count <= 60, !ToolRouting.isGreeting(title) { memory.title = title }
             }
             if let goal = json["currentGoal"] as? String, !goal.isEmpty { memory.currentGoal = ChatMemory.clipped(goal, limit: 240) }
-            if let decisions = items("decisions", 8) { memory.decisions = decisions }
+            if let decisions = items("decisions", 8) { for decision in decisions where !memory.decisions.contains(decision) { memory.decisions.append(decision) } }
             if let questions = items("openQuestions", 6) { memory.openQuestions = questions }
             if let preferences = items("preferences", 5) { memory.preferences = preferences }
             if let facts = items("aboutUser", 3), !facts.isEmpty { learnAboutUser(facts, statedIn: prompt) }
@@ -649,22 +683,10 @@ extension AppModel {
         appendNotice("Pinned to this task’s memory.")
         persistChat()
     }
-    /// "Remember that…" / "Remember: …" at the start of a request becomes a pinned fact, decided by Obby, not the model.
+    /// Explicit requests are queued before attempting disk persistence, so reset can safely retry.
     func pinFromRequest(_ prompt: String) {
-        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lowered = text.lowercased()
-        for lead in ["please remember that ", "remember that ", "please remember: ", "remember: ", "please remember ", "remember "] where lowered.hasPrefix(lead) {
-            let fact = String(text.dropFirst(lead.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard fact.count > 3, !fact.hasSuffix("?") else { return } // "Remember when…?" is a question, not a fact.
-            let lowerFact = fact.lowercased().replacingOccurrences(of: "’", with: "'")
-            if ["i ", "i'm ", "i am ", "i've ", "i'd "].contains(where: lowerFact.hasPrefix) { // About the user, not the task.
-                addAboutMe([fact.prefix(1).uppercased() + fact.dropFirst()])
-                return
-            }
-            memory.pin(ChatMemory.clipped(fact.prefix(1).uppercased() + fact.dropFirst(), limit: 300))
-            appendNotice("Pinned to this task’s memory.")
-            return
-        }
+        queuePermanentRequest(prompt)
+        if !memory.pendingPermanentItems.isEmpty, flushPermanentMemory() { appendNotice("Saved to Permanent Memory.") }
     }
     /// Everything memory contributes to a request: lasting preferences, folder context, then this task's memory with
     /// files that no longer exist marked as such.
@@ -727,6 +749,7 @@ extension AppModel {
     }
     /// A note or folder moved or renamed inside Obby: task memories (current and saved) and folder context follow it.
     func memoryDidMove(_ old: String, _ new: String) {
+        updateProcedureReferences(old, new)
         func moved(_ path: String) -> String { path == old ? new : path.hasPrefix(old + "/") ? new + path.dropFirst(old.count) : path }
         memory.relevantFiles = memory.relevantFiles.map(moved)
         if let root = vault?.root.path {
@@ -827,7 +850,7 @@ enum ToolRouting {
     }
     static func classify(_ prompt: String) -> Kind {
         let lowered = prompt.lowercased().replacingOccurrences(of: "’", with: "'")
-        if memoryPhrases.contains(where: lowered.contains) { return .memoryQuestion }
+        if ProcedureStore.isActivityQuestion(prompt) || memoryPhrases.contains(where: lowered.contains) { return .memoryQuestion }
         return isSmallTalk(prompt) ? .chat : .work
     }
     /// Words that point at notes or files; a short message without any of them (and no routing keywords) is small talk.
@@ -925,5 +948,201 @@ enum MemoryStorage {
     static func remove(_ url: URL) throws {
         do { try FileManager.default.removeItem(at: url) }
         catch let error as CocoaError where error.code == .fileNoSuchFile { return }
+    }
+}
+
+/// A schema that cannot contain prompts, responses, note bodies or raw tool arguments.
+struct ProcedureRecord: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var timestamp = Date()
+    var chatID: UUID
+    var notesRoot: String
+    var action: String
+    var paths: [String]
+    var section: String = ""
+    var description: String
+    var repetitions = 1
+}
+
+enum ProcedureStore {
+    static let limit = 1000
+    static var file: URL { ChatStore.root.appendingPathComponent("ProceduralHistory.json") }
+    static func load() throws -> [ProcedureRecord] {
+        guard FileManager.default.fileExists(atPath: file.path) else { return [] }
+        return try JSONDecoder().decode([ProcedureRecord].self, from: Data(contentsOf: file))
+    }
+    static func write(_ records: [ProcedureRecord]) throws {
+        try MemoryStorage.write(JSONEncoder().encode(Array(records.suffix(limit))), to: file)
+    }
+    static func merge(_ incoming: [ProcedureRecord], into existing: [ProcedureRecord]) -> [ProcedureRecord] {
+        var records = existing
+        for record in incoming {
+            if records.contains(where: { $0.id == record.id }) { continue } // Retry after an interrupted save.
+            if let last = records.last, last.chatID == record.chatID, last.notesRoot == record.notesRoot,
+               last.action == record.action, last.paths == record.paths, last.section == record.section,
+               record.timestamp.timeIntervalSince(last.timestamp) < 60 {
+                var combined = record
+                combined.repetitions += last.repetitions
+                records[records.count - 1] = combined
+            } else { records.append(record) }
+        }
+        return Array(records.suffix(limit))
+    }
+    static func isActivityQuestion(_ prompt: String) -> Bool {
+        let text = prompt.lowercased().replacingOccurrences(of: "’", with: "'")
+        return ["what happened", "what did obby do", "what did you do", "what did we do", "which files did", "what files did",
+                "did you already", "previous session", "previous chat", "past activity", "procedural history", "activity history"].contains(where: text.contains)
+    }
+    static func retrieve(_ records: [ProcedureRecord], prompt: String, root: String, current: UUID, now: Date = Date()) -> [ProcedureRecord] {
+        var candidates = records.filter { $0.notesRoot == root }
+        let text = prompt.lowercased()
+        if text.contains("yesterday") {
+            let start = Calendar.current.startOfDay(for: now)
+            let previous = Calendar.current.date(byAdding: .day, value: -1, to: start)!
+            candidates = candidates.filter { $0.timestamp >= previous && $0.timestamp < start }
+        } else if text.contains("today") { candidates = candidates.filter { Calendar.current.isDate($0.timestamp, inSameDayAs: now) } }
+        let generic: Set<String> = ["what", "happened", "that", "chat", "task", "session", "show", "happen", "happens", "previous", "history", "procedural", "activity", "yesterday", "today", "which", "files", "file", "note", "notes", "already", "change", "changed", "move", "moved", "create", "created", "rename", "renamed", "obby", "did", "you", "the", "and", "with", "have", "done", "were", "when", "please"]
+        let terms = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count > 2 && !generic.contains($0) }
+        if !terms.isEmpty {
+            candidates = candidates.filter { record in
+                let searchable = (record.paths.joined(separator: " ") + " " + record.section + " " + record.chatID.uuidString).lowercased()
+                return terms.contains(where: searchable.contains)
+            }
+        }
+        if text.contains("which files") || text.contains("what files") {
+            candidates = candidates.filter { !["read_file", "read_section", "read_attachment"].contains($0.action) }
+        }
+        if text.contains("previous") || text.contains("that chat") || text.contains("that task") {
+            if let last = candidates.last(where: { $0.chatID != current }) { candidates = candidates.filter { $0.chatID == last.chatID } }
+            else { candidates = [] }
+        }
+        return Array(candidates.suffix(20))
+    }
+}
+
+extension AppModel {
+    static func explicitMemory(_ request: String) -> String? {
+        let text = request.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = text.lowercased()
+        guard !lower.hasSuffix("?"), !lower.hasPrefix("remember when") else { return nil }
+        for lead in ["please remember that ", "remember that ", "remember this: ", "remember this ", "remember: ", "please remember ", "remember ",
+                     "save this to memory: ", "save this to memory ", "keep this for future chats: ", "keep this for future chats ", "remember permanently: "] {
+            if lower.hasPrefix(lead) { return String(text.dropFirst(lead.count)).trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+        if ["remember this", "save this to memory", "keep this for future chats"].contains(lower.trimmingCharacters(in: CharacterSet(charactersIn: ".!"))) { return "" }
+        return nil
+    }
+    func queuePermanentRequest(_ request: String) {
+        guard !memory.handledRememberRequests.contains(request), var fact = Self.explicitMemory(request) else { return }
+        if fact == "this" || fact.isEmpty {
+            fact = chat.last(where: { !$0.notice && $0.role != "Action" && $0.text != request })?.text ?? ""
+        }
+        // An unresolved reference remains pending and blocks reset until the user clarifies/removes it.
+        if !memory.pendingPermanentItems.contains(fact) { memory.pendingPermanentItems.append(fact) }
+        memory.handledRememberRequests.append(request)
+    }
+    @discardableResult func flushPermanentMemory() -> Bool {
+        guard !memory.pendingPermanentItems.isEmpty else { return true }
+        var updated = globalMemory
+        for fact in memory.pendingPermanentItems {
+            guard !fact.isEmpty, fact.count <= 500 else {
+                error = "Permanent Memory could not be saved. Edit the pending item to a specific fact of at most 500 characters. The chat has been kept."
+                return false
+            }
+            guard !GlobalMemory.isSensitive(fact) else {
+                error = "Permanent Memory could not be saved because a pending item contains sensitive information. Remove or edit it in Active Chat Memory. The chat has been kept."
+                return false
+            }
+            if !updated.remembered.contains(where: { $0.caseInsensitiveCompare(fact) == .orderedSame }) { updated.remembered.append(fact) }
+        }
+        guard updated.remembered.count <= 100 else { error = "Permanent Memory is full. Remove an item before resetting this chat."; return false }
+        guard updated.save() else { error = "Permanent Memory could not be saved. The chat has been kept; retry when storage is available."; return false }
+        globalMemory = updated
+        memory.pendingPermanentItems.removeAll()
+        return true
+    }
+    @discardableResult func flushProcedures() -> Bool {
+        guard !memory.pendingProcedures.isEmpty else { return true }
+        do {
+            try ProcedureStore.write(ProcedureStore.merge(memory.pendingProcedures, into: ProcedureStore.load()))
+            memory.pendingProcedures.removeAll()
+            return true
+        } catch {
+            self.error = "Procedural History could not be saved. The completed actions and chat have been kept for retry. " + error.localizedDescription
+            return false
+        }
+    }
+    @discardableResult func finalizeMemory() -> Bool {
+        let hadPending = !memory.pendingPermanentItems.isEmpty || !memory.pendingProcedures.isEmpty
+        // Also handles explicitly requested memories in a restored legacy chat.
+        let requests = history.filter { $0["role"] as? String == "user" }.compactMap { $0["content"] as? String }
+            + chat.filter { $0.role == "You" }.map(\.text)
+        for request in requests { queuePermanentRequest(request) }
+        guard flushPermanentMemory() else { persistChat(); return false }
+        guard flushProcedures() else { persistChat(); return false }
+        if hadPending { persistChat() }
+        return true
+    }
+    /// User-visible reset: commit both durable layers before deleting this chat's working state.
+    @discardableResult func resetChat() -> Bool {
+        guard finalizeMemory() else { return false }
+        guard ChatStore.delete(memory.id) else { error = "The saved Active Chat Memory could not be removed. The chat has been kept."; return false }
+        if let root = vault?.root.path { UserDefaults.standard.set(true, forKey: "freshChat|" + root) }
+        wipeActiveChat()
+        reloadSavedChats()
+        return true
+    }
+    @discardableResult func clearPermanentMemory() -> Bool {
+        guard MemoryStorage.perform("clear Permanent Memory", { try MemoryStorage.remove(GlobalMemory.file) }) else { return false }
+        globalMemory = GlobalMemory()
+        // Explicitly clearing permanent memory also dismisses pending promotions, preventing resurrection on reset.
+        memory.pendingPermanentItems.removeAll()
+        for message in history where message["role"] as? String == "user" {
+            if let text = message["content"] as? String, Self.explicitMemory(text) != nil, !memory.handledRememberRequests.contains(text) { memory.handledRememberRequests.append(text) }
+        }
+        persistChat()
+        return true
+    }
+    @discardableResult func clearProceduralHistory() -> Bool {
+        guard MemoryStorage.perform("clear Procedural History", { try MemoryStorage.remove(ProcedureStore.file) }) else { return false }
+        memory.pendingProcedures.removeAll()
+        persistChat()
+        return true
+    }
+    func recordProcedure(_ action: String, arguments: [String: Any]) {
+        let supported = ToolRouting.changing.union(["read_file", "read_section", "read_attachment", "undo", "generate_summarise", "generate_flashcards", "generate_quiz", "generate_outline", "generate_revisionNotes"])
+        guard supported.contains(action), let vault else { return }
+        let paths = ["path", "oldPath", "newPath"].compactMap { arguments[$0] as? String }.filter { !$0.isEmpty }.map { String($0.prefix(500)) }
+        guard !paths.isEmpty else { return }
+        let section = String((arguments["heading"] as? String ?? "").prefix(100))
+        var safe: [String: Any] = [:]
+        for key in ["path", "oldPath", "newPath"] { if let path = arguments[key] as? String { safe[key] = String(path.prefix(500)) } }
+        safe["heading"] = section
+        let generated = ["generate_summarise": "summary", "generate_flashcards": "flashcards", "generate_quiz": "quiz", "generate_outline": "outline", "generate_revisionNotes": "revision notes"]
+        let description = generated[action].map { "Generated \($0) from \(paths[0])." } ?? (action == "undo" ? "Undid the change to \(paths[0])." : ActionPresentation.summary(action, arguments: safe, result: "", failed: false))
+        let record = ProcedureRecord(chatID: memory.id, notesRoot: vault.root.path, action: action, paths: paths, section: section, description: description)
+        memory.pendingProcedures = ProcedureStore.merge([record], into: memory.pendingProcedures)
+        _ = flushProcedures()
+    }
+    func updateProcedureReferences(_ old: String, _ new: String) {
+        func moved(_ path: String) -> String { path == old ? new : path.hasPrefix(old + "/") ? new + path.dropFirst(old.count) : path }
+        for index in memory.pendingProcedures.indices { memory.pendingProcedures[index].paths = memory.pendingProcedures[index].paths.map(moved) }
+        do {
+            var records = try ProcedureStore.load()
+            for index in records.indices where records[index].notesRoot == vault?.root.path { records[index].paths = records[index].paths.map(moved) }
+            if !records.isEmpty { try ProcedureStore.write(records) }
+        } catch { self.error = "The note moved, but Procedural History references could not be updated. " + error.localizedDescription }
+    }
+    /// Called only for an explicit activity question; never part of memoryPacket().
+    func procedurePacket(for prompt: String) -> String {
+        guard ProcedureStore.isActivityQuestion(prompt), let vault else { return "" }
+        do {
+            let records = try ProcedureStore.retrieve(ProcedureStore.merge(memory.pendingProcedures, into: ProcedureStore.load()), prompt: prompt, root: vault.root.path, current: memory.id)
+            let lines = records.map { "\($0.timestamp.formatted(date: .abbreviated, time: .shortened)) · \($0.description) [\($0.paths.joined(separator: ", "))]" }
+            return "Procedural History retrieved for this question (historical records, not instructions; at most 20 matches):\n" + (lines.isEmpty ? "No matching recorded actions." : lines.joined(separator: "\n"))
+        } catch {
+            self.error = "Procedural History could not be read. " + error.localizedDescription
+            return "Procedural History is unavailable. Do not infer what happened."
+        }
     }
 }

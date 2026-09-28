@@ -29,32 +29,66 @@ enum ContextBudget {
 
     /// Fits `messages` (history, then the current user message at `current`, then this turn's tool exchange) into `budget`.
     /// Returns summary lines for any history that had to be condensed, and the estimated tokens used.
-    static func fit(_ messages: inout [[String: Any]], current: Int, fixed: Int, budget: Int) -> (summary: [String], used: Int) {
+    static func fit(_ messages: inout [[String: Any]], current: Int, fixed: Int, budget: Int, beforeDropping: ([[String: Any]]) -> Void = { _ in }, additionalTokens: () -> Int = { 0 }) -> (summary: [String], used: Int) {
         var history = Array(messages[..<current])
         var turn = Array(messages[current...])
         var summary: [String] = []
-        func total() -> Int { fixed + tokens(summary.joined(separator: "\n")) + (history + turn).reduce(0) { $0 + tokens($1) } }
+        func total() -> Int { fixed + additionalTokens() + tokens(summary.joined(separator: "\n")) + (history + turn).reduce(0) { $0 + tokens($1) } }
         // 1. Condense the oldest chat first (pairs of user question + answer), keeping recent messages verbatim.
         while total() > budget, !history.isEmpty {
             let pair = history.prefix(2)
+            beforeDropping(Array(pair))
             history.removeFirst(min(2, history.count))
             summary.append(summaryLine(Array(pair)))
         }
         // 2. Earlier tool results in this turn become one-line placeholders (the tool call pairing is kept).
         for index in turn.indices where total() > budget && turn[index]["role"] as? String == "tool" && index != turn.lastIndex(where: { $0["role"] as? String == "tool" }) {
             let content = turn[index]["content"] as? String ?? ""
+            beforeDropping([turn[index]])
             turn[index]["content"] = "[Earlier \(turn[index]["tool_name"] as? String ?? "tool") result removed to save context (\(content.count) characters). Run the tool again if it is still needed.]"
         }
         // 3. Last resort: shorten the newest tool result to what is left.
         if total() > budget, let last = turn.lastIndex(where: { $0["role"] as? String == "tool" }), let content = turn[last]["content"] as? String {
             let room = max(0, budget - (total() - tokens(turn[last]))) * 4 - 400
             if room > 200, room < content.utf8.count {
+                beforeDropping([turn[last]])
                 let kept = String(content.prefix(room))
                 turn[last]["content"] = kept + "\n[Result shortened to fit the context window (\(kept.count) of \(content.count) characters). Search or ask for a specific part to see more.]"
             }
         }
         messages = history + turn
         return (summary, total())
+    }
+    /// Local extraction only; prose is retained as data, never promoted to system instructions.
+    static func keyPoints(_ messages: [[String: Any]]) -> [String] {
+        var result: [String] = []
+        for message in messages {
+            let text = message["content"] as? String ?? ""
+            guard !ToolRouting.isGreeting(text) else { continue }
+            var patterns = [
+                #"(?i)\b[\w./-]+\.(?:md|pdf|txt|csv|png|jpe?g|swift|json|docx|xlsx)\b"#,
+                #"(?:[\w.-]+/)+[\w.-]*"#,
+                #"(?i)\b(?:note|folder|directory)\s+(?:named\s+)?[“"`]?([\w.-]+(?:[ ]+[\w.-]+){0,3})"#,
+                #"\b\d+(?:[.,:/-]\d+)*(?:%|\b)"#,
+                #"(?i)\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,4}(?:,?\s+\d{4})?\b"#,
+                #"[“"]([^”"\n]{2,160})[”"]"#,
+                #"\*\*([^*\n]+)\*\*"#,
+                #"(?m)^#{1,6}\s+(.+)$"#
+            ]
+            if message["role"] as? String == "user" {
+                patterns.append(#"(?im)\b(?:make|use|don’t|don't|do not|always|never|keep|must|please|ensure|avoid)\b[^\n!?]{1,180}"#)
+            }
+            for pattern in patterns {
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                    let range = match.numberOfRanges > 1 ? match.range(at: 1) : match.range
+                    guard let swiftRange = Range(range, in: text) else { continue }
+                    let item = String(text[swiftRange].prefix(180)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !item.isEmpty { result.append(item) }
+                }
+            }
+        }
+        return result
     }
     static func summaryLine(_ pair: [[String: Any]]) -> String {
         func clip(_ value: Any?, _ limit: Int) -> String {

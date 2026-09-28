@@ -225,7 +225,7 @@ extension Vault {
     static let maxAttachmentBytes = 500_000_000
     static func isImage(_ ext: String) -> Bool { imageExtensions.contains(ext) && UTType(filenameExtension: ext)?.conforms(to: .image) == true }
     /// The one import path for images and documents (drop, paste, toolbar): copies the file into
-    /// `<noteFolder>/Attachments/` inside the vault and returns its note-relative path ("Attachments/name.ext").
+    /// the root `Attachments/` folder and returns its path relative to the note.
     /// Bytes are copied (never linked or referenced in place); existing files are never overwritten.
     func importAttachment(_ source: AttachmentSource, noteFolder: String) throws -> String {
         let ext: String, base: String, write: (URL) throws -> Void, expected: Int?
@@ -257,7 +257,8 @@ extension Vault {
             write = { try bytes.write(to: $0, options: .withoutOverwriting) }
             expected = bytes.count
         }
-        let folder = noteFolder.isEmpty ? "Attachments" : noteFolder + "/Attachments"
+        _ = try resolve(noteFolder, allowRoot: true)
+        let folder = "Attachments"
         try mkdir(folder) // Through resolve(): stays inside the vault and refuses a symlinked Attachments folder.
         // Copy into a temporary file first and check it, then move it to a free name. The Markdown link is only
         // inserted after this returns, and an existing attachment is never overwritten.
@@ -276,7 +277,7 @@ extension Vault {
             catch let error as CocoaError where error.code == .fileWriteFileExists { continue }
             catch { throw Self.saveError(name, error) }
             guard fm.fileExists(atPath: target.path) else { throw ObbyError("The file couldn’t be added.") }
-            return "Attachments/" + name
+            return String(repeating: "../", count: noteFolder.split(separator: "/").count) + "Attachments/" + name
         }
         throw ObbyError("Too many attachments with that name.")
     }

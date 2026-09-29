@@ -117,6 +117,7 @@ enum ActionPresentation {
         case "read_file", "read_attachment": return "Read \(name(arg("path")))."
         case "list_directory": return "Checked the \(name(arg("path"))) folder."
         case "search_notes": return "Searched your notes for “\(arg("query"))”."
+        case "get_links": return arg("path").hasPrefix("#") ? "Listed notes tagged \(arg("path"))." : "Checked the links of \(name(arg("path")))."
         case "rename_path": return "Renamed \(name(arg("oldPath"))) to \(name(arg("newPath")))."
         case "move_path":
             let parent = arg("newPath").split(separator: "/").dropLast().joined(separator: "/")
@@ -154,7 +155,7 @@ enum ActionPresentation {
         }.joined(separator: "\n")
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    static let toolNames: Set<String> = ["list_directory", "read_file", "read_attachment", "append_to_file", "read_section", "replace_section", "append_to_section", "replace_text", "write_file", "create_file", "create_directory", "rename_path", "move_path", "delete_path", "search_notes"]
+    static let toolNames: Set<String> = ["list_directory", "read_file", "read_attachment", "append_to_file", "read_section", "replace_section", "append_to_section", "replace_text", "write_file", "create_file", "create_directory", "rename_path", "move_path", "delete_path", "search_notes", "get_links"]
     /// True only for the shapes of tool calls: {"tool_calls": …}, {"name": <Obby tool>, "arguments": …}, {"function": {…}}.
     static func isToolEnvelope(_ json: Any) -> Bool {
         if let array = json as? [Any] { return !array.isEmpty && array.allSatisfy(isToolEnvelope) }
@@ -567,7 +568,7 @@ extension AppModel {
 /// ordinary JSON, code and unknown names stay text. Execution still goes through Obby's sandboxed tool layer.
 enum TextToolCall {
     static let required: [String: [String]] = [
-        "list_directory": ["path"], "read_file": ["path"], "read_attachment": ["path"], "search_notes": ["query"],
+        "list_directory": ["path"], "read_file": ["path"], "read_attachment": ["path"], "search_notes": ["query"], "get_links": ["path"],
         "write_file": ["path", "content"], "append_to_file": ["path", "content"], "create_file": ["path", "content"],
         "read_section": ["path", "heading"], "replace_section": ["path", "heading", "content"], "append_to_section": ["path", "heading", "content"], "replace_text": ["path", "find", "replace"],
         "create_directory": ["path"], "rename_path": ["oldPath", "newPath"], "move_path": ["oldPath", "newPath"], "delete_path": ["path"]]
@@ -910,6 +911,8 @@ enum ToolRouting {
         if mentions(["attach", "attached", "attachment", "pdf", "document", "image", "photo", "screenshot", "csv", "scan", "picture"]) || (hasAttachments && mentions(["file", "paper", "reading", "article"])) {
             chosen.insert("read_attachment")
         }
+        if mentions(["link", "links", "linked", "backlink", "backlinks", "tag", "tags", "tagged", "connected", "connects"]) || lowered.contains("[[")
+            || lowered.range(of: "(^|\\s)#[\\p{L}_]", options: .regularExpression) != nil { chosen.insert("get_links") }
         if mentions(["find", "search", "where", "which", "look", "list", "show", "notes", "note", "read", "summar", "explain", "what", "why", "how", "quiz", "flashcard", "compare", "about"]) {
             chosen.formUnion(reading)
         }

@@ -33,3 +33,6 @@ xcuserdata/
 
 # Release packages
 *.dmg
+
+# Private planning reports
+OBSIDIAN_VAULT_ASSESSMENT.md

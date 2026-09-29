@@ -350,11 +350,17 @@ import CoreServices
             if note == target { backlinks = found }
         }
     }
-    nonisolated static func findBacklinks(to target: String, in vault: Vault) -> [String] {
+    nonisolated static func notePaths(in vault: Vault) -> [String] {
         func flatten(_ entries: [Entry]) -> [String] { entries.flatMap { $0.isDirectory ? flatten($0.children ?? []) : [$0.path] } }
-        let notes = flatten((try? vault.tree()) ?? []).filter { $0.lowercased().hasSuffix(".md") && $0 != target }
-        return notes.prefix(3000).filter { source in
-            guard let text = try? vault.read(source), text.contains("](") else { return false }
+        return flatten((try? vault.tree()) ?? []).filter { $0.lowercased().hasSuffix(".md") }
+    }
+    /// Notes whose Markdown links or [[wikilinks]] point at `target`.
+    nonisolated static func findBacklinks(to target: String, in vault: Vault) -> [String] {
+        let files = notePaths(in: vault)
+        return files.filter { $0 != target }.prefix(3000).filter { source in
+            guard let text = try? vault.read(source) else { return false }
+            if text.contains("[["), WikiLinks.links(in: text).contains(where: { WikiLinks.resolve($0.target, from: source, in: files) == target }) { return true }
+            guard text.contains("](") else { return false }
             let folder = (source as NSString).deletingLastPathComponent
             return NoteLinks.links(in: text).contains { link in
                 guard !link.isImage else { return false }
@@ -498,7 +504,18 @@ import CoreServices
         return try vault.resolveAttachment(link, inFolder: noteFolder)
     }
     /// Clicked link in the editor: a note opens in Obby; any other file opens in its default macOS app.
+    /// A clicked `#tag` searches for it; a clicked `[[wikilink]]` opens its note (or attachment).
     func openLink(_ destination: String) {
+        if destination.hasPrefix("#") { query = destination; return }
+        if destination.hasPrefix("[["), destination.hasSuffix("]]"), let vault {
+            let name = String(destination.dropFirst(2).dropLast(2))
+            if let path = WikiLinks.resolve(name, from: note ?? "", in: Self.notePaths(in: vault)) { openNote(path); return }
+            if !(name as NSString).pathExtension.isEmpty,
+               let found = (try? resolveAttachment(name)) ?? (try? vault.resolveAttachment("Attachments/" + (name as NSString).lastPathComponent, inFolder: "")) {
+                NSWorkspace.shared.open(found.url); return
+            }
+            error = "There is no note named “\(name)” yet."; return
+        }
         guard NoteLinks.target(destination) != nil else { return }
         do {
             let found = try resolveAttachment(destination)

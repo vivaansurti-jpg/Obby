@@ -73,7 +73,8 @@ extension AppModel {
             ("rename_path", "Rename a note or folder. Write a slash inside a title as \"／\".", ["oldPath", "newPath"]),
             ("move_path", "Move a note or folder to a new relative path.", ["oldPath", "newPath"]),
             ("delete_path", "Move a note or folder to Trash after the user confirms.", ["path"]),
-            ("search_notes", "Find notes by name or content at any depth; returns paths only. Optional path limits it to a folder; optional offset pages results.", ["query"])]
+            ("search_notes", "Find notes by name or content at any depth; returns paths only. Optional path limits it to a folder; optional offset pages results.", ["query"]),
+            ("get_links", "List a note's links, the notes linking to it and its #tags. Pass a #tag instead (e.g. #biology) to list the notes that use it.", ["path"])]
         return specs.map { name, description, args in
             var properties: [String: Any] = Dictionary(uniqueKeysWithValues: args.map { ($0, ["type": "string"]) })
             if NavigationContext.tools.contains(name) { properties["offset"] = ["type": "integer", "minimum": 0] }
@@ -93,6 +94,27 @@ extension AppModel {
         guard notes.count == 1 else { return nil }
         let candidate = folder + "/" + notes[0]
         return (try? vault.read(candidate)) != nil ? candidate : nil
+    }
+    /// get_links: outgoing links, backlinks and tags of one note, or the notes that use one #tag. Paths only.
+    func linkReport(_ path: String, vault: Vault) -> String {
+        let files = Self.notePaths(in: vault)
+        func list(_ items: [String]) -> String { items.isEmpty ? "- none" : items.prefix(50).map { "- " + $0 }.joined(separator: "\n") + (items.count > 50 ? "\n- …and \(items.count - 50) more" : "") }
+        if path.hasPrefix("#") {
+            let tag = String(path.drop { $0 == "#" })
+            let tagged = files.prefix(3000).filter { WikiLinks.uses(tag, in: (try? vault.read($0)) ?? "") }
+            return "Notes tagged #\(tag):\n" + list(Array(tagged))
+        }
+        guard let text = try? vault.read(path) else { return "Error: Couldn’t read \(path). Find the path with search_notes first." }
+        let folder = (path as NSString).deletingLastPathComponent
+        var outgoing: [String] = []
+        for link in WikiLinks.links(in: text) { outgoing.append(WikiLinks.resolve(link.target, from: path, in: files) ?? link.target + " (no such note yet)") }
+        for link in NoteLinks.links(in: text) where !link.isImage {
+            if let target = try? vault.linkPath(link.destination, inFolder: folder), target.lowercased().hasSuffix(".md") { outgoing.append(target) }
+        }
+        var seen = Set<String>(); outgoing = outgoing.filter { seen.insert($0).inserted }
+        var tagSeen = Set<String>()
+        let tags = WikiLinks.tags(in: text).map { "#" + $0.name }.filter { tagSeen.insert($0.lowercased()).inserted }
+        return "Links from \(path):\n" + list(outgoing) + "\nLinked from:\n" + list(Self.findBacklinks(to: path, in: vault)) + "\nTags: " + (tags.isEmpty ? "none" : tags.joined(separator: " "))
     }
     static let folderNoteTools: Set<String> = ["read_file", "read_section", "write_file", "append_to_file", "replace_section", "append_to_section", "replace_text"]
     func executeTool(_ name: String, arguments original: [String: Any]) throws -> String {
@@ -129,6 +151,7 @@ extension AppModel {
             let path = try arg("path")
             return try MarkdownSections.read(vault.read(path), heading: arg("heading"), note: (path as NSString).lastPathComponent)
         case "read_attachment": return try vault.attachmentText(vault.resolveAttachment(toolAttachmentLink(arg("path")), inFolder: requestNoteFolder ?? noteFolder).path)
+        case "get_links": return try linkReport(arg("path"), vault: vault)
         case "search_notes":
             let offset = max(0, arguments["offset"] as? Int ?? 0)
             return try NavigationContext.page(vault.searchPage(arg("query"), folder: arguments["path"] as? String ?? "", offset: offset, limit: 51), offset: offset)
@@ -462,8 +485,8 @@ extension AppModel {
                             for key in ["path", "oldPath", "newPath"] { if let path = call.arguments[key] as? String { touched.insert(path) } }
                         }
                         if !failed { // Remember files by path and completed changes; never their contents.
-                            for key in ["path", "newPath"] { if let path = call.arguments[key] as? String, call.name != "search_notes", call.name != "list_directory" { memory.remember(file: readsAttachment(call) ? ((try? vault?.resolveAttachment(toolAttachmentLink(path), inFolder: requestNoteFolder ?? noteFolder).path) ?? path) : path) } }
-                            if !["read_file", "read_section", "read_attachment", "list_directory", "search_notes"].contains(call.name) {
+                            for key in ["path", "newPath"] { if let path = call.arguments[key] as? String, call.name != "search_notes", call.name != "list_directory", call.name != "get_links" { memory.remember(file: readsAttachment(call) ? ((try? vault?.resolveAttachment(toolAttachmentLink(path), inFolder: requestNoteFolder ?? noteFolder).path) ?? path) : path) } }
+                            if !["read_file", "read_section", "read_attachment", "list_directory", "search_notes", "get_links"].contains(call.name) {
                                 let summary = ActionPresentation.summary(call.name, arguments: call.arguments, result: result, failed: false)
                                 memory.remember(action: summary); done.append(summary)
                             }

@@ -346,8 +346,11 @@ final class PlainTextView: NSTextView {
         guard index < text.length else { return nil }
         let glyphs = layout.glyphRange(forCharacterRange: NSRange(location: index, length: 1), actualCharacterRange: nil)
         guard layout.boundingRect(forGlyphRange: glyphs, in: container).contains(local) else { return nil }
-        return NoteLinks.links(in: string, range: text.lineRange(for: NSRange(location: index, length: 0)))
-            .first { NSLocationInRange(index, $0.titleRange) && NoteLinks.target($0.destination) != nil }?.destination
+        if let markdown = NoteLinks.links(in: string, range: text.lineRange(for: NSRange(location: index, length: 0)))
+            .first(where: { NSLocationInRange(index, $0.titleRange) && NoteLinks.target($0.destination) != nil }) { return markdown.destination }
+        if let wiki = WikiLinks.links(in: string).first(where: { NSLocationInRange(index, $0.range) }) { return "[[" + wiki.target + "]]" }
+        if let tag = WikiLinks.tags(in: string).first(where: { NSLocationInRange(index, $0.range) }) { return "#" + tag.name }
+        return nil
     }
     /// Inserts Markdown as its own block at the selection, with blank lines around it.
     func insertBlock(_ markdown: String) {

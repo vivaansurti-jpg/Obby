@@ -792,7 +792,7 @@ Earlier in this chat (condensed):
         check(AppModel.toolSystemPrompt(isLocal: false, note: nil, folder: "").contains("Current note: none. Selected folder: /."), "prompt preserves empty note and root folder interpolation")
         check(promptSource.contains("Procedural History below lists actions actually completed. Use it; never claim nothing happened if it lists actions."), "memory questions ground answers in completed history")
         let toolDescriptions = model.toolDefinitions.compactMap { ($0["function"] as? [String: Any])?["description"] as? String }
-        check(toolDescriptions.count == 15 && toolDescriptions.allSatisfy { $0.count <= 170 }, "tool descriptions kept short")
+        check(toolDescriptions.count == 16 && toolDescriptions.allSatisfy { $0.count <= 170 }, "tool descriptions kept short")
 
         // Memory cleanup: finished next steps drop, old actions fold into a count, long-missing files expire, pins stay.
         model.clearChat()
@@ -1007,6 +1007,32 @@ Earlier in this chat (condensed):
         check((try? vault.read("TaskUndo/keep.md")) == "Original" && (try? vault.read("TaskUndo/new.md")) == nil && (try? vault.read("TaskUndo/moved.md")) == nil, "Undo task restores edits, moves back and removes created notes")
         try vault.write("TaskUndo/linker.md", content: "See [the note](keep.md) and [web](https://example.com)", create: true)
         check(AppModel.findBacklinks(to: "TaskUndo/keep.md", in: vault) == ["TaskUndo/linker.md"] && AppModel.findBacklinks(to: "TaskUndo/linker.md", in: vault).isEmpty, "Linked from finds notes that link here")
+
+        // [[Wikilinks]] and #tags (Obsidian-compatible; parsing only, the file is never reformatted)
+        let wikiFiles = ["A/Cells.md", "B/Cells.md", "B/Plants.md", "Top.md"]
+        check(WikiLinks.resolve("Cells", from: "B/Plants.md", in: wikiFiles) == "B/Cells.md" && WikiLinks.resolve("cells", from: "Top.md", in: wikiFiles) == "A/Cells.md", "wikilink prefers the same folder, then the shortest path, ignoring case")
+        check(WikiLinks.resolve("A/Cells", from: "B/Plants.md", in: wikiFiles) == "A/Cells.md" && WikiLinks.resolve("Missing", from: "Top.md", in: wikiFiles) == nil && WikiLinks.resolve("../Top", from: "B/Plants.md", in: wikiFiles) == nil, "wikilink paths resolve from the root; missing and parent paths do not")
+        let wikiText = "See [[Cells|the cell note]] and [[Top#Intro]] and ![[Plants]].\n`[[Code]]`\n```\n[[Fenced]] #fenced\n```\n#biology #School/IB, not a#tag, [x](page.md#anchor), # Heading, #123"
+        check(WikiLinks.links(in: wikiText).map(\.target) == ["Cells", "Top", "Plants"] && WikiLinks.links(in: wikiText).last?.isEmbed == true, "wikilinks parse aliases, headings and embeds but skip code")
+        check(WikiLinks.tags(in: wikiText).map(\.name) == ["biology", "School/IB"], "tags skip code, links, headings, numbers and mid-word #")
+        check(WikiLinks.uses("school", in: wikiText) && WikiLinks.uses("#Biology", in: wikiText) && !WikiLinks.uses("bio", in: wikiText), "tag lookup matches nested tags and ignores case")
+        check(WikiLinks.tags(in: "---\ntags: x\ncolor: #fff\n---\n#real").map(\.name) == ["real"], "frontmatter is not scanned for inline tags")
+        try vault.mkdir("Wiki/Sub")
+        try vault.write("Wiki/Target.md", content: "Target #wiki", create: true)
+        try vault.write("Wiki/Sub/Linker.md", content: "Before [[Target|alias]] and [[Target#Part]] after", create: true)
+        check(AppModel.findBacklinks(to: "Wiki/Target.md", in: vault) == ["Wiki/Sub/Linker.md"], "Linked from includes [[wikilinks]]")
+        try vault.move("Wiki/Target.md", "Wiki/Renamed.md")
+        check(try vault.read("Wiki/Sub/Linker.md") == "Before [[Renamed|alias]] and [[Renamed#Part]] after", "rename rewrites [[wikilinks]] and keeps alias and heading")
+        try vault.move("Wiki/Renamed.md", "Wiki/Sub/Renamed.md")
+        check(try vault.read("Wiki/Sub/Linker.md") == "Before [[Renamed|alias]] and [[Renamed#Part]] after", "a move that keeps the name leaves unambiguous wikilinks unchanged")
+        try vault.write("Wiki/Renamed.md", content: "A second note with the same name", create: true)
+        try vault.write("Wiki/Other.md", content: "[[Renamed]]", create: true)
+        try vault.move("Wiki/Sub/Renamed.md", "Wiki/Sub/Final.md")
+        check(try vault.read("Wiki/Other.md") == "[[Renamed]]" && (try vault.read("Wiki/Sub/Linker.md")).hasPrefix("Before [[Final|alias]]"), "only links to the moved note are rewritten")
+        let report = model.linkReport("Wiki/Sub/Linker.md", vault: vault)
+        check(report.contains("- Wiki/Sub/Final.md") && report.contains("Tags: none"), "get_links lists a note's links")
+        check(model.linkReport("#wiki", vault: vault).contains("- Wiki/Sub/Final.md"), "get_links lists the notes that use a tag")
+        check(ToolRouting.tools(for: "which notes link to Cells?", hasAttachments: false).contains("get_links") && ToolRouting.tools(for: "show my #biology notes", hasAttachments: false).contains("get_links"), "link and tag questions get get_links")
 
         // Dropped Markdown files become notes (copied, never moved; names never overwritten)
         let outside = root.deletingLastPathComponent().appendingPathComponent("obby-drop-" + UUID().uuidString + ".md")

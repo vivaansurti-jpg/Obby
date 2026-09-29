@@ -190,9 +190,10 @@ final class Vault {
         var paths = Set(notes(try tree()))
         if old.lowercased().hasSuffix(".md"), (try? read(old)) != nil { paths.insert(old) } // Case-only rename's hidden intermediate.
         var changes: [(path: String, before: String, after: String)] = []
-        for path in paths.sorted() {
+        let oldNotes = paths.sorted(), wiki = (old: oldNotes, new: oldNotes.map(moved)) // For [[wikilinks]].
+        for path in oldNotes {
             let before = try read(path)
-            let after = rewriteLinks(before, from: path, to: moved(path), mapping: moved)
+            let after = rewriteLinks(before, from: path, to: moved(path), mapping: moved, wiki: wiki)
             if before != after { changes.append((path, before, after)) }
         }
         try fm.moveItem(at: resolve(old), to: resolve(new))
@@ -587,7 +588,8 @@ extension Vault {
         _ = try resolve(path)
         return path
     }
-    func rewriteLinks(_ text: String, from source: String, to destination: String, mapping: (String) -> String) -> String {
+    /// `wiki` (every note path before and after the move) also rewrites `[[wikilinks]]` whose note moved.
+    func rewriteLinks(_ text: String, from source: String, to destination: String, mapping: (String) -> String, wiki: (old: [String], new: [String])? = nil) -> String {
         let oldFolder = (source as NSString).deletingLastPathComponent
         let newFolder = (destination as NSString).deletingLastPathComponent.split(separator: "/").map(String.init)
         var fence = MarkdownFence()
@@ -608,7 +610,107 @@ extension Vault {
                 if let fragment = raw.firstIndex(of: "#") { replacement += raw[fragment...] }
                 result.replaceCharacters(in: link.destinationRange, with: replacement)
             }
+            if let wiki {
+                let current = result as String
+                for link in WikiLinks.links(in: current).reversed() {
+                    guard let target = WikiLinks.resolve(link.target, from: source, in: wiki.old) else { continue }
+                    let mapped = mapping(target)
+                    if WikiLinks.resolve(link.target, from: destination, in: wiki.new) == mapped { continue } // Still correct.
+                    result.replaceCharacters(in: link.targetRange, with: WikiLinks.text(for: mapped, from: destination, in: wiki.new))
+                }
+            }
             return result as String
         }.joined(separator: "\n")
+    }
+}
+
+/// Obsidian-style `[[Note]]`, `[[Folder/Note|alias]]`, `[[Note#Heading]]`, `![[Note]]` and `#tags`. Parsing only:
+/// note text is changed only when a move or rename rewrites the links that pointed at the moved note.
+enum WikiLinks {
+    struct Link { let isEmbed: Bool; let range: NSRange; let target: String; let targetRange: NSRange }
+    struct Tag { let name: String; let range: NSRange }
+    static let pattern = try! NSRegularExpression(pattern: #"(!?)\[\[([^\[\]\r\n|#^]*)((?:[#^|][^\[\]\r\n]*)?)\]\]"#)
+    static let tagPattern = try! NSRegularExpression(pattern: #"(?<![\p{L}\p{N}_#/&\-\]\)])#([\p{L}_][\p{L}\p{N}_/\-]*)"#)
+    private static let inlineCode = try! NSRegularExpression(pattern: #"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)"#)
+
+    /// Fenced code, inline code and YAML frontmatter never contain links or tags.
+    static func protectedRanges(_ text: String) -> [NSRange] {
+        var fence = MarkdownFence(), offset = 0, protected: [NSRange] = []
+        let lines = text.components(separatedBy: "\n")
+        var frontmatter = lines.count > 1 && lines[0].trimmingCharacters(in: .whitespaces) == "---"
+        for (index, line) in lines.enumerated() {
+            let length = (line as NSString).length, whole = NSRange(location: offset, length: length)
+            if frontmatter {
+                protected.append(whole)
+                if index > 0, ["---", "..."].contains(line.trimmingCharacters(in: .whitespaces)) { frontmatter = false }
+            } else if fence.consume(line) {
+                protected.append(whole)
+            } else {
+                protected += inlineCode.matches(in: line, range: NSRange(location: 0, length: length)).map {
+                    NSRange(location: offset + $0.range.location, length: $0.range.length)
+                }
+            }
+            offset += length + 1
+        }
+        return protected
+    }
+    static func links(in text: String) -> [Link] {
+        guard text.contains("[[") else { return [] }
+        let source = text as NSString, protected = protectedRanges(text)
+        return pattern.matches(in: text, range: NSRange(location: 0, length: source.length)).compactMap { match in
+            guard !protected.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else { return nil }
+            let target = source.substring(with: match.range(at: 2)).trimmingCharacters(in: .whitespaces)
+            guard !target.isEmpty else { return nil } // [[#Heading]] points inside the same note.
+            return Link(isEmbed: match.range(at: 1).length > 0, range: match.range, target: target, targetRange: match.range(at: 2))
+        }
+    }
+    static func tags(in text: String) -> [Tag] {
+        guard text.contains("#") else { return [] }
+        let source = text as NSString
+        let skip = protectedRanges(text) + links(in: text).map(\.range) + NoteLinks.links(in: text).map(\.destinationRange)
+        return tagPattern.matches(in: text, range: NSRange(location: 0, length: source.length)).compactMap { match in
+            guard !skip.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else { return nil }
+            var name = source.substring(with: match.range(at: 1))
+            while name.hasSuffix("/") || name.hasSuffix("-") { name.removeLast() }
+            return name.isEmpty ? nil : Tag(name: name, range: NSRange(location: match.range.location, length: name.utf16.count + 1))
+        }
+    }
+    /// True when `text` uses `tag` (without "#"), case-insensitively; `#school` also matches `#school/biology`.
+    static func uses(_ tag: String, in text: String) -> Bool {
+        let wanted = tag.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+        return tags(in: text).contains { let name = $0.name.lowercased(); return name == wanted || name.hasPrefix(wanted + "/") }
+    }
+    /// The note a wikilink points at, as Obsidian resolves it: an exact path from the root or from the linking note's
+    /// folder, otherwise a note with that name, preferring the linking note's folder, then the shortest path.
+    /// `files` are Obby-relative note paths. Nil when nothing matches.
+    static func resolve(_ target: String, from source: String, in files: [String]) -> String? {
+        var name = target.trimmingCharacters(in: .whitespaces)
+        while name.hasPrefix("/") { name.removeFirst() }
+        guard !name.isEmpty, !name.split(separator: "/").contains("..") else { return nil }
+        let folder = (source as NSString).deletingLastPathComponent
+        var byPath: [String: String] = [:]
+        for file in files where byPath[file.lowercased()] == nil { byPath[file.lowercased()] = file }
+        func shortest(_ paths: [String]) -> String? { paths.min { ($0.count, $0) < ($1.count, $1) } }
+        for candidate in name.lowercased().hasSuffix(".md") ? [name] : [name + ".md", name] {
+            let wanted = candidate.lowercased()
+            if wanted.contains("/") {
+                if let exact = byPath[wanted] { return exact }
+                if !folder.isEmpty, let near = byPath[(folder + "/" + wanted).lowercased()] { return near }
+                if let found = shortest(files.filter { $0.lowercased().hasSuffix("/" + wanted) }) { return found }
+            } else {
+                let named = files.filter { ($0 as NSString).lastPathComponent.lowercased() == wanted }
+                if let local = named.first(where: { ($0 as NSString).deletingLastPathComponent == folder }) { return local }
+                if let found = shortest(named) { return found }
+            }
+        }
+        return nil
+    }
+    /// The shortest wikilink text that still resolves to `path` from `source`: the note name when unambiguous,
+    /// otherwise its full path. ".md" is left out, as Obsidian writes it.
+    static func text(for path: String, from source: String, in files: [String]) -> String {
+        let full = path.lowercased().hasSuffix(".md") ? String(path.dropLast(3)) : path
+        let short = (full as NSString).lastPathComponent
+        if resolve(short, from: source, in: files) == path { return short }
+        return resolve(full, from: source, in: files) == path ? full : path
     }
 }

@@ -1,7 +1,7 @@
 import AppKit
 
 /// Obby's editor shows supported Markdown as formatted text and saves it back as plain Markdown.
-/// Supported: **bold**, *italic*, <u>underline</u>, large text, # / ## / ### headings, - bullets, 1. numbers,
+/// Supported: **bold**, *italic*, <u>underline</u>, # / ## / ### headings, - bullets, 1. numbers,
 /// - [ ] / - [x] checkboxes. Everything else (links, images, code, tables…) stays as literal text.
 /// The file on disk is always Markdown: `parse` runs when a note is loaded, `serialize` whenever it changes.
 extension NSAttributedString.Key {
@@ -9,7 +9,6 @@ extension NSAttributedString.Key {
     static let obbyBold = NSAttributedString.Key("obby.bold")
     static let obbyItalic = NSAttributedString.Key("obby.italic")
     static let obbyUnderline = NSAttributedString.Key("obby.underline")
-    static let obbyLarge = NSAttributedString.Key("obby.large")
     static let obbyMarker = NSAttributedString.Key("obby.marker")      // The visible "• ", "1. ", "☐ " in place of "- ", "1. ", "- [ ] "
 }
 
@@ -38,14 +37,28 @@ enum RichMarkdown {
 
     // MARK: Markdown → formatted text
 
+    /// Byte-for-byte safe: a line is shown formatted only if it saves back exactly as written; otherwise (for example
+    /// "* item", "- [X]", nested emphasis) it stays literal. Fenced code and a leading YAML frontmatter block stay literal.
     static func parse(_ markdown: String) -> NSMutableAttributedString {
         let out = NSMutableAttributedString()
         var fence = MarkdownFence()
-        for (index, line) in markdown.components(separatedBy: "\n").enumerated() {
+        let lines = markdown.components(separatedBy: "\n")
+        let frontmatterEnd: Int = {
+            guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else { return -1 }
+            return lines.dropFirst().firstIndex { ["---", "..."].contains($0.trimmingCharacters(in: .whitespaces)) } ?? -1
+        }()
+        for (index, line) in lines.enumerated() {
             if index > 0 { out.append(NSAttributedString(string: "\n")) }
-            out.append(fence.consume(line) ? NSAttributedString(string: line) : parseLine(line))
+            if index <= frontmatterEnd || fence.consume(line) { out.append(NSAttributedString(string: line)); continue }
+            let formatted = parseLine(line)
+            out.append(serialize(formatted).utf8.elementsEqual(line.utf8) ? formatted : NSMutableAttributedString(string: line))
         }
         style(out, range: NSRange(location: 0, length: out.length))
+        // Verify the complete result too: if paragraph styling or an unfamiliar construct changes bytes,
+        // display its original source instead. Unsupported syntax never needs a lossy conversion.
+        guard serialize(out).utf8.elementsEqual(markdown.utf8) else {
+            return NSMutableAttributedString(string: markdown, attributes: baseAttributes)
+        }
         return out
     }
     static let blockPatterns: [(NSRegularExpression, String)] = [
@@ -81,7 +94,6 @@ enum RichMarkdown {
         ("\\*\\*\\*(?=\\S)(.+?)(?<=\\S)\\*\\*\\*", [.obbyBold, .obbyItalic]),
         ("\\*\\*(?=\\S)(.+?)(?<=\\S)\\*\\*", [.obbyBold]),
         ("<u>(.+?)</u>", [.obbyUnderline]),
-        ("<span style=\"font-size:18px\">(.+?)</span>", [.obbyLarge]),
         ("(?<![*\\w])\\*(?=[^\\s*])(.+?)(?<=[^\\s*])\\*(?![*\\w])", [.obbyItalic]),
     ] as [(String, [NSAttributedString.Key])]).map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
     static func parseInline(_ text: String, _ attributes: [NSAttributedString.Key: Any]) -> NSMutableAttributedString {
@@ -137,15 +149,15 @@ enum RichMarkdown {
         default: return inline // A damaged list marker (e.g. half deleted) leaves a plain line.
         }
     }
-    static let inlineOrder: [NSAttributedString.Key] = [.obbyLarge, .obbyUnderline, .obbyBold, .obbyItalic]
+    static let inlineOrder: [NSAttributedString.Key] = [.obbyUnderline, .obbyBold, .obbyItalic]
     static func serializeInline(_ text: NSAttributedString, _ range: NSRange) -> String {
         guard range.length > 0 else { return "" }
         var out = "", open: [NSAttributedString.Key] = []
         func opening(_ key: NSAttributedString.Key) -> String {
-            switch key { case .obbyLarge: return "<span style=\"font-size:18px\">"; case .obbyUnderline: return "<u>"; case .obbyBold: return "**"; default: return "*" }
+            switch key { case .obbyUnderline: return "<u>"; case .obbyBold: return "**"; default: return "*" }
         }
         func closing(_ key: NSAttributedString.Key) -> String {
-            switch key { case .obbyLarge: return "</span>"; case .obbyUnderline: return "</u>"; case .obbyBold: return "**"; default: return "*" }
+            switch key { case .obbyUnderline: return "</u>"; case .obbyBold: return "**"; default: return "*" }
         }
         func closeAll() { // Trailing spaces go after the closing markers, as Markdown requires.
             guard !open.isEmpty else { return }
@@ -180,7 +192,7 @@ enum RichMarkdown {
         case "h1": size = (baseSize * 1.6).rounded(); bold = true
         case "h2": size = (baseSize * 1.35).rounded(); bold = true
         case "h3": size = (baseSize * 1.15).rounded(); bold = true
-        default: if attributes[.obbyLarge] != nil { size = (baseSize * 1.15).rounded() }
+        default: break
         }
         if isMarker { size = baseSize; bold = false; italic = false }
         var font = NSFont.systemFont(ofSize: size, weight: bold ? .bold : .regular)
@@ -219,7 +231,7 @@ enum RichMarkdown {
 
     // MARK: Toggles
 
-    /// Bold / italic / underline / large: removed if the whole selection already has it, otherwise applied.
+    /// Bold / italic / underline: removed if the whole selection already has it, otherwise applied.
     static func toggleInline(_ text: NSMutableAttributedString, range: NSRange, key: NSAttributedString.Key) {
         guard range.length > 0 else { return }
         var all = true

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreServices
 
 @MainActor final class AppModel: ObservableObject {
     @Published var vault: Vault?
@@ -112,7 +113,12 @@ import AppKit
     var timer: Timer?
     var sidebarDrag: SidebarDrag?
     var scopedURL: URL?
-    var rootWatcher: DispatchSourceFileSystemObject?
+    var folderWatchID = UUID()
+    var folderWatcher: NotesFolderWatcher?
+    var folderEventTask: Task<Void, Never>?
+    var folderDebounce = FolderEventDebounce()
+    var activityObserver: NSObjectProtocol?
+    var quitObserver: NSObjectProtocol?
     var chatSession = UUID()
     var history: [[String: Any]] = []
     var directoryResults: [String: (Date?, String)] = [:]
@@ -122,26 +128,39 @@ import AppKit
             Task { @MainActor [weak self] in self?.error = message }
         }
         guard restoreState else { return }
+        activityObserver = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refresh() }
+        }
+        quitObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stopFolderWatching(); self?.timer?.invalidate() }
+        }
         restoreSavedFolder()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in Task { @MainActor in if self?.refreshTask == nil { self?.refresh() } } }
-        Task { await connect() } // One read-only status check at launch; no repeating AI timers (the 1.5 s timer above only watches note files).
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in Task { @MainActor in if self?.refreshTask == nil { self?.refresh() } } }
+        Task { await connect() } // One read-only AI status check at launch.
     }
-    deinit { if let storageObserver { NotificationCenter.default.removeObserver(storageObserver) } }
+    deinit {
+        for observer in [storageObserver, activityObserver, quitObserver].compactMap({ $0 }) { NotificationCenter.default.removeObserver(observer) }
+        timer?.invalidate()
+        folderEventTask?.cancel()
+    }
     func restoreSavedFolder() {
         guard let data = UserDefaults.standard.data(forKey: "bookmark") else { clearVault(); return }
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: data, options: [.withSecurityScope, .withoutUI, .withoutMounting], bookmarkDataIsStale: &stale) else { clearVault(); return }
-        // Bookmarks can follow moved folders. Only reopen the originally selected location.
-        if let savedPath = UserDefaults.standard.string(forKey: "rootPath") {
-            guard url.standardizedFileURL.resolvingSymlinksInPath().path == savedPath else { clearVault(); return }
-        } else if stale { clearVault(); return }
+        // The resolved bookmark identifies the original folder even after a move.
+        let previousRoot = UserDefaults.standard.string(forKey: "rootPath")
+        if previousRoot == nil && stale { clearVault(); return }
         // Setups from before the notes-folder change (notes nested in `<folder>/Obby`) are forgotten; choose the folder again.
         guard UserDefaults.standard.bool(forKey: "rootIsNotesFolder") else { clearVault(); return }
-        openVault(url)
+        openVault(url, bookmarkRoot: previousRoot)
     }
     @discardableResult func validateRoot() -> Bool {
-        if vault?.rootExists == true { rootUnavailable = false; return true }
+        if vault?.rootExists == true {
+            if rootUnavailable { watchRoot() }
+            rootUnavailable = false; return true
+        }
         if vault != nil {
+            stopFolderWatching()
             if dirty {
                 saveTask?.cancel(); saveTask = nil
                 aiTask?.cancel()
@@ -157,7 +176,7 @@ import AppKit
         refreshTask?.cancel(); refreshTask = nil
         searchTask?.cancel(); searchTask = nil
         sidebarDrag = nil
-        rootWatcher?.cancel(); rootWatcher = nil
+        stopFolderWatching()
         saveTask?.cancel(); saveTask = nil
         guard clearChat() else { return }
         vault = nil; tree = []; results = []; query = ""; selection = nil; note = nil
@@ -166,20 +185,36 @@ import AppKit
         scopedURL?.stopAccessingSecurityScopedResource(); scopedURL = nil
         for key in ["bookmark", "rootPath", "lastNote", "rootIsNotesFolder"] { UserDefaults.standard.removeObject(forKey: key) }
     }
+    func stopFolderWatching() {
+        folderWatchID = UUID()
+        folderWatcher = nil
+        folderEventTask?.cancel(); folderEventTask = nil
+        folderDebounce = FolderEventDebounce()
+    }
     func watchRoot() {
-        rootWatcher?.cancel(); rootWatcher = nil
-        func watch(_ target: Vault) -> DispatchSourceFileSystemObject? {
-            let descriptor = open(target.root.path, O_EVTONLY)
-            guard descriptor >= 0 else { return nil }
-            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.delete, .rename, .write, .attrib, .revoke], queue: .main)
-            source.setEventHandler { [weak self] in
-                Task { @MainActor [weak self] in self?.refresh() }
+        stopFolderWatching()
+        guard let vault else { return }
+        let watchID = folderWatchID
+        let watcher = NotesFolderWatcher(root: vault.root.path) { [weak self, weak vault] paths, rootChanged, rescan in
+            Task { @MainActor [weak self, weak vault] in
+                guard let self, let vault, self.vault === vault, self.folderWatchID == watchID, self.folderWatcher != nil else { return }
+                // Root checks bypass filtering and self-save suppression.
+                guard self.validateRoot() else { return }
+                if rootChanged || rescan || paths.contains(where: {
+                    FolderEventDebounce.accepts($0, root: vault.root.path) && !vault.isRecentSelfWrite($0)
+                }) {
+                    guard self.folderDebounce.enqueue(now: ProcessInfo.processInfo.systemUptime) else { return }
+                    self.folderEventTask = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        guard !Task.isCancelled, let self else { return }
+                        self.folderDebounce.fire(now: ProcessInfo.processInfo.systemUptime)
+                        self.folderEventTask = nil
+                        self.refresh()
+                    }
+                }
             }
-            source.setCancelHandler { close(descriptor) }
-            source.resume()
-            return source
         }
-        if let vault { rootWatcher = watch(vault) }
+        folderWatcher = watcher
     }
     func perform(_ action: () throws -> Void) { do { try action() } catch { self.error = error.localizedDescription } }
     func chooseFolder() {
@@ -188,9 +223,18 @@ import AppKit
         if panel.runModal() == .OK, let url = panel.url { openVault(url) }
     }
     /// Opens a notes folder: the folder itself is the notes root, and existing notes load as they are.
-    func openVault(_ url: URL) {
+    func openVault(_ url: URL, bookmarkRoot: String? = nil) {
+        var matchedBookmarkRoot = bookmarkRoot
+        if matchedBookmarkRoot == nil, let data = UserDefaults.standard.data(forKey: "bookmark") {
+            var stale = false
+            if let resolved = try? URL(resolvingBookmarkData: data, options: [.withSecurityScope, .withoutUI, .withoutMounting], bookmarkDataIsStale: &stale),
+               ProcedureStore.canonicalRoot(resolved.path) == ProcedureStore.canonicalRoot(url.path) {
+                matchedBookmarkRoot = UserDefaults.standard.string(forKey: "rootPath")
+            }
+        }
         _ = validateRoot()
         guard save(), finalizeMemory() else { return }
+        stopFolderWatching()
         scopedURL?.stopAccessingSecurityScopedResource()
         _ = url.startAccessingSecurityScopedResource(); scopedURL = url
         guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
@@ -200,6 +244,7 @@ import AppKit
         guard chosen.rootExists else { clearVault(); self.error = "That folder can’t be used for notes."; return }
         refreshTask?.cancel(); refreshTask = nil
         searchTask?.cancel(); searchTask = nil
+        migrateProcedureRoot(to: chosen.root, bookmarkRoot: matchedBookmarkRoot)
         vault = chosen
         note = nil; selection = nil; loading = true; text = ""; loading = false; dirty = false
         clearChat()
@@ -362,7 +407,7 @@ import AppKit
         return alert.runModal() == .alertFirstButtonReturn ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) : nil
     }
     func create(directory: Bool) {
-        guard let vault, let name = input(directory ? "New folder" : "New note", value: directory ? "Untitled" : "Untitled.md"), !name.isEmpty else { return }
+        guard vault != nil, let name = input(directory ? "New folder" : "New note", value: directory ? "Untitled" : "Untitled.md"), !name.isEmpty else { return }
         perform {
             let filename: String
             if directory {
@@ -375,9 +420,15 @@ import AppKit
                 filename = stem + ".md"
             }
             let path = folder.isEmpty ? filename : folder + "/" + filename
-            if directory { try vault.mkdir(path) } else { try vault.write(path, content: "", create: true) }
+            try createSidebarItem(path, directory: directory)
             refresh(); selection = path; if !directory { openNote(path) }
         }
+    }
+    func createSidebarItem(_ path: String, directory: Bool) throws {
+        guard let vault else { throw ObbyError("Choose a notes folder first.") }
+        guard !FileManager.default.fileExists(atPath: try vault.resolve(path).path) else { throw ObbyError("An item with that name already exists.") }
+        if directory { try vault.mkdir(path) } else { try vault.write(path, content: "", create: true) }
+        recordProcedure(directory ? "create_directory" : "create_file", arguments: ["path": path], actor: "you")
     }
     func relocate(_ path: String, rename: Bool) {
         guard save(), let vault else { return }
@@ -392,7 +443,9 @@ import AppKit
                 value = stem + ".md"
             } else if rename && (value.isEmpty || value.contains("/")) { throw ObbyError("Enter a single name.") }
             let destination = rename ? (parent.isEmpty ? value : parent + "/" + value) : (value.isEmpty ? String(pieces.last!) : value + "/" + String(pieces.last!))
-            try vault.move(path, destination); didMove(path, destination); refresh()
+            try vault.move(path, destination); didMove(path, destination)
+            recordProcedure(rename ? "rename_path" : "move_path", arguments: ["oldPath": path, "newPath": destination], actor: "you")
+            refresh()
         }
     }
     func didMove(_ old: String, _ new: String) {
@@ -470,6 +523,7 @@ import AppKit
             }
             directoryResults.removeAll()
             didMove(path, destination)
+            recordProcedure("rename_path", arguments: ["oldPath": path, "newPath": destination], actor: "you")
             refresh()
             return true
         } catch { self.error = error.localizedDescription; return false }
@@ -504,7 +558,7 @@ import AppKit
         let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "Move \(path) to Trash?"; alert.informativeText = "Folders and everything inside them will be moved to the Trash."; alert.addButton(withTitle: "Move to Trash"); alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
-    func remove(_ path: String) { guard save(), confirmDelete(path) else { return }; perform { try vault?.delete(path); memoryDidDelete(path); refresh() } }
+    func remove(_ path: String) { guard let vault, save(), confirmDelete(path) else { return }; perform { try vault.delete(path); recordProcedure("delete_path", arguments: ["path": path], actor: "you"); memoryDidDelete(path); refresh() } }
     /// Asked before the AI replaces a substantial note with something much shorter.
     func confirmShrink(_ path: String, from old: Int, to new: Int) -> Bool {
         if skipAIConfirmations { return true } // Still undoable from the chat.
@@ -598,8 +652,70 @@ import AppKit
     }
     func persistSettings() { UserDefaults.standard.set(unloadPrevious, forKey: "unloadPrevious"); UserDefaults.standard.set(unloadOnQuit, forKey: "unloadOnQuit"); UserDefaults.standard.set(autoStartOllama, forKey: "autoStartOllama"); UserDefaults.standard.set(keepAlive.rawValue, forKey: "keepAlive"); UserDefaults.standard.set(endpoint, forKey: "ollamaURL"); UserDefaults.standard.set(selectedModel, forKey: activeModelKey); UserDefaults.standard.set(activeCustom?.id.uuidString, forKey: "activeCustomProvider"); UserDefaults.standard.set(provider.rawValue, forKey: "aiProvider"); UserDefaults.standard.set(openAIBaseURL, forKey: "openAIBaseURL"); UserDefaults.standard.set(openAITools, forKey: "openAITools"); UserDefaults.standard.set(temperature, forKey: "temperature"); UserDefaults.standard.set(contextWindow.rawValue, forKey: "contextWindow"); UserDefaults.standard.set(rememberChats, forKey: "rememberChats"); UserDefaults.standard.set(relatedNotesLocal, forKey: "relatedNotesLocal"); UserDefaults.standard.set(relatedNotesCloud, forKey: "relatedNotesCloud"); UserDefaults.standard.set(learnAboutMe, forKey: "learnAboutMe"); UserDefaults.standard.set(streamReplies, forKey: "streamReplies") }
 }
-struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil; var base = ""; var repeats = 1; var taskID: UUID? = nil }
+struct ChatLine: Identifiable { let id = UUID(); var role: String; var text: String; var rawAction: String? = nil; var unsuccessful = false; var notice = false; var undo: UndoEdit? = nil; var base = ""; var repeats = 1; var taskID: UUID? = nil; var fromActivityHistory = false }
 /// How to undo one AI change to a note (session only, kept in memory): the text before and after the change.
 /// `previous == nil` means the AI created the note, so undo moves it to the Trash.
 /// `movedFrom` set: the AI moved or renamed `movedFrom` to `path`, so undo moves it back.
 struct UndoEdit { var path: String; var previous: String?; var after: String; var movedFrom: String? = nil }
+
+/// A fixed coalescing window: continuous events cannot postpone a refresh indefinitely.
+struct FolderEventDebounce {
+    private(set) var deadline: TimeInterval?
+    static func accepts(_ path: String, root: String) -> Bool {
+        guard path.hasPrefix(root + "/") else { return false }
+        let components = path.dropFirst(root.count + 1).split(separator: "/")
+        return !components.isEmpty && !components.contains { $0.hasPrefix(".") }
+    }
+    mutating func enqueue(now: TimeInterval) -> Bool {
+        guard deadline == nil else { return false }
+        deadline = now + 0.3
+        return true
+    }
+    @discardableResult mutating func fire(now: TimeInterval) -> Bool {
+        guard let deadline, now >= deadline else { return false }
+        self.deadline = nil
+        return true
+    }
+}
+
+private final class FolderEventCallback {
+    let receive: ([String], Bool, Bool) -> Void
+    init(_ receive: @escaping ([String], Bool, Bool) -> Void) { self.receive = receive }
+}
+
+final class NotesFolderWatcher {
+    private var stream: FSEventStreamRef?
+    private let queue = DispatchQueue(label: "local.obby.notes.events", qos: .utility)
+    init?(root: String, receive: @escaping ([String], Bool, Bool) -> Void) {
+        let callback = FolderEventCallback(receive)
+        var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(callback).toOpaque(), retain: { pointer in
+            guard let pointer else { return nil }
+            _ = Unmanaged<FolderEventCallback>.fromOpaque(pointer).retain()
+            return pointer
+        }, release: { pointer in
+            if let pointer { Unmanaged<FolderEventCallback>.fromOpaque(pointer).release() }
+        }, copyDescription: nil)
+        let flags = kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagWatchRoot
+        guard let stream = FSEventStreamCreate(nil, { _, info, count, paths, flags, _ in
+            guard let info else { return }
+            let paths = Unmanaged<CFArray>.fromOpaque(paths).takeUnretainedValue() as! [String]
+            let events = UnsafeBufferPointer(start: flags, count: count)
+            let rootChanged = events.contains { $0 & UInt32(kFSEventStreamEventFlagRootChanged) != 0 }
+            let rescan = events.contains { $0 & UInt32(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped) != 0 }
+            Unmanaged<FolderEventCallback>.fromOpaque(info).takeUnretainedValue().receive(paths, rootChanged, rescan)
+        }, &context, [root] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.3, FSEventStreamCreateFlags(flags)) else { return nil }
+        self.stream = stream
+        FSEventStreamSetDispatchQueue(stream, queue)
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamInvalidate(stream); FSEventStreamRelease(stream); self.stream = nil
+            return nil
+        }
+    }
+    deinit {
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+        }
+    }
+}

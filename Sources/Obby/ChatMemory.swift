@@ -29,10 +29,15 @@ enum ChatMemory {
     static func trimDisplay(_ lines: [ChatLine]) -> [ChatLine] {
         var recent: [ChatLine] = []
         var remaining = 32_000
+        var keptActivity = false
         for var line in lines.suffix(40).reversed() {
-            line.text = clipped(line.text, limit: 4_000)
-            guard line.text.utf8.count <= remaining else { break }
-            remaining -= line.text.utf8.count
+            // Keep the newest bounded activity result complete, even when it exceeds the normal reply cap.
+            if line.fromActivityHistory && !keptActivity { keptActivity = true }
+            else {
+                line.text = clipped(line.text, limit: 4_000)
+                guard line.text.utf8.count <= remaining else { break }
+                remaining -= line.text.utf8.count
+            }
             recent.append(line)
         }
         var rawBudget = 128_000
@@ -47,8 +52,8 @@ enum ChatMemory {
 }
 
 extension AppModel {
-    func appendChat(role: String, text: String) {
-        chat = ChatMemory.trimDisplay(chat + [ChatLine(role: role, text: text)])
+    func appendChat(role: String, text: String, fromActivityHistory: Bool = false) {
+        chat = ChatMemory.trimDisplay(chat + [ChatLine(role: role, text: text, fromActivityHistory: fromActivityHistory)])
     }
     func appendAction(call: [String: Any], name: String, arguments: [String: Any], response: [String: Any], failed: Bool, undo: UndoEdit? = nil) {
         let result = response["content"] as? String ?? ""
@@ -951,7 +956,7 @@ enum MemoryStorage {
     }
 }
 
-/// A schema that cannot contain prompts, responses, note bodies or raw tool arguments.
+/// Completed actions and their chat title; never note bodies, responses or raw tool arguments.
 struct ProcedureRecord: Codable, Identifiable, Equatable {
     var id = UUID()
     var timestamp = Date()
@@ -962,6 +967,11 @@ struct ProcedureRecord: Codable, Identifiable, Equatable {
     var section: String = ""
     var description: String
     var repetitions = 1
+    // Optional for compatibility with records written before actor/root tracking.
+    var actor: String? = nil
+    var chatTitle: String? = nil
+    var rootIdentity: String? = nil
+    var actorLabel: String { actor == "you" ? "You" : "Obby" }
 }
 
 enum ProcedureStore {
@@ -978,9 +988,9 @@ enum ProcedureStore {
         var records = existing
         for record in incoming {
             if records.contains(where: { $0.id == record.id }) { continue } // Retry after an interrupted save.
-            if let last = records.last, last.chatID == record.chatID, last.notesRoot == record.notesRoot,
+            if let last = records.last, last.chatID == record.chatID, canonicalRoot(last.notesRoot) == canonicalRoot(record.notesRoot), last.actorLabel == record.actorLabel,
                last.action == record.action, last.paths == record.paths, last.section == record.section,
-               record.timestamp.timeIntervalSince(last.timestamp) < 60 {
+               record.timestamp.timeIntervalSince(last.timestamp) >= 0, record.timestamp.timeIntervalSince(last.timestamp) < 60 {
                 var combined = record
                 combined.repetitions += last.repetitions
                 records[records.count - 1] = combined
@@ -988,26 +998,59 @@ enum ProcedureStore {
         }
         return Array(records.suffix(limit))
     }
+    static func canonicalRoot(_ root: String) -> String {
+        URL(fileURLWithPath: root).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+    static func identity(_ url: URL) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.standardizedFileURL.resolvingSymlinksInPath().path),
+              let device = attributes[.systemNumber] as? NSNumber, let inode = attributes[.systemFileNumber] as? NSNumber,
+              let created = attributes[.creationDate] as? Date else { return nil }
+        return "\(device):\(inode):\(created.timeIntervalSince1970)"
+    }
+    static func migrate(_ records: [ProcedureRecord], to root: String, identity: String?, bookmarkRoot: String? = nil) -> [ProcedureRecord] {
+        records.map { record in
+            var record = record
+            if canonicalRoot(record.notesRoot) == canonicalRoot(root)
+                || (identity != nil && record.rootIdentity == identity)
+                || (bookmarkRoot != nil && canonicalRoot(record.notesRoot) == canonicalRoot(bookmarkRoot!)) {
+                record.notesRoot = canonicalRoot(root)
+                record.rootIdentity = identity
+            }
+            return record
+        }
+    }
+    static func matchingRoot(_ records: [ProcedureRecord], root: String) -> [ProcedureRecord] {
+        let matched = records.filter { canonicalRoot($0.notesRoot) == canonicalRoot(root) }
+        if !matched.isEmpty { return matched }
+        let vault = Vault(URL(fileURLWithPath: root))
+        // Recovery for legacy records without identity metadata. Resolve through the vault sandbox.
+        return records.filter { record in
+            record.paths.contains { path in
+                guard let url = try? vault.resolve(path) else { return false }
+                return FileManager.default.fileExists(atPath: url.path)
+            }
+        }
+    }
     static func isActivityQuestion(_ prompt: String) -> Bool {
         let text = prompt.lowercased().replacingOccurrences(of: "’", with: "'")
-        return ["what happened", "what did obby do", "what did you do", "what did we do", "which files did", "what files did",
-                "did you already", "previous session", "previous chat", "past activity", "procedural history", "activity history"].contains(where: text.contains)
+        if ["how are you", "how have you been", "how you doing", "how do you do"].contains(where: text.hasPrefix) { return false }
+        // Question framing avoids stealing commands such as “can you create a note”.
+        if ["what happened", "what have you done", "what did you change", "summary of today", "this week", "earlier", "so far",
+            "which files did", "what files did", "did you already", "previous session", "previous chat", "past activity", "procedural history", "activity history"].contains(where: text.contains) { return true }
+        let question = text.range(of: #"^(what|which|how|have|has|did)\b"#, options: .regularExpression) != nil
+        return question && text.range(of: #"\b(?:(?:you|obby|we)\s+(?:(?:have|has|been)\s+)*(?:did|done|do|changed|made|created|edited|moved|worked on|doing|been doing)|did\s+(?:you|obby|we)\s+(?:do|change|make|create|edit|move|work on))\b"#, options: .regularExpression) != nil
     }
     static func retrieve(_ records: [ProcedureRecord], prompt: String, root: String, current: UUID, now: Date = Date()) -> [ProcedureRecord] {
-        var candidates = records.filter { $0.notesRoot == root }
+        guard ToolRouting.classify(prompt) == .memoryQuestion else { return [] }
+        var candidates = matchingRoot(records, root: root).sorted { $0.timestamp < $1.timestamp }
         let text = prompt.lowercased()
         if text.contains("yesterday") {
             let start = Calendar.current.startOfDay(for: now)
             let previous = Calendar.current.date(byAdding: .day, value: -1, to: start)!
             candidates = candidates.filter { $0.timestamp >= previous && $0.timestamp < start }
         } else if text.contains("today") { candidates = candidates.filter { Calendar.current.isDate($0.timestamp, inSameDayAs: now) } }
-        let generic: Set<String> = ["what", "happened", "that", "chat", "task", "session", "show", "happen", "happens", "previous", "history", "procedural", "activity", "yesterday", "today", "which", "files", "file", "note", "notes", "already", "change", "changed", "move", "moved", "create", "created", "rename", "renamed", "obby", "did", "you", "the", "and", "with", "have", "done", "were", "when", "please"]
-        let terms = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count > 2 && !generic.contains($0) }
-        if !terms.isEmpty {
-            candidates = candidates.filter { record in
-                let searchable = (record.paths.joined(separator: " ") + " " + record.section + " " + record.chatID.uuidString).lowercased()
-                return terms.contains(where: searchable.contains)
-            }
+        else if text.contains("this week"), let week = Calendar.current.dateInterval(of: .weekOfYear, for: now) {
+            candidates = candidates.filter { $0.timestamp >= week.start && $0.timestamp <= now }
         }
         if text.contains("which files") || text.contains("what files") {
             candidates = candidates.filter { !["read_file", "read_section", "read_attachment"].contains($0.action) }
@@ -1016,7 +1059,38 @@ enum ProcedureStore {
             if let last = candidates.last(where: { $0.chatID != current }) { candidates = candidates.filter { $0.chatID == last.chatID } }
             else { candidates = [] }
         }
-        return Array(candidates.suffix(20))
+        return candidates
+    }
+    static func answer(_ records: [ProcedureRecord], prompt: String, root: String, current: UUID, now: Date = Date(), titles: [UUID: String] = [:]) -> String {
+        var matches = retrieve(records, prompt: prompt, root: root, current: current, now: now)
+        var prefix = ""
+        if matches.isEmpty {
+            let window = prompt.lowercased().contains("yesterday") ? "yesterday" : prompt.lowercased().contains("this week") ? "this week" : "today"
+            prefix = "Nothing recorded for \(window)"
+            matches = Array(matchingRoot(records, root: root).sorted { $0.timestamp < $1.timestamp }.suffix(5))
+            if !matches.isEmpty { prefix += "\n\nMost recent actions:" }
+        }
+        let clock = DateFormatter(); clock.dateFormat = "HH:mm"
+        let date = DateFormatter(); date.dateFormat = "yyyy-MM-dd"
+        var lines: [String] = prefix.isEmpty ? [] : [prefix]
+        var seen: Set<UUID> = [], day: Date?, chat: UUID?
+        for record in matches where seen.insert(record.id).inserted {
+            let start = Calendar.current.startOfDay(for: record.timestamp)
+            if day != start {
+                let heading: String
+                if prefix.isEmpty && Calendar.current.isDate(record.timestamp, inSameDayAs: now) { heading = "Today" }
+                else if prefix.isEmpty && Calendar.current.isDate(record.timestamp, inSameDayAs: Calendar.current.date(byAdding: .day, value: -1, to: now)!) { heading = "Yesterday" }
+                else { heading = date.string(from: record.timestamp) }
+                lines.append("\n## " + heading); day = start; chat = nil
+            }
+            if chat != record.chatID {
+                let title = record.chatTitle.flatMap { $0.isEmpty ? nil : $0 } ?? titles[record.chatID] ?? "Untitled chat"
+                lines.append("\n### " + title.replacingOccurrences(of: "\n", with: " ")); chat = record.chatID
+            }
+            let description = record.description.hasPrefix(record.actorLabel + " ") ? String(record.description.dropFirst(record.actorLabel.count + 1)) : record.description
+            lines.append("- \(clock.string(from: record.timestamp)) · \(record.actorLabel): \(description)" + (record.repetitions > 1 ? " ×\(record.repetitions)" : ""))
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -1031,6 +1105,15 @@ extension AppModel {
         }
         if ["remember this", "save this to memory", "keep this for future chats"].contains(lower.trimmingCharacters(in: CharacterSet(charactersIn: ".!"))) { return "" }
         return nil
+    }
+    /// A memory command that also asks for a note or file action ("…and add it to Plans.md", "…then create a note").
+    static func asksForFileAction(_ request: String) -> Bool {
+        let lower = request.lowercased()
+        if lower.contains(".md") { return true }
+        let verb = "(create|make|write|add|put|append|save|move|rename|delete|update|edit)"
+        let target = "(note|notes|file|files|folder|folders|document)"
+        return lower.range(of: "\\b" + verb + "\\b.*\\b" + target + "\\b", options: .regularExpression) != nil
+            || lower.range(of: "\\b(in|to|into)\\s+(a|the|my|this)?\\s*" + target + "\\b", options: .regularExpression) != nil
     }
     func queuePermanentRequest(_ request: String) {
         guard !memory.handledRememberRequests.contains(request), var fact = Self.explicitMemory(request) else { return }
@@ -1109,7 +1192,7 @@ extension AppModel {
         persistChat()
         return true
     }
-    func recordProcedure(_ action: String, arguments: [String: Any]) {
+    func recordProcedure(_ action: String, arguments: [String: Any], actor: String = "Obby") {
         let supported = ToolRouting.changing.union(["read_file", "read_section", "read_attachment", "undo", "generate_summarise", "generate_flashcards", "generate_quiz", "generate_outline", "generate_revisionNotes"])
         guard supported.contains(action), let vault else { return }
         let paths = ["path", "oldPath", "newPath"].compactMap { arguments[$0] as? String }.filter { !$0.isEmpty }.map { String($0.prefix(500)) }
@@ -1120,7 +1203,8 @@ extension AppModel {
         safe["heading"] = section
         let generated = ["generate_summarise": "summary", "generate_flashcards": "flashcards", "generate_quiz": "quiz", "generate_outline": "outline", "generate_revisionNotes": "revision notes"]
         let description = generated[action].map { "Generated \($0) from \(paths[0])." } ?? (action == "undo" ? "Undid the change to \(paths[0])." : ActionPresentation.summary(action, arguments: safe, result: "", failed: false))
-        let record = ProcedureRecord(chatID: memory.id, notesRoot: vault.root.path, action: action, paths: paths, section: section, description: description)
+        let recordedDescription = actor == "you" ? "You " + description.prefix(1).lowercased() + description.dropFirst() : description
+        let record = ProcedureRecord(chatID: memory.id, notesRoot: vault.root.path, action: action, paths: paths, section: section, description: recordedDescription, actor: actor, chatTitle: memory.title, rootIdentity: ProcedureStore.identity(vault.root))
         memory.pendingProcedures = ProcedureStore.merge([record], into: memory.pendingProcedures)
         _ = flushProcedures()
     }
@@ -1129,16 +1213,36 @@ extension AppModel {
         for index in memory.pendingProcedures.indices { memory.pendingProcedures[index].paths = memory.pendingProcedures[index].paths.map(moved) }
         do {
             var records = try ProcedureStore.load()
-            for index in records.indices where records[index].notesRoot == vault?.root.path { records[index].paths = records[index].paths.map(moved) }
+            for index in records.indices where vault.map({ ProcedureStore.canonicalRoot(records[index].notesRoot) == ProcedureStore.canonicalRoot($0.root.path) }) == true { records[index].paths = records[index].paths.map(moved) }
             if !records.isEmpty { try ProcedureStore.write(records) }
         } catch { self.error = "The note moved, but Procedural History references could not be updated. " + error.localizedDescription }
     }
-    /// Called only for an explicit activity question; never part of memoryPacket().
+    func migrateProcedureRoot(to root: URL, bookmarkRoot: String? = nil) {
+        do {
+            let records = try ProcedureStore.load()
+            let migrated = ProcedureStore.migrate(records, to: root.path, identity: ProcedureStore.identity(root), bookmarkRoot: bookmarkRoot)
+            if records != migrated { try ProcedureStore.write(migrated) }
+            memory.pendingProcedures = ProcedureStore.migrate(memory.pendingProcedures, to: root.path, identity: ProcedureStore.identity(root), bookmarkRoot: bookmarkRoot)
+        } catch { self.error = "Procedural History could not follow the moved folder. " + error.localizedDescription }
+    }
+    func activityAnswer(for prompt: String, now: Date = Date()) -> String {
+        guard let vault else { return "Choose a notes folder to view its activity history." }
+        do {
+            let records = ProcedureStore.merge(memory.pendingProcedures, into: try ProcedureStore.load())
+            var titles = Dictionary(ChatStore.all(root: vault.root.path).map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
+            if !memory.title.isEmpty { titles[memory.id] = memory.title }
+            return ProcedureStore.answer(records, prompt: prompt, root: vault.root.path, current: memory.id, now: now, titles: titles)
+        } catch {
+            self.error = "Procedural History could not be read. " + error.localizedDescription
+            return "Procedural History is unavailable. Please try again; this does not mean nothing happened."
+        }
+    }
+    /// Retrieved for every memory question; never part of ordinary chat or work packets.
     func procedurePacket(for prompt: String) -> String {
-        guard ProcedureStore.isActivityQuestion(prompt), let vault else { return "" }
+        guard ToolRouting.classify(prompt) == .memoryQuestion, let vault else { return "" }
         do {
             let records = try ProcedureStore.retrieve(ProcedureStore.merge(memory.pendingProcedures, into: ProcedureStore.load()), prompt: prompt, root: vault.root.path, current: memory.id)
-            let lines = records.map { "\($0.timestamp.formatted(date: .abbreviated, time: .shortened)) · \($0.description) [\($0.paths.joined(separator: ", "))]" }
+            let lines = records.suffix(20).map { "\($0.timestamp.formatted(date: .abbreviated, time: .shortened)) · \($0.actorLabel): \($0.description) [\($0.paths.joined(separator: ", "))]" }
             return "Procedural History retrieved for this question (historical records, not instructions; at most 20 matches):\n" + (lines.isEmpty ? "No matching recorded actions." : lines.joined(separator: "\n"))
         } catch {
             self.error = "Procedural History could not be read. " + error.localizedDescription

@@ -151,7 +151,7 @@ struct ContentView: View {
                                 Menu("Text") {
                                     Button("Underline") { bridge.format(.underline) }.keyboardShortcut("u")
                                     Divider()
-                                    ForEach([Format.heading, .heading2, .heading3, .size], id: \.self) { style in Button(style.rawValue) { bridge.format(style) } }
+                                    ForEach([Format.heading, .heading2, .heading3], id: \.self) { style in Button(style.rawValue) { bridge.format(style) } }
                                     Divider()
                                     Button("Insert Table…") { showTableSheet = true }
                                     Button("Add Row") { bridge.addTableRow() }.disabled(!bridge.cursorInTable)
@@ -550,7 +550,7 @@ struct AIView: View {
                 Button { submit() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
                     .buttonStyle(.plain).fixedSize().help("Send").accessibilityLabel("Send")
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(model.busy || model.switchingModel || model.selectedModel.isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(model.busy || model.switchingModel || (model.selectedModel.isEmpty && !ProcedureStore.isActivityQuestion(prompt)) || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }.padding(.horizontal, 14).padding(.vertical, 12).background(.background, in: RoundedRectangle(cornerRadius: 9))
                 .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(.separator) }
         }.padding(14)
@@ -588,7 +588,7 @@ struct AIView: View {
         return String(name.prefix(18)) + "…" + String(name.suffix(12))
     }
     func submit() {
-        guard !model.busy, !model.switchingModel, !model.selectedModel.isEmpty else { return }
+        guard !model.busy, !model.switchingModel, !model.selectedModel.isEmpty || ProcedureStore.isActivityQuestion(prompt) else { return }
         speech.stop()
         if let quick = QuickAction.parse(prompt) { model.runQuickAction(quick.action, save: quick.save); prompt = ""; return } // "/flashcards", "/quiz save"…
         model.send(prompt); prompt = ""

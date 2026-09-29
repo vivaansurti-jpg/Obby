@@ -34,6 +34,7 @@ extension AppModel {
             try vault.move(drag.path, destination)
             directoryResults.removeAll()
             didMove(drag.path, destination)
+            recordProcedure("move_path", arguments: ["oldPath": drag.path, "newPath": destination], actor: "you")
             refresh()
             return true
         } catch { self.error = error.localizedDescription; return false }

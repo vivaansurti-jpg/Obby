@@ -19,6 +19,16 @@ struct ObbyError: LocalizedError {
     var errorDescription: String? { message }
 }
 final class Vault {
+    private let selfWriteLock = NSLock()
+    private var selfWrites: [String: (TimeInterval, NSDictionary)] = [:]
+    static func isRecentWrite(_ written: TimeInterval, now: TimeInterval) -> Bool { now >= written && now - written < 1 }
+    func isRecentSelfWrite(_ path: String) -> Bool {
+        selfWriteLock.lock(); defer { selfWriteLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        selfWrites = selfWrites.filter { Self.isRecentWrite($0.value.0, now: now) }
+        guard let (_, attributes) = selfWrites[path], let current = try? fm.attributesOfItem(atPath: path) else { return false }
+        return attributes.isEqual(to: current)
+    }
     let root: URL
     let fm = FileManager.default
     private let identity: UInt64?
@@ -109,8 +119,12 @@ final class Vault {
         guard (try? fm.attributesOfItem(atPath: temp.path)[.size] as? NSNumber)?.intValue == data.count else {
             throw ObbyError("The note couldn’t be saved completely. The previous version was kept.")
         }
+        selfWriteLock.lock(); defer { selfWriteLock.unlock() }
         if create { try fm.moveItem(at: temp, to: url) } // Never replaces an existing file.
         else { _ = try fm.replaceItemAt(url, withItemAt: temp) }
+        let now = ProcessInfo.processInfo.systemUptime
+        selfWrites = selfWrites.filter { Self.isRecentWrite($0.value.0, now: now) }
+        if let attributes = try? fm.attributesOfItem(atPath: url.path) { selfWrites[url.path] = (now, attributes as NSDictionary) }
     }
     /// Removes recognized temporary files older than a day, excluding writes/imports active in this process.
     func removeStaleTemporaryFiles(now: Date = Date()) {

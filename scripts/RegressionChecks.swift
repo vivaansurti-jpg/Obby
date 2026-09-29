@@ -20,6 +20,17 @@ import AppKit
         func rejected(_ label: String, _ work: () throws -> Void) {
             do { try work(); preconditionFailure(label) } catch { count += 1; print("PASS regression: \(label)") }
         }
+        for path in [".note.md.obby-tmp-123", ".obby-import-123", ".hidden.md", ".DS_Store", "nested/.hidden/note.md", "nested/.note.md.obby-tmp-123"] {
+            check(!FolderEventDebounce.accepts("/notes/" + path, root: "/notes"), "watch filter ignores " + path)
+        }
+        check(FolderEventDebounce.accepts("/notes/nested/deeper/note.md", root: "/notes"), "watch filter accepts nested notes")
+        check(!FolderEventDebounce.accepts("/notes-other/note.md", root: "/notes"), "watch filter excludes other roots")
+        var debounce = FolderEventDebounce()
+        var scheduled = 0
+        for event in 0..<20 { if debounce.enqueue(now: Double(event) * 0.01) { scheduled += 1 } }
+        check(scheduled == 1 && !debounce.fire(now: 0.29) && debounce.fire(now: 0.3) && !debounce.fire(now: 0.4), "twenty events coalesce into one refresh")
+        check(debounce.enqueue(now: 0.4) && debounce.fire(now: 0.7), "debouncer accepts the next window")
+        check(Vault.isRecentWrite(10, now: 10.9) && !Vault.isRecentWrite(10, now: 11), "self-save suppression lasts one second")
         let vault = Vault(root)
         let model = AppModel(restoreState: false)
         model.vault = vault; model.rememberChats = false; model.relatedNotesLocal = false
@@ -54,7 +65,7 @@ import AppKit
         memoryRequests = []
         model.send("What happened in that chat?")
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
-        check(memoryRequests.contains { $0.contains("Procedural History retrieved") && $0.contains("Created Revision.md") }, "actual activity request receives retrieved records")
+        check(memoryRequests.isEmpty && model.chat.last?.role == "Obby" && model.chat.last!.text.contains("Created Revision.md") && model.chat.last!.text.contains("From Obby's activity history"), "activity answer renders records directly without a model request")
         _ = model.resetChat()
         _ = try model.executeTool("move_path", arguments: ["oldPath": "History/Revision.md", "newPath": "History/Renamed.md"])
         check(try ProcedureStore.load().first?.paths == ["History/Renamed.md"], "procedural references follow a renamed note")
@@ -92,6 +103,88 @@ import AppKit
         check(ProcedureStore.retrieve([otherRoot], prompt: "What did Obby do yesterday?", root: root.path, current: model.memory.id).isEmpty, "retrieval does not cross notes folders")
         _ = model.clearProceduralHistory(); _ = model.clearPermanentMemory(); _ = model.resetChat()
         model.error = nil; model.requestOverride = nil
+
+        // History recall uses deterministic dates and temporary roots, never the user's stored history.
+        let now = Calendar.current.date(from: DateComponents(year: 2026, month: 9, day: 29, hour: 18))!
+        let start = Calendar.current.startOfDay(for: now)
+        let chatID = UUID()
+        let first = ProcedureRecord(timestamp: start.addingTimeInterval(9 * 3600 + 2 * 60), chatID: chatID, notesRoot: root.path, action: "create_file", paths: ["History/Renamed.md"], description: "Created First.md.", actor: "Obby", chatTitle: "Biology revision")
+        let second = ProcedureRecord(timestamp: start.addingTimeInterval(14 * 3600 + 32 * 60), chatID: chatID, notesRoot: root.path, action: "rename_path", paths: ["History/Renamed.md"], description: "You renamed First.md to Second.md.", actor: "you", chatTitle: "Biology revision")
+        var yesterday = first; yesterday.id = UUID(); yesterday.timestamp = Calendar.current.date(byAdding: .day, value: -1, to: first.timestamp)!
+        for question in ["what did you do today", "what have you done", "what did you change", "what did Obby do yesterday", "summary of today", "this week", "earlier", "so far", "what have we been doing", "what have you worked on"] {
+            check(ToolRouting.classify(question) == .memoryQuestion && !ProcedureStore.retrieve([first, yesterday], prompt: question, root: root.path, current: chatID, now: now).isEmpty, "history recalled for: " + question)
+        }
+        for greeting in ["hi", "thanks", "how are you", "how have you been doing?"] {
+            check(ToolRouting.classify(greeting) != .memoryQuestion && model.procedurePacket(for: greeting).isEmpty && ProcedureStore.retrieve([first], prompt: greeting, root: root.path, current: chatID, now: now).isEmpty, "small talk never retrieves history: " + greeting)
+        }
+        check(!ProcedureStore.isActivityQuestion("Can you create a note about this enzyme?"), "work command stays out of direct history answers")
+        check(!model.procedurePacket(for: "remind me").isEmpty, "all memory questions retrieve history, beyond activity patterns")
+        let alias = root.appendingPathComponent("root-alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: root)
+        check(ProcedureStore.retrieve([first], prompt: "what have you done", root: alias.path + "/./", current: chatID, now: now).count == 1, "history matches standardized symlink-equivalent roots")
+        var legacy = first; legacy.notesRoot = root.appendingPathComponent("old-location").path
+        check(ProcedureStore.retrieve([legacy], prompt: "what have you done", root: root.path, current: chatID, now: now).count == 1, "legacy unmatched root falls back to existing paths")
+        legacy.paths = ["../outside.md"]
+        check(ProcedureStore.retrieve([legacy], prompt: "what have you done", root: root.path, current: chatID, now: now).isEmpty, "legacy fallback rejects paths outside the vault")
+        let answer = ProcedureStore.answer([second, first, first], prompt: "what did you do today", root: root.path, current: chatID, now: now)
+        check(answer.contains("## Today") && answer.contains("### Biology revision") && answer.contains("09:02 · Obby: Created First.md.") && answer.contains("14:32 · You: renamed First.md to Second.md."), "direct answer has day, chat title, time and both actor labels")
+        check(answer.range(of: "09:02")!.lowerBound < answer.range(of: "14:32")!.lowerBound && answer.components(separatedBy: "Created First.md.").count == 2, "direct answer sorts oldest first and deduplicates retries")
+        let oldRecords = (1...7).map { index -> ProcedureRecord in
+            var record = yesterday; record.id = UUID(); record.timestamp = yesterday.timestamp.addingTimeInterval(Double(index * 60)); record.description = "Action \(index)"; return record
+        }
+        let fallback = ProcedureStore.answer(oldRecords, prompt: "what did you do today", root: root.path, current: chatID, now: now)
+        check(fallback.contains("Nothing recorded for today") && fallback.contains("2026-09-28") && !fallback.contains("Action 2") && fallback.contains("Action 3") && fallback.contains("Action 7"), "empty day lists five most recent dated actions")
+        check(ProcedureStore.answer([], prompt: "what did you do today", root: root.path, current: chatID, now: now) == "Nothing recorded for today", "empty history is explicit")
+        let encoded = try JSONEncoder().encode(first)
+        var legacyObject = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+        for key in ["actor", "chatTitle", "rootIdentity"] { legacyObject.removeValue(forKey: key) }
+        let decodedLegacy = try JSONDecoder().decode(ProcedureRecord.self, from: JSONSerialization.data(withJSONObject: legacyObject))
+        check(decodedLegacy.actorLabel == "Obby", "old procedural records decode with Obby as actor")
+        var sameAction = first; sameAction.id = UUID(); sameAction.actor = "you"
+        check(ProcedureStore.merge([sameAction], into: [first]).count == 2, "deduplication keeps different actors separate")
+
+        let originalFolder = root.appendingPathComponent("original-vault")
+        let movedFolder = root.appendingPathComponent("moved-vault")
+        try fm.createDirectory(at: originalFolder, withIntermediateDirectories: true)
+        var movedRecord = first; movedRecord.notesRoot = originalFolder.path; movedRecord.rootIdentity = ProcedureStore.identity(originalFolder)
+        let originalIdentity = movedRecord.rootIdentity
+        try fm.moveItem(at: originalFolder, to: movedFolder)
+        let migrated = ProcedureStore.migrate([movedRecord, otherRoot], to: movedFolder.path, identity: ProcedureStore.identity(movedFolder))
+        check(originalIdentity != nil && migrated[0].notesRoot == ProcedureStore.canonicalRoot(movedFolder.path) && migrated[1] == otherRoot, "same directory identity migrates moved roots and preserves unrelated records")
+        var bookmarkRecord = movedRecord; bookmarkRecord.rootIdentity = nil
+        check(ProcedureStore.migrate([bookmarkRecord], to: movedFolder.path, identity: ProcedureStore.identity(movedFolder), bookmarkRoot: originalFolder.path)[0].notesRoot == ProcedureStore.canonicalRoot(movedFolder.path), "resolved bookmark migrates legacy records without identity")
+        check(ProcedureStore.migrate([movedRecord], to: root.path, identity: ProcedureStore.identity(root))[0] == movedRecord, "unrelated folder selection retains old records")
+
+        let storedBeforeSidebar = try ProcedureStore.load()
+        try ProcedureStore.write([movedRecord, otherRoot])
+        let reopened = AppModel(restoreState: false)
+        reopened.openVault(movedFolder)
+        check(try ProcedureStore.load().first?.notesRoot == ProcedureStore.canonicalRoot(movedFolder.path), "opening moved notes folder persists identity-based migration")
+        reopened.clearVault()
+        try ProcedureStore.write(storedBeforeSidebar)
+        model.memory.title = "Sidebar work"
+        try model.createSidebarItem("User folder", directory: true)
+        try model.createSidebarItem("User note.md", directory: false)
+        check(model.renameNote("User note.md", to: "User renamed"), "user inline rename succeeds")
+        let drag = model.beginSidebarDrag("User renamed.md")!
+        check(model.moveSidebarItem(drag, to: "User folder"), "user sidebar move succeeds")
+        model.deleteOverride = { _ in true }
+        model.remove("User folder/User renamed.md")
+        let userRecords = try ProcedureStore.load().filter { $0.actor == "you" }
+        check(Set(userRecords.map(\.action)).isSuperset(of: ["create_directory", "create_file", "rename_path", "move_path", "delete_path"]) && userRecords.allSatisfy { $0.description.hasPrefix("You ") }, "user sidebar creates, rename, move and Trash are recorded as You")
+        check(model.activityAnswer(for: "what did you do today").contains("You: renamed User note.md to User renamed.md."), "user actions appear labelled in direct answers")
+        let countBeforeFailure = try ProcedureStore.load().count
+        rejected("failed sidebar creation is rejected") { try model.createSidebarItem("User folder", directory: true) }
+        check(try ProcedureStore.load().count == countBeforeFailure, "failed sidebar action creates no history")
+        model.selectedModel = ""; model.connected = false; memoryRequests = []
+        model.send("what have you done")
+        check(!model.busy && memoryRequests.isEmpty && model.chat.last!.text.contains("From Obby's activity history") && model.chat.last!.text.contains("You:"), "offline activity answer needs no selected model")
+        let longActivity = String(repeating: "09:02 · Obby: Created a note.\n", count: 250)
+        model.appendChat(role: "Obby", text: longActivity, fromActivityHistory: true)
+        model.appendChat(role: "You", text: "thanks")
+        check(model.chat.dropLast().last?.text == longActivity, "latest activity answer keeps every line beyond the ordinary display cap")
+        model.selectedModel = "test"; model.connected = true
+        try ProcedureStore.write(storedBeforeSidebar)
 
         let sharingContainer = NSView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800))
         let headerContainer = NSView(frame: NSRect(x: 250, y: 600, width: 650, height: 60))

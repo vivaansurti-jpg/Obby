@@ -3,16 +3,16 @@ import AppKit
 import UniformTypeIdentifiers
 
 enum Format: String, CaseIterable {
-    case bold = "Bold", italic = "Italic", underline = "Underline", heading = "Heading 1", heading2 = "Heading 2", heading3 = "Heading 3", bullet = "Bullets", numbered = "Numbers", checkbox = "Checklist", checked = "Completed", size = "Large text"
+    case bold = "Bold", italic = "Italic", underline = "Underline", heading = "Heading 1", heading2 = "Heading 2", heading3 = "Heading 3", bullet = "Bullets", numbered = "Numbers", checkbox = "Checklist", checked = "Completed"
     func apply(to text: String, range: NSRange) -> (String, NSRange) {
         let source = text as NSString
         let safe = NSRange(location: min(range.location, source.length), length: min(range.length, source.length - min(range.location, source.length)))
         var affected = safe
         var replacement: String
         switch self {
-        case .bold, .italic, .underline, .size:
+        case .bold, .italic, .underline:
             let markers: (String, String)
-            switch self { case .bold: markers = ("**", "**"); case .italic: markers = ("*", "*"); case .underline: markers = ("<u>", "</u>"); default: markers = ("<span style=\"font-size:18px\">", "</span>") }
+            switch self { case .bold: markers = ("**", "**"); case .italic: markers = ("*", "*"); default: markers = ("<u>", "</u>") }
             let selected = source.substring(with: safe)
             replacement = markers.0 + selected + markers.1
             return (source.replacingCharacters(in: safe, with: replacement), NSRange(location: safe.location + (markers.0 as NSString).length, length: safe.length))
@@ -163,7 +163,6 @@ final class EditorBridge: ObservableObject {
         case .bold: inlineKey = .obbyBold
         case .italic: inlineKey = .obbyItalic
         case .underline: inlineKey = .obbyUnderline
-        case .size: inlineKey = .obbyLarge
         default: inlineKey = nil
         }
         if let key = inlineKey {

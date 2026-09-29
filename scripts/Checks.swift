@@ -34,7 +34,7 @@ import AppKit
         try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent("dangling.md").path, withDestinationPath: "/tmp/obby-no-such-file")
         blocked("dangling symlink") { try vault.write("dangling.md", content: "bad", create: true) }
         check(try vault.entries().count == 1, "tree excludes symlinks")
-        for (format, expected) in [(Format.bold, "**important**"), (.italic, "*important*"), (.underline, "<u>important</u>"), (.heading, "# important"), (.heading2, "## important"), (.heading3, "### important"), (.size, "<span style=\"font-size:18px\">important</span>")] {
+        for (format, expected) in [(Format.bold, "**important**"), (.italic, "*important*"), (.underline, "<u>important</u>"), (.heading, "# important"), (.heading2, "## important"), (.heading3, "### important")] {
             check(format.apply(to: "important", range: NSRange(location: 0, length: 9)).0 == expected, format.rawValue)
         }
         for (format, expected) in [(Format.bullet, "- one\n- two\nthree"), (.numbered, "1. one\n2. two\nthree"), (.checkbox, "- [ ] one\n- [ ] two\nthree"), (.checked, "- [x] one\n- [x] two\nthree")] {
@@ -69,7 +69,60 @@ import AppKit
         let rendered = RichMarkdown.parse(aiReply)
         check(rendered.string.contains("Some bold, italic, both and underlined text.") && rendered.string.contains("`**code**`") && rendered.string.contains("**fenced**"), "AI Markdown renders without visible markers; code stays literal")
         check(!rendered.string.contains("# ") && !rendered.string.contains("<u>") && !rendered.string.contains("- [ ]") && rendered.string.contains("☐ open task") && rendered.string.contains("• one"), "AI headings, underline, lists and checkboxes render visually")
-        check(RichMarkdown.serialize(rendered) == aiReply, "AI Markdown saves back unchanged")
+        check(Data(RichMarkdown.serialize(rendered).utf8) == Data(aiReply.utf8), "AI Markdown saves back unchanged")
+        // Round trip: opening and saving an unedited note never changes a byte.
+        let vaultNote = [
+            "---", "title: Cells", "tags: [biology, revision]", "aliases:", "  - Cell notes", "---",
+            "# Heading 1", "## Heading 2", "### Heading 3", "#### Heading 4", "###### Heading 6", "#hashtag and #tag/nested", "#  Two spaces",
+            "- dash item", "* star item", "+ plus item", "  - nested item", "\t- tab item", "1. one", "01. zero-padded", "3) paren",
+            "- [ ] open", "- [x] done", "- [X] capital done", "- [ ]", "- ", "-",
+            "**bold**, *italic*, ***both***, __under bold__, _under italic_, *a **nested** b*, **<u>mixed</u>**, <u>under</u>",
+            "** not bold **, 2 * 3 * 4, a*b*c, trailing  ", "",
+            "| A | **B** |", "|---|:---:|", "| `x|y` | [[Note|alias]] |", "",
+            "```swift", "# not a heading", "- not a list", "**not bold**", "```",
+            "~~~", "**tilde fenced**", "~~~~",
+            "Inline `**code**` and ``double `tick` code``",
+            "[Link](Other.md) [web](https://example.com/*a*b) <https://example.com> ![Image](Attachments/a.png) ![[Embed.png]] ![[Note#Heading]]",
+            "[[Wiki link]] [[Wiki link|Alias]] [[Note#Section]] [[Note^block]] ^block-id",
+            "> [!note] Callout title", "> Callout body with **bold**", "> - quoted list",
+            "<div align=\"center\">HTML <b>bold</b></div>", "<span style=\"font-size:18px\">old large text</span>",
+            "%% Obsidian comment %%", "==highlight== ~~strike~~ $math$", "Setext", "===",
+            "Windows line\r", "# Heading with CR\r", "",
+        ].joined(separator: "\n")
+        check(Data(RichMarkdown.serialize(RichMarkdown.parse(vaultNote)).utf8) == Data(vaultNote.utf8), "opening and saving an unedited note is byte-for-byte identical")
+        let roundTripFixtures: [(String, String)] = [
+            ("vault syntax", vaultNote),
+            ("CRLF", vaultNote.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\n", with: "\r\n")),
+            ("Unicode", "# Café e\u{301} 👩🏽‍🔬\n**é e\u{301}** [[e\u{301}|é]] #タグ\n"),
+            ("no trailing newline", "# Title\n\n[[Note]] #tag ![[Image.png]]"),
+            ("trailing blanks", "**bold**  \n\n\n"),
+            ("empty", ""),
+            ("UTF-8 BOM", "\u{FEFF}---\ntags: [biology]\n---\n# Title\n"),
+            ("unclosed fence", "~~~markdown\n# literal\n- [X] task\n<u>literal</u>"),
+            ("nested HTML", "<div>\n<span style=\"font-size:18px\">old **large** text</span>\n<!-- [[Note]] -->\n</div>\n"),
+        ]
+        let roundTripModel = AppModel(restoreState: false)
+        roundTripModel.vault = vault; roundTripModel.rememberChats = false
+        for (index, fixture) in roundTripFixtures.enumerated() {
+            let (label, source) = fixture, path = "Roundtrip-\(index).md"
+            let url = root.appendingPathComponent(path), bytes = Data(source.utf8)
+            try bytes.write(to: url)
+            roundTripModel.openNote(path)
+            let rich = RichMarkdown.parse(roundTripModel.text)
+            let output = RichMarkdown.serialize(rich)
+            check(Data(output.utf8) == bytes, "rich editor byte round trip: " + label)
+            rich.append(NSAttributedString(string: "\n\nAdded paragraph."))
+            check(Data(RichMarkdown.serialize(rich).utf8) == Data((source + "\n\nAdded paragraph.").utf8), "adding prose preserves existing syntax bytes: " + label)
+            roundTripModel.text = output
+            check(roundTripModel.save() && (try? Data(contentsOf: url)) == bytes, "open and explicit save preserve disk bytes: " + label)
+            try vault.write(path, content: output)
+            check(try Data(contentsOf: url) == bytes, "serialized write preserves disk bytes: " + label)
+            try FileManager.default.removeItem(at: url)
+        }
+        roundTripModel.note = nil
+
+        check(RichMarkdown.parse("---\ntitle: x\n- a\n---\n- b").string.hasPrefix("---\ntitle: x\n- a\n---\n•"), "frontmatter stays literal; the note body is formatted")
+        check(RichMarkdown.parse("* star").string == "* star" && RichMarkdown.parse("- dash").string == "• dash", "lines that cannot save back exactly stay literal")
         let lines = RichMarkdown.parse("one\ntwo")
         let bulleted = RichMarkdown.toggleBlock(lines, range: NSRange(location: 0, length: lines.length), format: .bullet)!
         check(RichMarkdown.serialize(bulleted.1) == "- one\n- two" && bulleted.0.length == 7, "bullets toggle on")
@@ -446,6 +499,7 @@ import AppKit
         model.openNote("Current.md")
         model.send("Add this to Current.md")
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        while let refresh = model.refreshTask { await refresh.value } // Tool writes refresh the editor asynchronously.
         check(try vault.read("Current.md") == "# TOK\nAdded line" && model.text == "# TOK\nAdded line" && !model.dirty, "text tool call edits the note and the open editor refreshes")
         check(model.chat.contains { $0.text == "Updated Current.md." } && !model.chat.contains { $0.role == "Obby" && $0.text.contains("write_file") }, "compact summary shown, no raw tool syntax")
         _ = try model.executeTool("append_to_file", arguments: ["path": "Current.md", "content": "More"])
@@ -638,12 +692,13 @@ Earlier in this chat (condensed):
         for (name, updated, original, rules) in promptCases {
             for rule in rules { check(updated.contains(rule), "\(name) keeps: \(rule)") }
             let oldTokens = ContextBudget.tokens(original), newTokens = ContextBudget.tokens(updated)
-            check(newTokens < oldTokens, "\(name) is shorter")
+            if name != "Memory question" { check(newTokens < oldTokens, "\(name) is shorter") } // History grounding is now explicitly required.
             print("PROMPT TOKENS \(name): \(oldTokens) -> \(newTokens)")
         }
         check(promptSource.contains("Chat memory (continue from it):") && promptSource.contains("Earlier (condensed):"), "short memory headers used in requests")
         check(promptSource.contains("attached.isEmpty ? \"\" : "), "attachment hint remains conditional")
         check(AppModel.toolSystemPrompt(isLocal: false, note: nil, folder: "").contains("Current note: none. Selected folder: /."), "prompt preserves empty note and root folder interpolation")
+        check(promptSource.contains("Procedural History below lists actions actually completed. Use it; never claim nothing happened if it lists actions."), "memory questions ground answers in completed history")
         let toolDescriptions = model.toolDefinitions.compactMap { ($0["function"] as? [String: Any])?["description"] as? String }
         check(toolDescriptions.count == 15 && toolDescriptions.allSatisfy { $0.count <= 170 }, "tool descriptions kept short")
 
@@ -870,6 +925,23 @@ Earlier in this chat (condensed):
         let stem = outside.deletingPathExtension().lastPathComponent
         check(firstImport == [stem + ".md"] && secondImport == [stem + "-2.md"] && (try? vault.read(stem + ".md")) == "Dropped **text**" && FileManager.default.fileExists(atPath: outside.path), "dropped Markdown is copied in as a note without overwriting")
         check(model.importNotes([root.appendingPathComponent("TaskUndo/linker.md")]) == ["TaskUndo/linker.md"], "a dropped note already in the folder just opens")
+
+        // A pure memory command goes to Permanent Memory only: no model call, no tools, no note search or creation.
+        var memoryRoutes: [String] = []
+        let savedMemoryOverride = model.requestOverride
+        model.requestOverride = { route, _ in memoryRoutes.append(route); return ["message": ["role": "assistant", "content": "unexpected"]] }
+        let birthdayRemoteBefore = remote.count
+        model.clearChat()
+        model.send("Remember that my birthday is on 29 September")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let birthdayNotes = try vault.search("birthday")
+        check(model.globalMemory.remembered.contains("my birthday is on 29 September") && !memoryRoutes.contains("/api/chat") && remote.count == birthdayRemoteBefore
+              && (try? vault.read("birthday.md")) == nil && birthdayNotes.isEmpty
+              && !model.chat.contains { $0.role == "Action" } && model.chat.last?.text == "Saved to Permanent Memory.", "\"Remember that…\" saves only to Permanent Memory, with no tools or model call")
+        check(!AppModel.asksForFileAction("Remember that my birthday is on 29 September") && AppModel.asksForFileAction("Remember that the exam is Friday and add it to Plans.md")
+              && AppModel.asksForFileAction("remember this and create a note about it"), "memory commands that also ask for a file action use the normal path")
+        model.globalMemory.remembered.removeAll { $0 == "my birthday is on 29 September" }; _ = model.globalMemory.save()
+        model.requestOverride = savedMemoryOverride
 
         // Follow-ups keep the previous task's tools; "note b" finds b's only note
         let task = "go into note b, and shorten the story to 10 words."

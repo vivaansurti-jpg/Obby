@@ -124,7 +124,7 @@ Any file can be attached and opened. The AI can read PDF (selectable text via PD
 
 ## Sharing
 
-The note header Share button and **File → Share** save pending edits and open the native macOS sharing picker with the note’s `.md` file. Available services are supplied by macOS. Notes with attachments also offer **Export as PDF…**, which saves a paginated rendering with local images. Remote images are not downloaded. Sharing requires no Obby account or hosted link; Obby does not upload notes itself.
+The note header Share button and **File → Share** save pending edits and open the native macOS sharing picker with the note’s `.md` file. Available services are supplied by macOS. Every open note offers **Export as PDF…** in its header and the File menu, saving a paginated rendering with any local images. The sharing picker opens beside the note’s Share button. Remote images are not downloaded. Sharing requires no Obby account or hosted link; Obby does not upload notes itself.
 
 ## AI memory
 

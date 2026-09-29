@@ -34,7 +34,7 @@ import UniformTypeIdentifiers
             CommandGroup(replacing: .saveItem) {
                 Button("Save") { model.save() }.keyboardShortcut("s")
                 Button("Share") { model.shareNote() }.disabled(model.note == nil)
-                if !model.noteAttachments.isEmpty { Button("Export as PDF…") { model.exportNotePDF() } }
+                Button("Export as PDF…") { model.exportNotePDF() }.disabled(model.note == nil)
                 Button("Save Recovery Copy…") { model.saveRecoveryCopy() }.disabled(!model.dirty)
             }
             CommandGroup(after: .sidebar) {
@@ -142,9 +142,8 @@ struct ContentView: View {
                         if let note = model.note {
                             HStack {
                                 NoteTitleField(path: note); Spacer()
-                                if !model.noteAttachments.isEmpty { Button("Export as PDF…") { model.exportNotePDF() }.buttonStyle(.borderless) }
-                                Button { model.shareNote() } label: { Image(systemName: "square.and.arrow.up") }
-                                    .buttonStyle(.borderless).help("Share").accessibilityLabel("Share")
+                                Button("Export as PDF…") { model.exportNotePDF() }.buttonStyle(.borderless)
+                                NoteShareButton(model: model).frame(width: 26, height: 24)
                             }.padding(.horizontal).padding(.vertical, 20)
                             HStack(spacing: 12) {
                                 Button { bridge.format(.bold) } label: { Image(systemName: "bold") }.help("Bold").keyboardShortcut("b")

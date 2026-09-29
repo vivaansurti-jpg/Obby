@@ -93,6 +93,14 @@ import AppKit
         _ = model.clearProceduralHistory(); _ = model.clearPermanentMemory(); _ = model.resetChat()
         model.error = nil; model.requestOverride = nil
 
+        let sharingContainer = NSView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800))
+        let headerContainer = NSView(frame: NSRect(x: 250, y: 600, width: 650, height: 60))
+        let shareAnchor = NSButton(frame: NSRect(x: 550, y: 10, width: 26, height: 24))
+        shareAnchor.identifier = NoteShareButton.identifier
+        sharingContainer.addSubview(headerContainer); headerContainer.addSubview(shareAnchor)
+        check(NoteShareButton.anchor(in: sharingContainer) === shareAnchor, "File Share resolves the actual header button through nested view coordinates")
+        check(NotePDF.render("# Plain note\n\nA note without attachments.", vault: vault, folder: "").string.contains("A note without attachments."), "PDF export renders Markdown without attachments")
+
         check(String(ChatMarkdown.paragraph("a\nb").characters) == "a\nb", "single paragraph newline renders literally")
         check(ChatMarkdown.blocks("\n\na\n\n\n\nb\n\n").count == 2, "blank lines collapse and outer blank lines disappear")
         if case .code(let code) = ChatMarkdown.blocks("```\na\n\n\n\nb\n```").first! {

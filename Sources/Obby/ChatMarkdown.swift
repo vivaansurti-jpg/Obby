@@ -697,14 +697,41 @@ struct MemoryDangerZone: View {
     }
 }
 
+/// A real AppKit button supplies its own bounds as the sharing picker's anchor.
+struct NoteShareButton: NSViewRepresentable {
+    let model: AppModel
+    static let identifier = NSUserInterfaceItemIdentifier("ObbyNoteShare")
+    func makeCoordinator() -> Coordinator { Coordinator(model) }
+    func makeNSView(context: Context) -> NSButton {
+        let button = NSButton(image: NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: "Share")!, target: context.coordinator, action: #selector(Coordinator.share(_:)))
+        button.identifier = Self.identifier
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.toolTip = "Share"
+        button.setAccessibilityLabel("Share")
+        return button
+    }
+    func updateNSView(_ button: NSButton, context: Context) { button.isEnabled = model.note != nil }
+    @MainActor static func anchor(in view: NSView) -> NSView? {
+        if view.identifier == identifier { return view }
+        for child in view.subviews { if let found = anchor(in: child) { return found } }
+        return nil
+    }
+    @MainActor final class Coordinator: NSObject {
+        let model: AppModel
+        init(_ model: AppModel) { self.model = model }
+        @objc func share(_ sender: NSButton) { model.shareNote(from: sender) }
+    }
+}
+
 @MainActor extension AppModel {
     /// Save first; the system alone decides which sharing service handles the local Markdown file.
-    func shareNote() {
+    func shareNote(from anchor: NSView? = nil) {
         guard let note, let vault, save() else { return }
         perform {
             let url = try vault.resolve(note)
-            guard let view = NSApp.keyWindow?.contentView else { throw ObbyError("Open a note window before sharing.") }
-            NSSharingServicePicker(items: [url]).show(relativeTo: NSRect(x: view.bounds.maxX - 40, y: view.bounds.maxY - 60, width: 1, height: 1), of: view, preferredEdge: .minY)
+            guard let view = anchor ?? NSApp.keyWindow?.contentView.flatMap({ NoteShareButton.anchor(in: $0) }) else { throw ObbyError("Open a note window before sharing.") }
+            NSSharingServicePicker(items: [url]).show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
         }
     }
 

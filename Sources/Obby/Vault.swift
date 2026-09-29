@@ -18,6 +18,21 @@ struct ObbyError: LocalizedError {
     init(_ message: String) { self.message = message }
     var errorDescription: String? { message }
 }
+/// A decoded source or a display-only preview. Invalid bytes are never passed to an editable view.
+struct NoteSource {
+    let bytes: Data
+    let text: String
+    let isReadOnly: Bool
+    static let readOnlyNotice = "This file isn’t valid UTF-8. Read-only preview; its original bytes are preserved."
+    init(bytes: Data) {
+        self.bytes = bytes
+        if let source = String(data: bytes, encoding: .utf8), source.utf8.elementsEqual(bytes) {
+            text = source; isReadOnly = false
+        } else {
+            text = String(decoding: bytes, as: UTF8.self); isReadOnly = true
+        }
+    }
+}
 final class Vault {
     private let selfWriteLock = NSLock()
     private var selfWrites: [String: (TimeInterval, NSDictionary)] = [:]
@@ -85,13 +100,19 @@ final class Vault {
         return url
     }
     static func contentVersion(_ text: String) -> Data { Data(SHA256.hash(data: Data(text.utf8))) }
-    func read(_ path: String) throws -> String { try String(contentsOf: markdown(path), encoding: .utf8) }
+    func readSource(_ path: String) throws -> NoteSource { NoteSource(bytes: try Data(contentsOf: markdown(path))) }
+    func read(_ path: String) throws -> String {
+        let source = try readSource(path)
+        guard !source.isReadOnly else { throw ObbyError(NoteSource.readOnlyNotice) }
+        return source.text
+    }
     func write(_ path: String, content: String, create: Bool = false) throws {
         let url = try markdown(path)
         if create && fm.fileExists(atPath: url.path) { throw ObbyError("A file already exists at \(path).") }
         if !create && !fm.fileExists(atPath: url.path) { throw ObbyError("The note no longer exists.") }
         let name = url.lastPathComponent, parent = (path as NSString).deletingLastPathComponent
         do {
+            if !create, NoteSource(bytes: try Data(contentsOf: url)).isReadOnly { throw ObbyError(NoteSource.readOnlyNotice) }
             if create && !parent.isEmpty { try mkdir(parent) } // Missing parent folders, through resolve() like any folder.
             try atomicWrite(Data(content.utf8), to: url, create: create)
         } catch let error as ObbyError { throw error } catch { throw Self.saveError(name, error) }

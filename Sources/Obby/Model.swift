@@ -7,7 +7,8 @@ import CoreServices
     @Published var tree: [Entry] = []
     @Published var selection: String?
     @Published var note: String? 
-    @Published var text = "" { didSet { if !loading && text != oldValue { dirty = true; scheduleSave() } } }
+    @Published var text = "" { didSet { if !loading && !text.utf8.elementsEqual(oldValue.utf8) { dirty = true; scheduleSave() } } }
+    @Published var editorReadOnly = false
     @Published var dirty = false
     @Published var status = ""
     @Published var error: String?
@@ -103,6 +104,7 @@ import CoreServices
     var historySummary: String { get { memory.summary } set { memory.summary = newValue } }
     var loading = false
     var diskText = ""
+    var diskBytes = Data()
     var saveTask: Task<Void, Never>?
     var aiTask: Task<Void, Never>?
     var rootUnavailable = false
@@ -181,7 +183,7 @@ import CoreServices
         guard clearChat() else { return }
         vault = nil; tree = []; results = []; query = ""; selection = nil; note = nil
         loading = true; text = ""; loading = false
-        diskText = ""; dirty = false; status = ""; error = nil; saveConflict = false
+        diskText = ""; diskBytes = Data(); editorReadOnly = false; dirty = false; status = ""; error = nil; saveConflict = false
         scopedURL?.stopAccessingSecurityScopedResource(); scopedURL = nil
         for key in ["bookmark", "rootPath", "lastNote", "rootIsNotesFolder"] { UserDefaults.standard.removeObject(forKey: key) }
     }
@@ -246,7 +248,7 @@ import CoreServices
         searchTask?.cancel(); searchTask = nil
         migrateProcedureRoot(to: chosen.root, bookmarkRoot: matchedBookmarkRoot)
         vault = chosen
-        note = nil; selection = nil; loading = true; text = ""; loading = false; dirty = false
+        note = nil; selection = nil; editorReadOnly = false; diskBytes = Data(); loading = true; text = ""; loading = false; dirty = false
         clearChat()
         restoreLatestChat() // Continue this folder's most recent chat (when remembering is on).
         Task.detached(priority: .background) { chosen.removeStaleTemporaryFiles() } // Leftovers from an interrupted save or import, if any.
@@ -256,15 +258,15 @@ import CoreServices
         watchRoot()
         if let bookmark = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil) { UserDefaults.standard.set(bookmark, forKey: "bookmark") }
         refresh()
-        if let path = UserDefaults.standard.string(forKey: "lastNote"), (try? vault?.read(path)) != nil { openNote(path) }
+        if let path = UserDefaults.standard.string(forKey: "lastNote"), (try? vault?.readSource(path)) != nil { openNote(path) }
     }
     func refresh() {
         guard validateRoot(), let vault else { return }
         guard refreshTask == nil else { refreshAgain = true; return }
-        let open = note, baseline = diskText
+        let open = note, baseline = diskBytes
         refreshTask = Task { [weak self] in
-            let worker = Task.detached(priority: .utility) { () throws -> ([Entry], String?) in
-                (try vault.tree(), open.flatMap { try? vault.read($0) })
+            let worker = Task.detached(priority: .utility) { () throws -> ([Entry], NoteSource?) in
+                (try vault.tree(), open.flatMap { try? vault.readSource($0) })
             }
             let result = await withTaskCancellationHandler { await worker.result } onCancel: { worker.cancel() }
             guard !Task.isCancelled, let self, self.vault === vault else { return }
@@ -273,9 +275,9 @@ import CoreServices
             switch result {
             case .success(let (fresh, freshText)):
                 if fresh != self.tree { self.tree = fresh }
-                if let open, self.note == open, !self.dirty, self.diskText == baseline {
+                if let open, self.note == open, !self.dirty, self.diskBytes == baseline {
                     if let freshText {
-                        if freshText != baseline { self.loading = true; self.text = freshText; self.loading = false; self.diskText = freshText; self.status = "Updated from disk" }
+                        if freshText.bytes != baseline { self.loadEditorSource(freshText); self.status = freshText.isReadOnly ? NoteSource.readOnlyNotice : "Updated from disk" }
                     } else { self.closeNote(); self.status = "Note moved or removed outside Obby" }
                 }
                 if !self.query.isEmpty, self.searchTask == nil { self.search() }
@@ -298,11 +300,17 @@ import CoreServices
     func openNote(_ path: String) {
         guard path != note, save(), let vault else { return }
         perform {
-            let content = try vault.read(path)
-            loading = true; text = content; loading = false; diskText = content; note = path; dirty = false
+            let content = try vault.readSource(path)
+            loadEditorSource(content); note = path
             UserDefaults.standard.set(path, forKey: "lastNote")
         }
         updateBacklinks()
+    }
+    private func loadEditorSource(_ source: NoteSource) {
+        loading = true; text = source.text; loading = false
+        diskText = source.text; diskBytes = source.bytes; dirty = false
+        editorReadOnly = source.isReadOnly
+        status = source.isReadOnly ? NoteSource.readOnlyNotice : ""
     }
     /// Markdown files dropped onto Obby from Finder: copied (never moved) into the selected folder as notes, with
     /// "-2", "-3"… when the name is taken, then opened. Files already inside the notes folder are just opened.
@@ -318,7 +326,7 @@ import CoreServices
             }
             let stem = Self.filenameStem(forTitle: url.deletingPathExtension().lastPathComponent)
             guard (try? Self.validateNoteName(stem)) != nil else { problems.append(url.lastPathComponent + " (unsupported name)"); continue }
-            let text = content.replacingOccurrences(of: "\r\n", with: "\n")
+            let text = content
             var copied: String?
             for number in 1...200 {
                 let name = number == 1 ? stem + ".md" : "\(stem)-\(number).md"
@@ -376,23 +384,23 @@ import CoreServices
         guard validateRoot() else { return !dirty }
         guard dirty, let note, let vault else { return true }
         do {
-            let current = try vault.read(note)
-            if current != diskText && !overwriteConflict {
+            guard !editorReadOnly else { throw ObbyError(NoteSource.readOnlyNotice) }
+            let current = try Data(contentsOf: vault.markdown(note))
+            if current != diskBytes && !overwriteConflict {
                 saveConflict = true
                 throw ObbyError("This note changed outside Obby. Your unsaved edits remain in the editor. Overwrite the Markdown file with your edits, or reload its current contents.")
             }
             try vault.write(note, content: text)
             saveConflict = false
-            diskText = text; dirty = false; return true
+            diskText = text; diskBytes = Data(text.utf8); dirty = false; return true
         } catch { self.error = error.localizedDescription; return false }
     }
     func reloadAfterConflict() {
         guard let note, let vault else { return }
         perform {
-            let content = try vault.read(note)
+            let content = try vault.readSource(note)
             saveTask?.cancel(); saveTask = nil
-            loading = true; text = content; loading = false
-            diskText = content; dirty = false; saveConflict = false
+            loadEditorSource(content); saveConflict = false
         }
     }
     var folder: String {
@@ -550,7 +558,7 @@ import CoreServices
     func closeNote() {
         saveTask?.cancel(); saveTask = nil
         note = nil; loading = true; text = ""; loading = false
-        diskText = ""; dirty = false; saveConflict = false; backlinks = []
+        diskText = ""; diskBytes = Data(); editorReadOnly = false; dirty = false; saveConflict = false; backlinks = []
         UserDefaults.standard.removeObject(forKey: "lastNote")
     }
     func confirmDelete(_ path: String) -> Bool { // Always asked, whatever "Don't ask before AI edits" says.

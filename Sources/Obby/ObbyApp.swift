@@ -183,7 +183,10 @@ struct ContentView: View {
                                 Spacer()
                             }.buttonStyle(.borderless).padding(.horizontal).padding(.bottom, 10)
                             Divider()
-                            MarkdownEditor(text: $model.text, bridge: bridge, importAttachments: { model.importAttachments($0) }, openLink: { model.openLink($0) }).id(note)
+                            if model.editorReadOnly {
+                                Text(NoteSource.readOnlyNotice).font(.caption).foregroundStyle(.secondary).padding(.horizontal)
+                            }
+                            MarkdownEditor(text: $model.text, bridge: bridge, readOnly: model.editorReadOnly, importAttachments: { model.importAttachments($0) }, openLink: { model.openLink($0) }).id(note)
                                 .onReceive(NotificationCenter.default.publisher(for: .init("ObbyEditorFontSize"))) { _ in bridge.applyFontSize() }
                             if !model.backlinks.isEmpty { // Notes that link here; click to open.
                                 Divider()

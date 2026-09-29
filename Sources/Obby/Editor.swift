@@ -4,34 +4,68 @@ import UniformTypeIdentifiers
 
 enum Format: String, CaseIterable {
     case bold = "Bold", italic = "Italic", underline = "Underline", heading = "Heading 1", heading2 = "Heading 2", heading3 = "Heading 3", bullet = "Bullets", numbered = "Numbers", checkbox = "Checklist", checked = "Completed"
-    func apply(to text: String, range: NSRange) -> (String, NSRange) {
-        let source = text as NSString
-        let safe = NSRange(location: min(range.location, source.length), length: min(range.length, source.length - min(range.location, source.length)))
-        var affected = safe
-        var replacement: String
-        switch self {
-        case .bold, .italic, .underline:
-            let markers: (String, String)
-            switch self { case .bold: markers = ("**", "**"); case .italic: markers = ("*", "*"); default: markers = ("<u>", "</u>") }
-            let selected = source.substring(with: safe)
-            replacement = markers.0 + selected + markers.1
-            return (source.replacingCharacters(in: safe, with: replacement), NSRange(location: safe.location + (markers.0 as NSString).length, length: safe.length))
-        default:
-            var adjusted = safe
-            if adjusted.length > 0 && source.substring(with: NSRange(location: NSMaxRange(adjusted) - 1, length: 1)) == "\n" { adjusted.length -= 1 }
-            affected = source.lineRange(for: adjusted)
-            let original = source.substring(with: affected)
-            let trailing = original.hasSuffix("\n")
-            var lines = original.components(separatedBy: "\n")
-            if trailing { lines.removeLast() }
-            replacement = lines.enumerated().map { index, line in
-                let prefix: String
-                switch self { case .heading: prefix = "# "; case .heading2: prefix = "## "; case .heading3: prefix = "### "; case .bullet: prefix = "- "; case .numbered: prefix = "\(index + 1). "; case .checked: prefix = "- [x] "; default: prefix = "- [ ] " }
-                let clean = line.replacingOccurrences(of: "^(#{1,6} |[-*] (\\[[ xX]\\] )?|[0-9]+\\. )", with: "", options: .regularExpression)
-                return prefix + clean
-            }.joined(separator: "\n") + (trailing ? "\n" : "")
+    struct Edit { let range: NSRange; let text: String }
+    /// Edits are ordered from the end of the source to the beginning so offsets stay valid.
+    func edits(in text: String, range: NSRange) -> ([Edit], NSRange) {
+        let ns = text as NSString
+        let safe = NSRange(location: min(range.location, ns.length), length: min(range.length, ns.length - min(range.location, ns.length)))
+        if [.bold, .italic, .underline].contains(self) {
+            let left = self == .bold ? "**" : self == .italic ? "*" : "<u>"
+            let right = self == .underline ? "</u>" : left
+            let l = (left as NSString).length, r = (right as NSString).length
+            let selected = ns.substring(with: safe)
+            let selectedItalic = selected.prefix { $0 == "*" }.count % 2 == 1 && selected.reversed().prefix { $0 == "*" }.count % 2 == 1
+            if safe.length >= l + r, selected.hasPrefix(left), selected.hasSuffix(right), self != .italic || selectedItalic {
+                return ([Edit(range: NSRange(location: NSMaxRange(safe) - r, length: r), text: ""), Edit(range: NSRange(location: safe.location, length: l), text: "")], NSRange(location: safe.location, length: safe.length - l - r))
+            }
+            let surroundingItalic = ns.substring(to: safe.location).reversed().prefix { $0 == "*" }.count % 2 == 1 && ns.substring(from: NSMaxRange(safe)).prefix { $0 == "*" }.count % 2 == 1
+            if safe.location >= l, NSMaxRange(safe) + r <= ns.length, self != .italic || surroundingItalic,
+               ns.substring(with: NSRange(location: safe.location - l, length: l)) == left,
+               ns.substring(with: NSRange(location: NSMaxRange(safe), length: r)) == right {
+                return ([Edit(range: NSRange(location: NSMaxRange(safe), length: r), text: ""), Edit(range: NSRange(location: safe.location - l, length: l), text: "")], NSRange(location: safe.location - l, length: safe.length))
+            }
+            return ([Edit(range: NSRange(location: NSMaxRange(safe), length: 0), text: right), Edit(range: NSRange(location: safe.location, length: 0), text: left)], NSRange(location: safe.location + l, length: safe.length))
         }
-        return (source.replacingCharacters(in: affected, with: replacement), NSRange(location: affected.location, length: (replacement as NSString).length))
+        let all = RichMarkdown.lines(text)
+        let first = all.lastIndex { $0.range.location <= safe.location } ?? 0
+        let last = all.lastIndex { $0.range.location <= max(safe.location, NSMaxRange(safe) - 1) } ?? first
+        let rows = Array(all[first...last])
+        let pattern: String
+        switch self {
+        case .heading: pattern = #"^[ \t]*(#)[ \t]+"#
+        case .heading2: pattern = #"^[ \t]*(##)[ \t]+"#
+        case .heading3: pattern = #"^[ \t]*(###)[ \t]+"#
+        case .bullet: pattern = #"^[ \t]*([-+*])[ \t]+(?!\[)"#
+        case .numbered: pattern = #"^[ \t]*([0-9]+[.)])[ \t]+"#
+        case .checked: pattern = #"^[ \t]*([-+*][ \t]+\[[xX]\])[ \t]*"#
+        default: pattern = #"^[ \t]*([-+*][ \t]+\[ \])[ \t]*"#
+        }
+        let remove = rows.allSatisfy { !RichMarkdown.matches(pattern, in: $0.body).isEmpty && (self != .bullet || RichMarkdown.matches(RichMarkdown.checkboxPattern, in: $0.body).isEmpty) }
+        var edits: [Edit] = []
+        for (index, line) in rows.enumerated() {
+            let indent = (String(line.body.prefix { $0 == " " || $0 == "\t" }) as NSString).length
+            let prefix = RichMarkdown.matches(#"^[ \t]*(?:#{1,6}[ \t]+|[-+*](?:[ \t]+\[[ xX]\])?[ \t]+|[0-9]+[.)][ \t]+)"#, in: line.body).first
+            let length = max(0, (prefix?.range.length ?? indent) - indent)
+            let marker: String
+            switch self {
+            case .heading: marker = "# "
+            case .heading2: marker = "## "
+            case .heading3: marker = "### "
+            case .bullet: marker = "- "
+            case .numbered: marker = "\(index + 1). "
+            case .checked: marker = "- [x] "
+            default: marker = "- [ ] "
+            }
+            edits.append(Edit(range: NSRange(location: line.range.location + indent, length: length), text: remove ? "" : marker))
+        }
+        let delta = edits.reduce(0) { $0 + ($1.text as NSString).length - $1.range.length }
+        return (Array(edits.reversed()), NSRange(location: rows[0].range.location, length: max(0, NSMaxRange(rows.last!.range) - rows[0].range.location + delta)))
+    }
+    func apply(to text: String, range: NSRange) -> (String, NSRange) {
+        let (edits, selection) = edits(in: text, range: range)
+        let result = NSMutableString(string: text)
+        for edit in edits { result.replaceCharacters(in: edit.range, with: edit.text) }
+        return (result as String, selection)
     }
 }
 /// Plain GFM pipe tables: insert, find the table at the cursor, add a row or a column. Text only; nothing is re-padded.
@@ -91,7 +125,7 @@ final class EditorBridge: ObservableObject {
     weak var view: NSTextView?
     /// Toolbar "Insert image": pick image files, then the same import path as drag-and-drop and paste.
     func insertImage() {
-        guard let view = view as? PlainTextView else { return }
+        guard let view = view as? PlainTextView, view.isEditable else { return }
         let range = view.selectedRange()
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
@@ -106,7 +140,7 @@ final class EditorBridge: ObservableObject {
     }
     /// Toolbar "Attach document": any regular file, through the same import path as images.
     func attachDocument() {
-        guard let view = view as? PlainTextView else { return }
+        guard let view = view as? PlainTextView, view.isEditable else { return }
         let range = view.selectedRange()
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
@@ -119,7 +153,7 @@ final class EditorBridge: ObservableObject {
         view.insertAttachments(panel.urls.map { .file($0) })
     }
     func insertTable(columns: Int, rows: Int) {
-        guard let view = view as? PlainTextView else { return }
+        guard let view = view as? PlainTextView, view.isEditable else { return }
         view.window?.makeFirstResponder(view)
         view.insertBlock(MarkdownTable.make(columns: columns, rows: rows)) // One insertion, one undo step.
     }
@@ -147,38 +181,18 @@ final class EditorBridge: ObservableObject {
         view.replace(NSRange(location: start, length: (old as NSString).length),
                      with: NSAttributedString(string: new, attributes: RichMarkdown.baseAttributes), select: NSRange(location: caret.location, length: 0))
     }
-    /// Editor text size changed: restyle the whole note once.
+    /// Font-size changes restyle once, without changing source or undo history.
     func applyFontSize() {
-        guard let view = view as? PlainTextView, let storage = view.textStorage else { return }
-        RichMarkdown.style(storage, range: NSRange(location: 0, length: storage.length))
-        view.typingAttributes = RichMarkdown.baseAttributes
-        view.highlightLinks()
+        guard let view = view as? PlainTextView else { return }
+        view.restyle()
     }
-    /// True toggles on the formatted text (never by wrapping the selection in more Markdown characters).
     func format(_ style: Format) {
-        guard let view = view as? PlainTextView, let storage = view.textStorage else { return }
-        let selection = view.selectedRange()
-        let inlineKey: NSAttributedString.Key?
-        switch style {
-        case .bold: inlineKey = .obbyBold
-        case .italic: inlineKey = .obbyItalic
-        case .underline: inlineKey = .obbyUnderline
-        default: inlineKey = nil
-        }
-        if let key = inlineKey {
-            if selection.length == 0 { // No selection: the next typed text starts or stops using the style.
-                var typing = view.typingAttributes
-                typing[key] = typing[key] == nil ? true : nil
-                let paragraph = (storage.string as NSString).paragraphRange(for: selection)
-                view.typingAttributes = RichMarkdown.visual(typing, block: RichMarkdown.block(in: storage, paragraph: paragraph))
-            } else {
-                let changed = NSMutableAttributedString(attributedString: storage.attributedSubstring(from: selection))
-                RichMarkdown.toggleInline(changed, range: NSRange(location: 0, length: changed.length), key: key)
-                view.replace(selection, with: changed, select: selection)
-            }
-        } else if let result = RichMarkdown.toggleBlock(storage, range: selection, format: style) {
-            view.replace(result.0, with: result.1, select: NSRange(location: result.0.location + result.1.length, length: 0))
-        }
+        guard let view = view as? PlainTextView, view.isEditable else { return }
+        let (edits, selection) = style.edits(in: view.string, range: view.selectedRange())
+        view.undoManager?.beginUndoGrouping()
+        for edit in edits { view.insertText(edit.text, replacementRange: edit.range) }
+        view.undoManager?.endUndoGrouping()
+        view.setSelectedRange(selection)
         view.window?.makeFirstResponder(view)
     }
 }
@@ -221,6 +235,7 @@ final class PlainTextView: NSTextView {
     }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let sources = Self.attachmentSources(from: sender.draggingPasteboard, allowData: true)
+        guard isEditable else { return false }
         guard !sources.isEmpty, importAttachments != nil else { return super.performDragOperation(sender) }
         let index = characterIndexForInsertion(at: convert(sender.draggingLocation, from: nil))
         setSelectedRange(NSRange(location: index, length: 0))
@@ -228,104 +243,86 @@ final class PlainTextView: NSTextView {
         window?.makeFirstResponder(self)
         return true // Never fall back to inserting the original file path.
     }
-    /// The one path for drop, paste and both toolbar buttons: import into the root Attachments folder, insert a note-relative Markdown reference.
-    /// One undoable replacement of formatted text, restyled and followed by the normal change notification.
-    func replace(_ range: NSRange, with text: NSAttributedString, select: NSRange) {
-        guard let storage = textStorage, shouldChangeText(in: range, replacementString: text.string) else { return }
-        isNormalizing = true
-        storage.replaceCharacters(in: range, with: text)
-        RichMarkdown.style(storage, range: NSRange(location: range.location, length: text.length))
-        didChangeText()
-        isNormalizing = false
-        setSelectedRange(NSRange(location: min(select.location, storage.length), length: min(select.length, storage.length - min(select.location, storage.length))))
+    let styler = MarkdownStyler()
+    private var editedRange: NSRange?
+    func loadSource(_ source: String) {
+        textStorage?.setAttributedString(NSAttributedString(string: source))
+        restyle()
     }
-    var isNormalizing = false
-    /// After an edit: Markdown typed into these paragraphs ("**bold**", "# ", "- ", "1. ", "- [ ] ") becomes
-    /// formatting, damaged list markers turn back into plain lines, and fonts are refreshed. Text is re-read through the
-    /// same parser used when a note opens, so the result always matches the saved Markdown.
-    func normalize(_ range: NSRange) {
-        guard let storage = textStorage, !isNormalizing, storage.length > 0 else { return }
-        let ns = storage.string as NSString
-        let safe = NSRange(location: min(range.location, ns.length), length: min(range.length, ns.length - min(range.location, ns.length)))
-        let fromEnd = ns.length - selectedRange().location
-        var paragraphs: [NSRange] = []
-        ns.enumerateSubstrings(in: ns.paragraphRange(for: safe), options: [.byParagraphs, .substringNotRequired]) { _, content, _, _ in paragraphs.append(content) }
-        var fence = MarkdownFence()
-        for line in ns.substring(to: paragraphs.first?.location ?? 0).components(separatedBy: "\n").dropLast() { _ = fence.consume(line) }
-        let editable = paragraphs.filter { !fence.consume(ns.substring(with: $0)) }
-        var changed = false
-        for paragraph in editable.reversed() {
-            let current = storage.attributedSubstring(from: paragraph)
-            let fresh = RichMarkdown.parse(RichMarkdown.serialize(current))
-            guard fresh.string != current.string, shouldChangeText(in: paragraph, replacementString: fresh.string) else { continue }
-            isNormalizing = true
-            storage.replaceCharacters(in: paragraph, with: fresh)
-            didChangeText()
-            isNormalizing = false
-            changed = true
-        }
-        RichMarkdown.style(storage, range: NSRange(location: safe.location, length: min(storage.length - min(safe.location, storage.length), safe.length + 1)))
-        if changed { setSelectedRange(NSRange(location: max(0, storage.length - fromEnd), length: 0)) }
+    func restyle(_ range: NSRange? = nil) {
+        guard let storage = textStorage else { return }
+        styler.restyle(storage, edited: range)
+        typingAttributes = RichMarkdown.baseAttributes
+    }
+    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        guard isEditable, super.shouldChangeText(in: affectedCharRange, replacementString: replacementString) else { return false }
+        editedRange = NSRange(location: affectedCharRange.location, length: ((replacementString ?? "") as NSString).length)
+        return true
+    }
+    override func didChangeText() {
+        restyle(editedRange ?? selectedRange())
+        editedRange = nil
+        super.didChangeText() // The binding receives exactly the current source string.
+    }
+    func replace(_ range: NSRange, with text: NSAttributedString, select: NSRange) {
+        guard isEditable else { return }
+        insertText(text.string, replacementRange: range) // AppKit retains the existing undo path.
+        setSelectedRange(NSRange(location: min(select.location, (string as NSString).length), length: min(select.length, (string as NSString).length - min(select.location, (string as NSString).length))))
     }
     static func insideFence(_ text: NSString, before location: Int) -> Bool {
-        var fence = MarkdownFence()
-        for line in text.substring(to: location).components(separatedBy: "\n").dropLast() { _ = fence.consume(line) }
-        return fence.isOpen
+        let lines = RichMarkdown.lines(text as String), regions = RichMarkdown.regions(lines)
+        let index = lines.lastIndex { $0.range.location <= location } ?? 0
+        return regions[index] != .prose
     }
-    /// Return in a list continues it (numbers count up, done items continue as open ones); Return on an empty item
-    /// ends the list; Return after a heading continues in normal text.
+    /// Enter preserves the local newline spelling and inserts only the literal continuation marker.
     override func insertNewline(_ sender: Any?) {
-        guard let storage = textStorage else { return super.insertNewline(sender) }
-        let ns = storage.string as NSString, caret = selectedRange()
-        var paragraph = ns.paragraphRange(for: NSRange(location: caret.location, length: 0))
-        if paragraph.length > 0, ns.character(at: NSMaxRange(paragraph) - 1) == 10 { paragraph.length -= 1 }
-        guard caret.length == 0, let block = RichMarkdown.block(in: storage, paragraph: paragraph) else { return super.insertNewline(sender) }
-        if block.hasPrefix("h") { super.insertNewline(sender); typingAttributes = RichMarkdown.baseAttributes; return }
-        var markerEnd = paragraph.location
-        while markerEnd < NSMaxRange(paragraph), storage.attribute(.obbyMarker, at: markerEnd, effectiveRange: nil) != nil { markerEnd += 1 }
-        if markerEnd == NSMaxRange(paragraph) { // Empty item: end the list.
-            replace(paragraph, with: NSAttributedString(string: "", attributes: RichMarkdown.baseAttributes), select: NSRange(location: paragraph.location, length: 0))
-            typingAttributes = RichMarkdown.baseAttributes
-            return
+        guard isEditable else { return }
+        let caret = selectedRange(), lines = RichMarkdown.lines(string), regions = RichMarkdown.regions(lines)
+        let index = lines.lastIndex { $0.range.location <= caret.location } ?? 0
+        let line = lines[index]
+        let newline = line.ending.isEmpty ? (lines.first { !$0.ending.isEmpty }?.ending ?? "\n") : line.ending
+        var insertion = newline
+        if caret.length == 0, regions[index] == .prose,
+           let marker = RichMarkdown.matches(RichMarkdown.listPattern, in: line.body).first,
+           caret.location >= line.range.location + NSMaxRange(marker.range) {
+            let ns = line.body as NSString
+            var prefix = ns.substring(with: marker.range)
+            if ns.substring(from: NSMaxRange(marker.range)).trimmingCharacters(in: .whitespaces).isEmpty {
+                let indent = String(prefix.prefix { $0 == " " || $0 == "\t" })
+                insertText(indent, replacementRange: NSRange(location: line.range.location, length: ns.length))
+                return
+            }
+            if let box = RichMarkdown.matches(RichMarkdown.checkboxPattern, in: prefix).first {
+                prefix = (prefix as NSString).replacingCharacters(in: box.range(at: 1), with: " ")
+            } else if let number = RichMarkdown.matches(#"[0-9]+(?=[.)])"#, in: prefix).first {
+                let value = Int((prefix as NSString).substring(with: number.range)) ?? 0
+                prefix = (prefix as NSString).replacingCharacters(in: number.range, with: String(value + 1))
+            }
+            insertion += prefix
         }
-        let next = block == "done" ? "todo" : block
-        let current = ns.substring(with: NSRange(location: paragraph.location, length: markerEnd - paragraph.location))
-        let number = block == "number" ? String((Int(current.trimmingCharacters(in: CharacterSet(charactersIn: ". "))) ?? 0) + 1) : nil
-        let item = NSMutableAttributedString(string: "\n")
-        item.append(NSAttributedString(string: RichMarkdown.marker(next, number: number) ?? "", attributes: [.obbyMarker: true, .obbyBlock: next]))
-        replace(caret, with: item, select: NSRange(location: caret.location + item.length, length: 0))
-        typingAttributes = RichMarkdown.visual([.obbyBlock: next], block: next)
+        insertText(insertion, replacementRange: caret)
     }
-    /// Copy and drag give Markdown, so pasting elsewhere (or back into Obby) keeps the formatting.
     override func writeSelection(to pboard: NSPasteboard, types: [NSPasteboard.PasteboardType]) -> Bool {
-        guard let storage = textStorage, selectedRange().length > 0 else { return super.writeSelection(to: pboard, types: types) }
+        guard selectedRange().length > 0 else { return super.writeSelection(to: pboard, types: types) }
         pboard.clearContents()
-        return pboard.setString(RichMarkdown.serialize(storage.attributedSubstring(from: selectedRange())), forType: .string)
+        return pboard.setString((string as NSString).substring(with: selectedRange()), forType: .string)
     }
-    /// A click on a checkbox ticks or unticks it.
+    /// Toggle exactly the space/x inside the source checkbox; everything else stays untouched.
     func toggleCheckbox(at index: Int) -> Bool {
-        guard let storage = textStorage, index < storage.length, storage.attribute(.obbyMarker, at: index, effectiveRange: nil) != nil,
-              let block = storage.attribute(.obbyBlock, at: index, effectiveRange: nil) as? String, block == "todo" || block == "done" else { return false }
-        let ns = storage.string as NSString
-        var paragraph = ns.paragraphRange(for: NSRange(location: index, length: 0))
-        if paragraph.length > 0, ns.character(at: NSMaxRange(paragraph) - 1) == 10 { paragraph.length -= 1 }
-        let markdown = RichMarkdown.serialize(storage.attributedSubstring(from: paragraph))
-        let flipped = block == "todo" ? "- [x] " + markdown.dropFirst(6) : "- [ ] " + markdown.dropFirst(6)
-        replace(paragraph, with: RichMarkdown.parse(flipped), select: selectedRange())
+        guard isEditable, index >= 0, index < (string as NSString).length else { return false }
+        let lines = RichMarkdown.lines(string), regions = RichMarkdown.regions(lines)
+        guard let row = lines.lastIndex(where: { $0.range.location <= index }), regions[row] == .prose,
+              let match = RichMarkdown.matches(RichMarkdown.checkboxPattern, in: lines[row].body).first else { return false }
+        let character = lines[row].range.location + match.range(at: 1).location
+        guard (character - 1...character + 1).contains(index) else { return false }
+        let caret = selectedRange(), old = (string as NSString).substring(with: NSRange(location: character, length: 1))
+        insertText(old == " " ? "x" : " ", replacementRange: NSRange(location: character, length: 1))
+        setSelectedRange(caret)
         return true
     }
     func insertAttachments(_ sources: [AttachmentSource]) {
+        guard isEditable else { return }
         if let markdown = importAttachments?(sources) { insertBlock(markdown) }
-    }
-    /// Shows local links' titles in the link colour (display only; the note text is unchanged).
-    func highlightLinks() {
-        guard let layout = layoutManager else { return }
-        let full = NSRange(location: 0, length: (string as NSString).length)
-        layout.removeTemporaryAttribute(.foregroundColor, forCharacterRange: full)
-        layout.removeTemporaryAttribute(.underlineStyle, forCharacterRange: full)
-        for link in NoteLinks.links(in: string) where NoteLinks.target(link.destination) != nil {
-            layout.addTemporaryAttributes([.foregroundColor: NSColor.linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue], forCharacterRange: link.titleRange)
-        }
     }
     /// A plain click on a link's [title] opens it; hold Option (or any modifier) to place the cursor there instead.
     override func mouseDown(with event: NSEvent) {
@@ -360,12 +357,12 @@ final class PlainTextView: NSTextView {
         let trail = after.isEmpty ? "\n" : after.hasPrefix("\n\n") ? "" : after.hasPrefix("\n") ? "\n" : "\n\n"
         let inserted = lead + markdown + trail
         insertText(inserted, replacementRange: range)
-        normalize(NSRange(location: range.location, length: (inserted as NSString).length))
     }
     override func paste(_ sender: Any?) { pastePlain(from: .general) }
     override func pasteAsRichText(_ sender: Any?) { pastePlain(from: .general) }
     override func pasteAsPlainText(_ sender: Any?) { pastePlain(from: .general) }
     func pastePlain(from pasteboard: NSPasteboard) {
+        guard isEditable else { return }
         // Copied files, or image data with no text alongside it, become attachments; text is never affected.
         let files = Self.attachmentSources(from: pasteboard, allowData: pasteboard.string(forType: .string) == nil)
         if !files.isEmpty, importAttachments != nil {
@@ -373,9 +370,7 @@ final class PlainTextView: NSTextView {
             return
         }
         guard let text = Self.plainText(from: pasteboard) else { return super.paste(nil) }
-        let start = selectedRange().location
         insertText(text, replacementRange: selectedRange()) // Registers undo and goes through the normal change path.
-        normalize(NSRange(location: start, length: (text as NSString).length)) // Pasted Markdown shows formatted.
     }
     static func plainText(from pasteboard: NSPasteboard) -> String? {
         var text = pasteboard.string(forType: .string)
@@ -388,13 +383,13 @@ final class PlainTextView: NSTextView {
                 }
             }
         }
-        // Only line endings are normalised (Windows/old-Mac to \n) so the .md file stays consistent.
-        return text?.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        return text // Literal text, including its line endings.
     }
 }
 struct MarkdownEditor: NSViewRepresentable {
     @Binding var text: String
     let bridge: EditorBridge
+    var readOnly = false
     var importAttachments: (([AttachmentSource]) -> String?)? = nil
     var openLink: ((String) -> Void)? = nil
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -410,7 +405,7 @@ struct MarkdownEditor: NSViewRepresentable {
         view.isHorizontallyResizable = false
         view.textContainer?.containerSize = NSSize(width: size.width, height: CGFloat.greatestFiniteMagnitude)
         scroll.documentView = view
-        // Formatted display of the note's Markdown (see RichMarkdown); pasted rich text still arrives as plain text.
+        // Markdown source is the text storage. Attributes affect display only.
         view.isRichText = true
         view.usesFontPanel = false
         view.usesRuler = false
@@ -431,28 +426,29 @@ struct MarkdownEditor: NSViewRepresentable {
         view.autoresizingMask = [.width]
         view.textContainer?.widthTracksTextView = true
         view.delegate = context.coordinator
-        view.textStorage?.setAttributedString(RichMarkdown.parse(text))
+        view.loadSource(text)
+        view.isEditable = !readOnly
         view.typingAttributes = RichMarkdown.baseAttributes
         context.coordinator.shown = text
         view.importAttachments = importAttachments
         view.openLink = openLink
-        view.highlightLinks()
         view.registerForDraggedTypes(PlainTextView.imageDataTypes.map { $0.0 }) // Image data from other apps (file URLs are already registered).
         bridge.view = view
         return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
-        let view = scroll.documentView as! NSTextView
-        // Only a change from outside the editor (opening a note, an AI edit) reloads; it goes through the same parser.
-        if text != context.coordinator.shown {
+        let view = scroll.documentView as! PlainTextView
+        // Only an external byte change reloads the source.
+        view.isEditable = !readOnly
+        if !text.utf8.elementsEqual(context.coordinator.shown.utf8) {
             context.coordinator.shown = text
-            view.textStorage?.setAttributedString(RichMarkdown.parse(text))
+            view.loadSource(text)
             view.typingAttributes = RichMarkdown.baseAttributes
-            view.undoManager?.removeAllActions(); (view as? PlainTextView)?.highlightLinks()
+            view.undoManager?.removeAllActions()
         }
-        (view as? PlainTextView)?.importAttachments = importAttachments
-        (view as? PlainTextView)?.openLink = openLink
+        view.importAttachments = importAttachments
+        view.openLink = openLink
         bridge.view = view
     }
     class Coordinator: NSObject, NSTextViewDelegate {
@@ -461,13 +457,8 @@ struct MarkdownEditor: NSViewRepresentable {
         init(_ parent: MarkdownEditor) { self.parent = parent }
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView, let storage = view.textStorage else { return }
-            if let plain = view as? PlainTextView, !plain.isNormalizing {
-                plain.normalize(NSRange(location: min(view.selectedRange().location, storage.length), length: 0))
-            }
-            let markdown = RichMarkdown.serialize(storage)
-            shown = markdown
-            parent.text = markdown
-            (view as? PlainTextView)?.highlightLinks()
+            shown = storage.string
+            parent.text = storage.string
         }
     }
 }

@@ -1,278 +1,133 @@
 import AppKit
 
-/// Obby's editor shows supported Markdown as formatted text and saves it back as plain Markdown.
-/// Supported: **bold**, *italic*, <u>underline</u>, # / ## / ### headings, - bullets, 1. numbers,
-/// - [ ] / - [x] checkboxes. Everything else (links, images, code, tables…) stays as literal text.
-/// The file on disk is always Markdown: `parse` runs when a note is loaded, `serialize` whenever it changes.
-extension NSAttributedString.Key {
-    static let obbyBlock = NSAttributedString.Key("obby.block")        // "h1" "h2" "h3" "bullet" "number" "todo" "done"
-    static let obbyBold = NSAttributedString.Key("obby.bold")
-    static let obbyItalic = NSAttributedString.Key("obby.italic")
-    static let obbyUnderline = NSAttributedString.Key("obby.underline")
-    static let obbyMarker = NSAttributedString.Key("obby.marker")      // The visible "• ", "1. ", "☐ " in place of "- ", "1. ", "- [ ] "
-}
-
+/// Source styling only. This type never removes markers, changes characters or serializes Markdown.
 enum RichMarkdown {
-    /// Editor text size (display only): View → Bigger / Smaller / Actual Size, or Settings → Notes. 11–28 pt, default 14.
     static let defaultFontSize: Double = 14
     static func clampFontSize(_ value: Double) -> Double { min(max(value.rounded(), 11), 28) }
     static var baseSize: CGFloat {
         let stored = UserDefaults.standard.double(forKey: "editorFontSize")
         return CGFloat(clampFontSize(stored == 0 ? defaultFontSize : stored))
     }
-    /// ATX heading level of a line (1–6), or nil: "#hashtag" (no space) is not a heading, nor is anything in a code fence.
-    static func headingLevel(_ line: String, inFence: Bool) -> Int? {
-        guard !inFence, let match = line.range(of: "^#{1,6}(?= |$)", options: .regularExpression) else { return nil }
-        return line.distance(from: match.lowerBound, to: match.upperBound)
+    static var baseAttributes: [NSAttributedString.Key: Any] {
+        [.font: NSFont.systemFont(ofSize: baseSize), .foregroundColor: NSColor.labelColor]
     }
-    /// Heading levels for every line of a note, tracking ``` fences.
-    static func headingLevels(_ markdown: String) -> [Int?] {
-        var fence = MarkdownFence()
-        return markdown.components(separatedBy: "\n").map { line in
-            if fence.consume(line) { return nil }
-            return headingLevel(line, inFence: false)
-        }
+    struct Line {
+        let range: NSRange
+        let body: String
+        let ending: String
     }
-    static var baseAttributes: [NSAttributedString.Key: Any] { visual([:], block: nil) }
-
-    // MARK: Markdown → formatted text
-
-    /// Byte-for-byte safe: a line is shown formatted only if it saves back exactly as written; otherwise (for example
-    /// "* item", "- [X]", nested emphasis) it stays literal. Fenced code and a leading YAML frontmatter block stay literal.
-    static func parse(_ markdown: String) -> NSMutableAttributedString {
-        let out = NSMutableAttributedString()
-        var fence = MarkdownFence()
-        let lines = markdown.components(separatedBy: "\n")
-        let frontmatterEnd: Int = {
-            guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else { return -1 }
-            return lines.dropFirst().firstIndex { ["---", "..."].contains($0.trimmingCharacters(in: .whitespaces)) } ?? -1
-        }()
-        for (index, line) in lines.enumerated() {
-            if index > 0 { out.append(NSAttributedString(string: "\n")) }
-            if index <= frontmatterEnd || fence.consume(line) { out.append(NSAttributedString(string: line)); continue }
-            let formatted = parseLine(line)
-            out.append(serialize(formatted).utf8.elementsEqual(line.utf8) ? formatted : NSMutableAttributedString(string: line))
-        }
-        style(out, range: NSRange(location: 0, length: out.length))
-        // Verify the complete result too: if paragraph styling or an unfamiliar construct changes bytes,
-        // display its original source instead. Unsupported syntax never needs a lossy conversion.
-        guard serialize(out).utf8.elementsEqual(markdown.utf8) else {
-            return NSMutableAttributedString(string: markdown, attributes: baseAttributes)
-        }
-        return out
-    }
-    static let blockPatterns: [(NSRegularExpression, String)] = [
-        ("^### (.+)$", "h3"), ("^## (.+)$", "h2"), ("^# (.+)$", "h1"),
-        ("^- \\[[xX]\\] (.*)$", "done"), ("^- \\[ \\] (.*)$", "todo"), ("^[-*] (.*)$", "bullet"), ("^([0-9]{1,9})\\. (.*)$", "number"),
-    ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
-    static func parseLine(_ line: String) -> NSMutableAttributedString {
-        let ns = line as NSString
-        for (pattern, block) in blockPatterns {
-            guard let match = pattern.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { continue }
-            let result = NSMutableAttributedString()
-            if let marker = marker(block, number: block == "number" ? ns.substring(with: match.range(at: 1)) : nil) {
-                result.append(NSAttributedString(string: marker, attributes: [.obbyMarker: true]))
-            }
-            result.append(parseInline(ns.substring(with: match.range(at: match.numberOfRanges - 1)), [:]))
-            result.addAttribute(.obbyBlock, value: block, range: NSRange(location: 0, length: result.length))
-            return result
-        }
-        return parseInline(line, [:])
-    }
-    static func marker(_ block: String, number: String? = nil) -> String? {
-        switch block {
-        case "bullet": return "• "
-        case "number": return (number ?? "1") + ". "
-        case "todo": return "☐ "
-        case "done": return "☑ "
-        default: return nil
-        }
-    }
-    /// Inline styles, innermost first by position; `code` spans are kept exactly as written.
-    static let inlinePatterns: [(NSRegularExpression, [NSAttributedString.Key])] = ([
-        ("`[^`]+`", []),
-        ("\\*\\*\\*(?=\\S)(.+?)(?<=\\S)\\*\\*\\*", [.obbyBold, .obbyItalic]),
-        ("\\*\\*(?=\\S)(.+?)(?<=\\S)\\*\\*", [.obbyBold]),
-        ("<u>(.+?)</u>", [.obbyUnderline]),
-        ("(?<![*\\w])\\*(?=[^\\s*])(.+?)(?<=[^\\s*])\\*(?![*\\w])", [.obbyItalic]),
-    ] as [(String, [NSAttributedString.Key])]).map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
-    static func parseInline(_ text: String, _ attributes: [NSAttributedString.Key: Any]) -> NSMutableAttributedString {
-        let out = NSMutableAttributedString(), ns = text as NSString
-        var position = 0
+    /// NSString ranges are UTF-16, as required by NSTextView. Separators are never normalized.
+    static func lines(_ text: String) -> [Line] {
+        let ns = text as NSString
+        var result: [Line] = [], position = 0
         while position < ns.length {
-            var best: (NSTextCheckingResult, [NSAttributedString.Key])?
-            for (pattern, keys) in inlinePatterns {
-                if let match = pattern.firstMatch(in: text, range: NSRange(location: position, length: ns.length - position)),
-                   best == nil || match.range.location < best!.0.range.location { best = (match, keys) }
-            }
-            guard let found = best else { break }
-            let (match, keys) = found
-            out.append(NSAttributedString(string: ns.substring(with: NSRange(location: position, length: match.range.location - position)), attributes: attributes))
-            if keys.isEmpty {
-                out.append(NSAttributedString(string: ns.substring(with: match.range), attributes: attributes))
-            } else {
-                var inner = attributes
-                for key in keys { inner[key] = true }
-                out.append(parseInline(ns.substring(with: match.range(at: 1)), inner))
-            }
-            position = NSMaxRange(match.range)
+            var start = 0, end = 0, contentsEnd = 0
+            ns.getLineStart(&start, end: &end, contentsEnd: &contentsEnd, for: NSRange(location: position, length: 0))
+            result.append(Line(range: NSRange(location: start, length: end - start), body: ns.substring(with: NSRange(location: start, length: contentsEnd - start)), ending: ns.substring(with: NSRange(location: contentsEnd, length: end - contentsEnd))))
+            position = end
         }
-        if position < ns.length { out.append(NSAttributedString(string: ns.substring(from: position), attributes: attributes)) }
-        return out
-    }
-
-    // MARK: Formatted text → Markdown
-
-    static func serialize(_ text: NSAttributedString) -> String {
-        var location = 0
-        return text.string.components(separatedBy: "\n").map { line in
-            let length = (line as NSString).length
-            defer { location += length + 1 }
-            return serializeLine(text, NSRange(location: location, length: length))
-        }.joined(separator: "\n")
-    }
-    static func serializeLine(_ text: NSAttributedString, _ range: NSRange) -> String {
-        guard range.length > 0 else { return "" }
-        var contentStart = range.location
-        while contentStart < NSMaxRange(range), text.attribute(.obbyMarker, at: contentStart, effectiveRange: nil) != nil { contentStart += 1 }
-        let markerText = (text.string as NSString).substring(with: NSRange(location: range.location, length: contentStart - range.location))
-        let inline = serializeInline(text, NSRange(location: contentStart, length: NSMaxRange(range) - contentStart))
-        guard let block = text.attribute(.obbyBlock, at: range.location, effectiveRange: nil) as? String else { return inline }
-        switch block {
-        case "h1": return inline.isEmpty ? "" : "# " + inline
-        case "h2": return inline.isEmpty ? "" : "## " + inline
-        case "h3": return inline.isEmpty ? "" : "### " + inline
-        case "bullet": return markerText == "• " ? "- " + inline : inline
-        case "todo": return markerText == "☐ " ? "- [ ] " + inline : inline
-        case "done": return markerText == "☑ " ? "- [x] " + inline : inline
-        case "number": return markerText.range(of: "^[0-9]{1,9}\\. $", options: .regularExpression) != nil ? markerText + inline : inline
-        default: return inline // A damaged list marker (e.g. half deleted) leaves a plain line.
-        }
-    }
-    static let inlineOrder: [NSAttributedString.Key] = [.obbyUnderline, .obbyBold, .obbyItalic]
-    static func serializeInline(_ text: NSAttributedString, _ range: NSRange) -> String {
-        guard range.length > 0 else { return "" }
-        var out = "", open: [NSAttributedString.Key] = []
-        func opening(_ key: NSAttributedString.Key) -> String {
-            switch key { case .obbyUnderline: return "<u>"; case .obbyBold: return "**"; default: return "*" }
-        }
-        func closing(_ key: NSAttributedString.Key) -> String {
-            switch key { case .obbyUnderline: return "</u>"; case .obbyBold: return "**"; default: return "*" }
-        }
-        func closeAll() { // Trailing spaces go after the closing markers, as Markdown requires.
-            guard !open.isEmpty else { return }
-            let trimmed = out.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
-            let spaces = String(out.dropFirst(trimmed.count))
-            out = trimmed + open.reversed().map(closing).joined() + spaces
-            open = []
-        }
-        text.enumerateAttributes(in: range) { attributes, run, _ in
-            guard attributes[.obbyMarker] == nil else { return }
-            let piece = (text.string as NSString).substring(with: run)
-            if piece.trimmingCharacters(in: .whitespaces).isEmpty { out += piece; return } // Spaces keep the current style.
-            let want = inlineOrder.filter { attributes[$0] != nil }
-            if want != open {
-                closeAll()
-                let body = piece.replacingOccurrences(of: "^\\s+", with: "", options: .regularExpression)
-                out += String(piece.dropLast(body.count)) + want.map(opening).joined()
-                open = want
-                out += body
-            } else { out += piece }
-        }
-        closeAll()
-        return out
-    }
-
-    // MARK: Appearance
-
-    static func visual(_ attributes: [NSAttributedString.Key: Any], block: String?) -> [NSAttributedString.Key: Any] {
-        let isMarker = attributes[.obbyMarker] != nil
-        var size = baseSize, bold = attributes[.obbyBold] != nil, italic = attributes[.obbyItalic] != nil
-        switch block {
-        case "h1": size = (baseSize * 1.6).rounded(); bold = true
-        case "h2": size = (baseSize * 1.35).rounded(); bold = true
-        case "h3": size = (baseSize * 1.15).rounded(); bold = true
-        default: break
-        }
-        if isMarker { size = baseSize; bold = false; italic = false }
-        var font = NSFont.systemFont(ofSize: size, weight: bold ? .bold : .regular)
-        if italic { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
-        let done = block == "done" && !isMarker
-        var result = attributes
-        result[.font] = font
-        result[.foregroundColor] = isMarker || done ? NSColor.secondaryLabelColor : NSColor.labelColor
-        result[.underlineStyle] = attributes[.obbyUnderline] != nil ? NSUnderlineStyle.single.rawValue : 0
-        result[.strikethroughStyle] = done ? NSUnderlineStyle.single.rawValue : 0
+        if result.isEmpty || result.last?.ending.isEmpty == false { result.append(Line(range: NSRange(location: ns.length, length: 0), body: "", ending: "")) }
         return result
     }
-    static func block(in text: NSAttributedString, paragraph: NSRange) -> String? {
-        guard paragraph.length > 0, paragraph.location < text.length else { return nil }
-        return text.attribute(.obbyBlock, at: paragraph.location, effectiveRange: nil) as? String
-    }
-    /// Fonts, colours and indents from Obby's own attributes, for every paragraph touching `range`.
-    static func style(_ text: NSMutableAttributedString, range: NSRange) {
-        let ns = text.string as NSString
-        guard ns.length > 0 else { return }
-        let whole = ns.paragraphRange(for: NSRange(location: min(range.location, ns.length), length: min(range.length, ns.length - min(range.location, ns.length))))
-        text.beginEditing()
-        ns.enumerateSubstrings(in: whole, options: [.byParagraphs, .substringNotRequired]) { _, content, enclosing, _ in
-            let kind = Self.block(in: text, paragraph: content.length > 0 ? content : enclosing)
-            let paragraph = NSMutableParagraphStyle()
-            if let kind, let shown = Self.marker(kind, number: "1") {
-                paragraph.headIndent = (shown as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: baseSize)]).width
-                    + (kind == "number" ? 6 : 0)
+    enum Region: Equatable { case prose, code, frontmatter }
+    static func regions(_ lines: [Line]) -> [Region] {
+        var fence = MarkdownFence(), frontmatter = false
+        return lines.enumerated().map { index, line in
+            let value = line.body.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\u{FEFF}", with: "")
+            if index == 0 && value == "---" { frontmatter = true; return .frontmatter }
+            if frontmatter {
+                if value == "---" || value == "..." { frontmatter = false }
+                return .frontmatter
             }
-            if kind?.hasPrefix("h") == true { paragraph.paragraphSpacingBefore = 6 }
-            text.enumerateAttributes(in: enclosing) { attributes, run, _ in text.setAttributes(visual(attributes, block: kind), range: run) }
-            text.addAttribute(.paragraphStyle, value: paragraph, range: enclosing)
+            return fence.consume(line.body) ? .code : .prose
         }
-        text.endEditing()
     }
+    static func headingLevel(_ line: String, inFence: Bool) -> Int? {
+        guard !inFence, let match = matches(#"^ {0,3}(#{1,6})(?:[ \t]+|$)"#, in: line).first else { return nil }
+        return match.range(at: 1).length
+    }
+    static func headingLevels(_ markdown: String) -> [Int?] {
+        let rows = lines(markdown), states = regions(rows)
+        return rows.enumerated().map { headingLevel($0.element.body, inFence: states[$0.offset] != .prose) }
+    }
+    static func matches(_ pattern: String, in text: String) -> [NSTextCheckingResult] {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return regex.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
+    }
+    static let listPattern = #"^([ \t]*)(?:[-+*](?:[ \t]+\[[ xX]\])?|[0-9]{1,9}[.)])[ \t]+"#
+    static let checkboxPattern = #"^[ \t]*[-+*][ \t]+\[([ xX])\](?:[ \t]+|$)"#
+    static func style(_ text: NSMutableAttributedString, line: Line, region: Region) {
+        guard line.range.length > 0 else { return }
+        text.setAttributes(baseAttributes, range: line.range)
+        if region != .prose {
+            text.addAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: baseSize, weight: .regular), range: line.range)
+            return
+        }
+        func absolute(_ range: NSRange) -> NSRange { NSRange(location: line.range.location + range.location, length: range.length) }
+        func dim(_ range: NSRange) { text.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: absolute(range)) }
+        func font(_ range: NSRange, traits: NSFontTraitMask) {
+            text.enumerateAttribute(.font, in: absolute(range)) { value, part, _ in
+                let original = value as? NSFont ?? NSFont.systemFont(ofSize: baseSize)
+                text.addAttribute(.font, value: NSFontManager.shared.convert(original, toHaveTrait: traits), range: part)
+            }
+        }
+        if let heading = matches(#"^ {0,3}(#{1,6})(?:[ \t]+|$)"#, in: line.body).first {
+            let scales: [CGFloat] = [1.6, 1.35, 1.15, 1.1, 1, 1]
+            text.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: (baseSize * scales[heading.range(at: 1).length - 1]).rounded()), range: line.range)
+            dim(heading.range)
+        }
+        if let marker = matches(listPattern, in: line.body).first { dim(marker.range) }
+        let code = matches(#"(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)"#, in: line.body)
+        func inCode(_ range: NSRange) -> Bool { code.contains { NSIntersectionRange($0.range, range).length > 0 } }
+        let styles: [(String, NSFontTraitMask)] = [
+            (#"(\*\*\*)(?=\S)(.+?)(?<=\S)(\*\*\*)"#, [.boldFontMask, .italicFontMask]),
+            (#"(?<!\*)(\*\*)(?=\S)(.+?)(?<=\S)(\*\*)(?!\*)"#, .boldFontMask),
+            (#"(?<![\w*])(\*)(?=\S)(.+?)(?<=\S)(\*)(?![\w*])"#, .italicFontMask),
+            (#"(<u>)(.+?)(</u>)"#, [])]
+        for (pattern, traits) in styles {
+            for match in matches(pattern, in: line.body) where !inCode(match.range) {
+                if traits.isEmpty { text.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: absolute(match.range(at: 2))) }
+                else { font(match.range(at: 2), traits: traits) }
+                dim(match.range(at: 1)); dim(match.range(at: 3))
+            }
+        }
+        for pattern in [#"!?\[\[[^\]\r\n]+\]\]"#, #"(?<![\w#])#[\p{L}_][\p{L}\p{N}_/\-]*"#] {
+            for match in matches(pattern, in: line.body) where !inCode(match.range) { text.addAttribute(.foregroundColor, value: NSColor.linkColor, range: absolute(match.range)) }
+        }
+        for link in NoteLinks.links(in: line.body) where !inCode(link.titleRange) {
+            text.addAttribute(.foregroundColor, value: NSColor.linkColor, range: absolute(link.titleRange))
+        }
+        for match in code {
+            text.addAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: baseSize, weight: .regular), range: absolute(match.range))
+            dim(match.range(at: 1))
+            dim(NSRange(location: NSMaxRange(match.range) - match.range(at: 1).length, length: match.range(at: 1).length))
+        }
+    }
+}
 
-    // MARK: Toggles
-
-    /// Bold / italic / underline: removed if the whole selection already has it, otherwise applied.
-    static func toggleInline(_ text: NSMutableAttributedString, range: NSRange, key: NSAttributedString.Key) {
-        guard range.length > 0 else { return }
-        var all = true
-        text.enumerateAttributes(in: range) { attributes, run, stop in
-            guard attributes[.obbyMarker] == nil,
-                  !(text.string as NSString).substring(with: run).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-            if attributes[key] == nil { all = false; stop.pointee = true }
+/// Only edited paragraphs and neighbours get attributes reapplied. When a fence/frontmatter boundary
+/// changes, also invalidate paragraphs whose lexical region changed; never rewrite their source.
+final class MarkdownStyler {
+    private var previous: [RichMarkdown.Region] = []
+    private(set) var styledRanges: [NSRange] = []
+    func restyle(_ storage: NSMutableAttributedString, edited: NSRange? = nil) {
+        let lines = RichMarkdown.lines(storage.string), regions = RichMarkdown.regions(lines)
+        let location = min(edited?.location ?? 0, storage.length)
+        let end = min(NSMaxRange(edited ?? NSRange(location: 0, length: storage.length)), storage.length)
+        let first = lines.lastIndex { $0.range.location <= location } ?? 0
+        let last = lines.lastIndex { $0.range.location <= end } ?? first
+        let delta = regions.count - previous.count
+        styledRanges = []
+        storage.beginEditing()
+        for index in lines.indices {
+            let priorIndex = index > last ? index - delta : index
+            let changedRegion = !previous.indices.contains(priorIndex) || previous[priorIndex] != regions[index]
+            if edited == nil || (max(0, first - 1)...min(lines.count - 1, last + 1)).contains(index) || changedRegion {
+                RichMarkdown.style(storage, line: lines[index], region: regions[index])
+                styledRanges.append(lines[index].range)
+            }
         }
-        if all { text.removeAttribute(key, range: range) } else { text.addAttribute(key, value: true, range: range) }
-        style(text, range: range)
-    }
-    static func blockName(_ format: Format) -> String? {
-        switch format {
-        case .heading: return "h1"; case .heading2: return "h2"; case .heading3: return "h3"
-        case .bullet: return "bullet"; case .numbered: return "number"; case .checkbox: return "todo"; case .checked: return "done"
-        default: return nil
-        }
-    }
-    /// Headings, lists and checkboxes for the lines touching `range`: removed if every line already has it, otherwise
-    /// applied. Returns the replaced range and its new formatted text. Works through Markdown, so inline styles stay.
-    static func toggleBlock(_ text: NSAttributedString, range: NSRange, format: Format) -> (NSRange, NSMutableAttributedString)? {
-        guard let target = blockName(format) else { return nil }
-        let ns = text.string as NSString
-        var selection = NSRange(location: min(range.location, ns.length), length: min(range.length, ns.length - min(range.location, ns.length)))
-        if selection.length > 0, ns.character(at: NSMaxRange(selection) - 1) == 10 { selection.length -= 1 }
-        var lines = ns.lineRange(for: selection)
-        if lines.length > 0, ns.character(at: NSMaxRange(lines) - 1) == 10 { lines.length -= 1 }
-        let markdown = serialize(text.attributedSubstring(from: lines))
-        let current = markdown.components(separatedBy: "\n").map { line -> String? in
-            let parsed = parseLine(line)
-            return parsed.length > 0 ? parsed.attribute(.obbyBlock, at: 0, effectiveRange: nil) as? String : nil
-        }
-        let prefixes = "^(#{1,3} |- \\[[ xX]\\] |[-*] |[0-9]{1,9}\\. )"
-        let updated: String
-        if current.allSatisfy({ $0 == target }) {
-            updated = target == "done"
-                ? markdown.replacingOccurrences(of: "(?m)^- \\[[xX]\\] ", with: "- [ ] ", options: .regularExpression) // Mark done again: back to open.
-                : markdown.replacingOccurrences(of: "(?m)" + prefixes, with: "", options: .regularExpression)
-        } else {
-            updated = format.apply(to: markdown, range: NSRange(location: 0, length: (markdown as NSString).length)).0
-        }
-        return (lines, parse(updated))
+        storage.endEditing()
+        previous = regions
     }
 }

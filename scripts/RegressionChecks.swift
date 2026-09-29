@@ -297,7 +297,9 @@ import AppKit
 
         let fenced = "# Real\n~~~~\n```\n# Fake\n* literal\n```\n~~~~\n# End\nend"
         check(MarkdownSections.headings(fenced.components(separatedBy: "\n")).map(\.title) == ["Real", "End"], "mixed code fences cannot create fake sections")
-        check(RichMarkdown.serialize(RichMarkdown.parse(fenced)) == fenced, "editor preserves mixed-fence code exactly")
+        let fencedSource = NSMutableAttributedString(string: fenced)
+        MarkdownStyler().restyle(fencedSource)
+        check(Data(fencedSource.string.utf8) == Data(fenced.utf8), "editor preserves mixed-fence code exactly")
         let longFence = "````\n```\n# Still code\n````\n# Real"
         check(MarkdownSections.headings(longFence.components(separatedBy: "\n")).map(\.title) == ["Real"], "shorter fences do not close a longer fence")
         check(MarkdownTable.table(in: ["~~~", "| a |", "| --- |", "~~~"], at: 1) == nil, "table commands ignore tilde-fenced code")

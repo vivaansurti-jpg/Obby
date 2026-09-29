@@ -1,5 +1,9 @@
 import Foundation
 import AppKit
+final class SourceUndoDelegate: NSObject, NSTextViewDelegate {
+    let manager = UndoManager()
+    func undoManager(for view: NSTextView) -> UndoManager? { manager }
+}
 @main struct Checks {
     @MainActor static func main() async throws {
         setbuf(stdout, nil)
@@ -52,24 +56,18 @@ import AppKit
         check(RichMarkdown.headingLevels("# One\n#hashtag\n```\n## not\n```\n### Three\n####### seven") == [1, nil, nil, nil, nil, 3, nil], "heading levels ignore fences and #hashtags")
         check(RichMarkdown.clampFontSize(5) == 11 && RichMarkdown.clampFontSize(40) == 28 && RichMarkdown.clampFontSize(14) == 14, "editor text size stays within 11-28 pt")
 
-        // Formatted editing: Markdown is shown as formatting and saved back as the same Markdown
-        let boldHello = RichMarkdown.parse("**hello**")
-        check(boldHello.string == "hello" && boldHello.attribute(.obbyBold, at: 0, effectiveRange: nil) != nil && RichMarkdown.serialize(boldHello) == "**hello**", "bold shows without ** and saves as **hello**")
-        let heading = RichMarkdown.parse("# Biology")
-        check(heading.string == "Biology" && heading.attribute(.obbyBlock, at: 0, effectiveRange: nil) as? String == "h1" && RichMarkdown.serialize(heading) == "# Biology", "heading shows without # and saves as # Biology")
-        let toggled = RichMarkdown.parse("**text**")
-        RichMarkdown.toggleInline(toggled, range: NSRange(location: 0, length: toggled.length), key: .obbyBold)
-        check(RichMarkdown.serialize(toggled) == "text", "bold toggles off to plain text")
-        RichMarkdown.toggleInline(toggled, range: NSRange(location: 0, length: toggled.length), key: .obbyBold)
-        check(RichMarkdown.serialize(toggled) == "**text**", "bold toggles on again")
-        let partBold = RichMarkdown.parse("some **bold** words")
-        RichMarkdown.toggleInline(partBold, range: NSRange(location: 0, length: partBold.length), key: .obbyBold)
-        check(RichMarkdown.serialize(partBold) == "**some bold words**", "mixed selection becomes all bold, not nested markers")
+        // Source styling never transforms the text; the native editor owns character edits.
+        func sourceView(_ source: String) -> PlainTextView {
+            let view = PlainTextView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+            view.isRichText = true; view.isEditable = true; view.allowsUndo = false
+            view.isAutomaticQuoteSubstitutionEnabled = false; view.isAutomaticDashSubstitutionEnabled = false
+            view.isAutomaticTextReplacementEnabled = false
+            view.loadSource(source)
+            return view
+        }
         let aiReply = "# Title\n\nSome **bold**, *italic*, ***both*** and <u>underlined</u> text.\n\n## Steps\n- one\n- two\n1. first\n2. second\n- [ ] open task\n- [x] done task\n### Small\n[Link](Other.md) and `**code**`\n```\n**fenced**\n```"
-        let rendered = RichMarkdown.parse(aiReply)
-        check(rendered.string.contains("Some bold, italic, both and underlined text.") && rendered.string.contains("`**code**`") && rendered.string.contains("**fenced**"), "AI Markdown renders without visible markers; code stays literal")
-        check(!rendered.string.contains("# ") && !rendered.string.contains("<u>") && !rendered.string.contains("- [ ]") && rendered.string.contains("☐ open task") && rendered.string.contains("• one"), "AI headings, underline, lists and checkboxes render visually")
-        check(Data(RichMarkdown.serialize(rendered).utf8) == Data(aiReply.utf8), "AI Markdown saves back unchanged")
+        let rendered = sourceView(aiReply)
+        check(Data(rendered.string.utf8) == Data(aiReply.utf8), "AI Markdown saves back unchanged")
         // Round trip: opening and saving an unedited note never changes a byte.
         let vaultNote = [
             "---", "title: Cells", "tags: [biology, revision]", "aliases:", "  - Cell notes", "---",
@@ -89,7 +87,7 @@ import AppKit
             "%% Obsidian comment %%", "==highlight== ~~strike~~ $math$", "Setext", "===",
             "Windows line\r", "# Heading with CR\r", "",
         ].joined(separator: "\n")
-        check(Data(RichMarkdown.serialize(RichMarkdown.parse(vaultNote)).utf8) == Data(vaultNote.utf8), "opening and saving an unedited note is byte-for-byte identical")
+        check(Data(sourceView(vaultNote).string.utf8) == Data(vaultNote.utf8), "opening and saving an unedited note is byte-for-byte identical")
         let roundTripFixtures: [(String, String)] = [
             ("vault syntax", vaultNote),
             ("CRLF", vaultNote.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\n", with: "\r\n")),
@@ -108,11 +106,11 @@ import AppKit
             let url = root.appendingPathComponent(path), bytes = Data(source.utf8)
             try bytes.write(to: url)
             roundTripModel.openNote(path)
-            let rich = RichMarkdown.parse(roundTripModel.text)
-            let output = RichMarkdown.serialize(rich)
+            let rich = sourceView(roundTripModel.text)
+            let output = rich.string
             check(Data(output.utf8) == bytes, "rich editor byte round trip: " + label)
-            rich.append(NSAttributedString(string: "\n\nAdded paragraph."))
-            check(Data(RichMarkdown.serialize(rich).utf8) == Data((source + "\n\nAdded paragraph.").utf8), "adding prose preserves existing syntax bytes: " + label)
+            rich.insertText("\n\nAdded paragraph.", replacementRange: NSRange(location: (rich.string as NSString).length, length: 0))
+            check(Data(rich.string.utf8) == Data((source + "\n\nAdded paragraph.").utf8), "adding prose preserves existing syntax bytes: " + label)
             roundTripModel.text = output
             check(roundTripModel.save() && (try? Data(contentsOf: url)) == bytes, "open and explicit save preserve disk bytes: " + label)
             try vault.write(path, content: output)
@@ -121,18 +119,112 @@ import AppKit
         }
         roundTripModel.note = nil
 
-        check(RichMarkdown.parse("---\ntitle: x\n- a\n---\n- b").string.hasPrefix("---\ntitle: x\n- a\n---\n•"), "frontmatter stays literal; the note body is formatted")
-        check(RichMarkdown.parse("* star").string == "* star" && RichMarkdown.parse("- dash").string == "• dash", "lines that cannot save back exactly stay literal")
-        let lines = RichMarkdown.parse("one\ntwo")
-        let bulleted = RichMarkdown.toggleBlock(lines, range: NSRange(location: 0, length: lines.length), format: .bullet)!
-        check(RichMarkdown.serialize(bulleted.1) == "- one\n- two" && bulleted.0.length == 7, "bullets toggle on")
-        let unbulleted = RichMarkdown.toggleBlock(bulleted.1, range: NSRange(location: 0, length: bulleted.1.length), format: .bullet)!.1
-        check(RichMarkdown.serialize(unbulleted) == "one\ntwo", "bullets toggle off")
-        let headingOff = RichMarkdown.toggleBlock(heading, range: NSRange(location: 0, length: heading.length), format: .heading)!.1
-        check(RichMarkdown.serialize(headingOff) == "Biology", "heading toggles off")
-        let broken = RichMarkdown.parse("- item")
-        broken.deleteCharacters(in: NSRange(location: 0, length: 1)) // Half the bullet marker deleted.
-        check(RichMarkdown.serialize(broken) == " item" || RichMarkdown.serialize(broken) == "item", "damaged list marker leaves a plain line")
+        // Exhaust every Unicode-scalar boundary in the corpus: insert, replace and delete one scalar.
+        // The oracle splices original UTF-8 bytes, independently of the editor and its UTF-16 ranges.
+        var propertyEdits = 0
+        for (label, source) in roundTripFixtures {
+            let view = sourceView(source), bytes = Data(source.utf8)
+            var byteOffsets = [0], utf16Offsets = [0]
+            for scalar in source.unicodeScalars {
+                byteOffsets.append(byteOffsets.last! + String(scalar).utf8.count)
+                utf16Offsets.append(utf16Offsets.last! + String(scalar).utf16.count)
+            }
+            for position in byteOffsets.indices {
+                for operation in 0..<3 {
+                    let next = operation == 0 ? position : min(position + 1, byteOffsets.count - 1)
+                    let insertion = operation == 2 ? "" : "🧪e\u{301}"
+                    let range = NSRange(location: utf16Offsets[position], length: utf16Offsets[next] - utf16Offsets[position])
+                    view.loadSource(source)
+                    view.insertText(insertion, replacementRange: range)
+                    let expected = Data(bytes.prefix(byteOffsets[position])) + Data(insertion.utf8) + Data(bytes.dropFirst(byteOffsets[next]))
+                    precondition(Data(view.string.utf8) == expected, "single edit altered unrelated bytes: " + label + " at \(position), op \(operation)")
+                    propertyEdits += 1
+                }
+            }
+            check(true, "every scalar-range edit preserves all other bytes: " + label)
+        }
+        print("PROPERTY EDITS: \(propertyEdits)")
+        let styled = sourceView("# Heading\n**bold** *italic* <u>under</u> `**code**`\n- [ ] task\n[[Note]] #tag ![[image.png]]")
+        let styledText = styled.string as NSString
+        let attributes = styled.textStorage!
+        let headingFont = attributes.attribute(.font, at: styledText.range(of: "Heading").location, effectiveRange: nil) as! NSFont
+        check(headingFont.pointSize > RichMarkdown.baseSize && NSFontManager.shared.traits(of: headingFont).contains(.boldFontMask), "heading size and weight are display-only")
+        check((attributes.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor) == .secondaryLabelColor, "heading markers remain visible and dimmed")
+        let boldFont = attributes.attribute(.font, at: styledText.range(of: "bold").location, effectiveRange: nil) as! NSFont
+        let italicFont = attributes.attribute(.font, at: styledText.range(of: "italic").location, effectiveRange: nil) as! NSFont
+        check(NSFontManager.shared.traits(of: boldFont).contains(.boldFontMask) && NSFontManager.shared.traits(of: italicFont).contains(.italicFontMask), "literal emphasis has bold and italic display attributes")
+        check((attributes.attribute(.underlineStyle, at: styledText.range(of: "under").location, effectiveRange: nil) as? Int) == NSUnderlineStyle.single.rawValue, "literal underline receives display styling")
+        check((attributes.attribute(.font, at: styledText.range(of: "code").location, effectiveRange: nil) as? NSFont)?.isFixedPitch == true, "inline code is monospaced")
+        for token in ["[[Note]]", "#tag", "![[image.png]]"] {
+            check((attributes.attribute(.foregroundColor, at: styledText.range(of: token).location, effectiveRange: nil) as? NSColor) == .linkColor, "source link/tag colour: " + token)
+        }
+        let incremental = sourceView((0..<40).map { "paragraph \($0)" }.joined(separator: "\n"))
+        let editAt = (incremental.string as NSString).range(of: "paragraph 20").location
+        incremental.insertText("x", replacementRange: NSRange(location: editAt, length: 0))
+        check(incremental.styler.styledRanges.count == 3, "ordinary typing restyles only its paragraph and neighbours")
+        let fencedView = sourceView("```\n# literal\n- [ ] code\n```\n# heading")
+        check(!fencedView.toggleCheckbox(at: (fencedView.string as NSString).range(of: "[ ]").location), "code checkbox remains literal")
+        let yamlView = sourceView("---\ntags:\n- [ ] yaml\n---\n- [ ] task")
+        check(!yamlView.toggleCheckbox(at: (yamlView.string as NSString).range(of: "[ ]").location), "frontmatter checkbox remains literal")
+        let toggle = sourceView("prefix\r\n  - [ ] **task**\r\nsuffix"), toggleBefore = "prefix\r\n  - [ ] **task**\r\nsuffix"
+        let box = (toggle.string as NSString).range(of: "[ ]")
+        check(toggle.toggleCheckbox(at: box.location) && Data(toggle.string.utf8) == Data(toggleBefore.replacingOccurrences(of: "[ ]", with: "[x]").utf8), "checkbox replaces one source character only")
+        check(toggle.toggleCheckbox(at: box.location + 1) && Data(toggle.string.utf8) == Data(toggleBefore.utf8), "checkbox toggles back without changing any other bytes")
+        let bridge = EditorBridge(), formatting = sourceView("before\r\nword\r\nafter")
+        bridge.view = formatting; formatting.setSelectedRange((formatting.string as NSString).range(of: "word"))
+        bridge.format(.bold)
+        check(formatting.string == "before\r\n**word**\r\nafter", "formatting inserts only literal markers")
+        bridge.format(.bold)
+        check(formatting.string == "before\r\nword\r\nafter", "formatting removes only the surrounding markers")
+        check(Format.italic.apply(to: "**bold**", range: NSRange(location: 0, length: 8)).0 == "***bold***", "italic adds to bold instead of deleting a bold marker")
+        let listView = sourceView("1. first\r\n2. second")
+        listView.setSelectedRange(NSRange(location: (listView.string as NSString).length, length: 0)); listView.insertNewline(nil)
+        check(listView.string == "1. first\r\n2. second\r\n3. ", "Enter inserts literal numbered marker with original line ending")
+        listView.insertNewline(nil)
+        check(listView.string == "1. first\r\n2. second\r\n", "Enter on an empty list item removes only that marker")
+        let sourceBoard = NSPasteboard.withUniqueName()
+        defer { sourceBoard.releaseGlobally() }
+        sourceBoard.setString("a\r\nb\rc", forType: .string)
+        check(PlainTextView.plainText(from: sourceBoard) == "a\r\nb\rc", "plain paste keeps all line-ending bytes")
+
+        let undoDelegate = SourceUndoDelegate(), undoView = sourceView("before **word** after")
+        undoView.delegate = undoDelegate; undoView.allowsUndo = true
+        undoDelegate.manager.groupsByEvent = false
+        let undoBridge = EditorBridge(); undoBridge.view = undoView
+        undoView.setSelectedRange((undoView.string as NSString).range(of: "word"))
+        undoBridge.format(.bold)
+        check(undoView.string == "before word after", "source formatting uses the native edit path")
+        undoDelegate.manager.undo()
+        check(undoView.string == "before **word** after", "native Undo restores the original source markers")
+        undoDelegate.manager.redo()
+        check(undoView.string == "before word after", "native Redo replays only source marker edits")
+
+        // Invalid UTF-8 is display-only and cannot be written back, even through a direct save attempt.
+        let invalidPath = "Invalid-UTF8.md", invalidBytes = Data([0xff, 0xfe, 0x61, 0x80])
+        try invalidBytes.write(to: root.appendingPathComponent(invalidPath))
+        roundTripModel.openNote(invalidPath)
+        check(roundTripModel.editorReadOnly && roundTripModel.status == NoteSource.readOnlyNotice, "invalid UTF-8 opens read-only with notice")
+        let lockedView = sourceView(roundTripModel.text); lockedView.isEditable = false
+        let lockedBefore = lockedView.string
+        lockedView.insertText("x", replacementRange: NSRange(location: 0, length: 0))
+        check(lockedView.string == lockedBefore, "read-only source view rejects typing")
+        roundTripModel.text += "attempted edit"
+        check(!roundTripModel.save(overwriteConflict: true) && (try? Data(contentsOf: root.appendingPathComponent(invalidPath))) == invalidBytes, "invalid source bytes cannot be saved or force-overwritten")
+        blocked("invalid UTF-8 cannot be re-encoded by Vault.write") { try vault.write(invalidPath, content: "replacement") }
+        roundTripModel.reloadAfterConflict()
+        try FileManager.default.removeItem(at: root.appendingPathComponent(invalidPath))
+        roundTripModel.note = nil
+        let unicodePath = "Unicode-bytes.md"
+        try vault.write(unicodePath, content: "é", create: true)
+        roundTripModel.openNote(unicodePath)
+        roundTripModel.text = "e\u{301}"
+        check(roundTripModel.dirty && roundTripModel.save() && (try? Data(contentsOf: root.appendingPathComponent(unicodePath))) == Data("e\u{301}".utf8), "canonically equivalent Unicode edits are dirty and saved byte-for-byte")
+        try Data("é".utf8).write(to: root.appendingPathComponent(unicodePath))
+        roundTripModel.text += " typed"
+        check(!roundTripModel.save() && roundTripModel.saveConflict, "external byte-only Unicode change triggers conflict")
+        roundTripModel.reloadAfterConflict(); roundTripModel.note = nil
+        try FileManager.default.removeItem(at: root.appendingPathComponent(unicodePath))
+
         let model = AppModel(restoreState: false); model.timer?.invalidate(); model.vault = vault; model.rememberChats = true
         model.relatedNotesLocal = false; model.relatedNotesCloud = false // Related notes are checked on their own below.
         model.streamReplies = false

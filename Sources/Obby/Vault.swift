@@ -231,7 +231,7 @@ final class Vault {
             try Task.checkCancellation()
             for entry in try entries(path) {
                 if entry.isDirectory { pending.append(entry.path) }
-                let match = entry.path.localizedCaseInsensitiveContains(query) || (!entry.isDirectory && ((try? read(entry.path))?.localizedCaseInsensitiveContains(query) == true))
+                let match = Self.nameMatches(entry.path, query) || (!entry.isDirectory && ((try? read(entry.path))?.localizedCaseInsensitiveContains(query) == true))
                 if match {
                     if skipped < offset { skipped += 1 }
                     else { matches.append(entry); if matches.count >= limit { return matches } }
@@ -240,11 +240,20 @@ final class Vault {
         }
         return matches
     }
+    /// Name matching that treats "/" and the title slash "／" alike and ignores spaces and case,
+    /// so "BM 30/09/2026" finds "BM 30 ／ 09 ／ 2026.md".
+    static func nameMatches(_ path: String, _ query: String) -> Bool {
+        func loose(_ text: String) -> String {
+            text.lowercased().replacingOccurrences(of: "\u{FF0F}", with: "/").filter { !$0.isWhitespace }
+        }
+        let wanted = loose(query)
+        return !wanted.isEmpty && (path.localizedCaseInsensitiveContains(query) || loose(path).contains(wanted))
+    }
     func search(_ query: String) throws -> [Entry] {
         func walk(_ entries: [Entry]) -> [Entry] { entries.flatMap { [$0] + walk($0.children ?? []) } }
         return try walk(tree()).filter { entry in
             try Task.checkCancellation()
-            return entry.path.localizedCaseInsensitiveContains(query) || (!entry.isDirectory && ((try? read(entry.path))?.localizedCaseInsensitiveContains(query) == true))
+            return Self.nameMatches(entry.path, query) || (!entry.isDirectory && ((try? read(entry.path))?.localizedCaseInsensitiveContains(query) == true))
         }
     }
 }

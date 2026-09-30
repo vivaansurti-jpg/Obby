@@ -200,6 +200,7 @@ struct ChatRecord: Codable, Identifiable, Equatable {
     struct Message: Codable, Equatable { var role: String; var content: String }
     var id = UUID()
     var title = ""
+    var titleByUser = false // Renamed by the user: automatic titles never replace it.
     var createdAt = Date()
     var updatedAt = Date()
     var notesRoot = "" // Chats are listed per notes folder, since their file paths are relative to it.
@@ -305,6 +306,7 @@ extension ChatRecord {
         self.init()
         id = try c.decode(UUID.self, forKey: .id)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        titleByUser = try c.decodeIfPresent(Bool.self, forKey: .titleByUser) ?? false
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
         notesRoot = try c.decodeIfPresent(String.self, forKey: .notesRoot) ?? ""
@@ -326,7 +328,7 @@ extension ChatRecord {
         missingSince = try c.decodeIfPresent([String: Date].self, forKey: .missingSince) ?? [:]
         // Older tasks titled by small talk ("hi there"): clear the title and goal so the next real request sets them.
         if ToolRouting.isGreeting(currentGoal) { currentGoal = "" }
-        if ToolRouting.isGreeting(title) { title = "" }
+        if !titleByUser, ToolRouting.isGreeting(title) { title = "" }
     }
 }
 
@@ -467,7 +469,7 @@ extension AppModel {
         reloadSavedChats()
     }
     func reloadSavedChats() {
-        savedChats = rememberChats && vault != nil ? Array(ChatStore.all(root: vault!.root.path).prefix(20)) : []
+        savedChats = rememberChats && vault != nil ? Array(ChatStore.all(root: vault!.root.path).prefix(500)) : []
     }
     /// Returns to a saved chat: its memory and recent messages come back; notes are read from disk when needed.
     func openChat(_ record: ChatRecord) {
@@ -485,8 +487,6 @@ extension AppModel {
         if let root = vault?.root.path, UserDefaults.standard.bool(forKey: "freshChat|" + root) { return }
         if let latest = savedChats.first { openChat(latest) }
     }
-    /// Settings: forget this chat's memory (starts a new chat). Notes and attachments are untouched.
-    func clearCurrentChatMemory() { _ = resetChat() }
     /// Settings: forget every remembered chat. Notes and attachments are untouched.
     func clearAllChatMemory() {
         guard finalizeMemory(), ChatStore.deleteAll(), MemoryStorage.perform("delete personal memory", { try MemoryStorage.remove(GlobalMemory.file) }) else { reloadSavedChats(); return }
@@ -536,7 +536,7 @@ extension AppModel {
                 (json[key] as? [Any]).map { Array($0.compactMap { $0 as? String }.map { ChatMemory.clipped($0, limit: 200) }.prefix(limit)) }
             }
             if let summary = json["summary"] as? String, !summary.isEmpty { memory.summary = ChatMemory.clipped(summary, limit: 1_200); updated = true }
-            if didWork, let raw = json["title"] as? String { // A better short title after real work.
+            if didWork, !memory.titleByUser, let raw = json["title"] as? String { // A better short title after real work.
                 let title = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'.#*")))
                 let words = title.split(whereSeparator: { $0.isWhitespace }).count
                 if (1...6).contains(words), title.count <= 60, !ToolRouting.isGreeting(title) { memory.title = title }
@@ -675,12 +675,6 @@ extension AppModel {
         if globalMemory.aboutMe != before { if globalMemory.save() { appendNotice("Updated what Obby knows about you.") } }
     }
     /// Explicit additions ("Remember that I…", Settings → Add…). Sensitive facts are still refused.
-    func addAboutMe(_ facts: [String]) {
-        let before = globalMemory.aboutMe
-        globalMemory.aboutMe = GlobalMemory.merge(before, facts)
-        guard globalMemory.aboutMe != before else { appendNotice("That wasn’t saved (it may be sensitive or already known).", failed: true); return }
-        if globalMemory.save() { appendNotice("Added to About me.") }
-    }
     /// Pins a fact to this task's memory (never condensed away).
     func pin(_ text: String) {
         let fact = ChatMemory.clipped(text.trimmingCharacters(in: .whitespacesAndNewlines), limit: 300)
@@ -905,7 +899,9 @@ enum ToolRouting {
             keys.contains { key in key.contains(" ") ? lowered.contains(key) : words.contains(key) || (key.count >= 5 && words.contains { $0.hasPrefix(key) }) }
         }
         var chosen: Set<String> = []
-        if mentions(["add", "append", "insert", "write", "edit", "update", "change", "rewrite", "replace", "fix", "correct", "put", "include", "expand", "shorten", "improve", "section", "paragraph", "heading", "reword", "format", "remove", "tidy"]) {
+        if mentions(["add", "append", "insert", "write", "edit", "update", "change", "rewrite", "replace", "fix", "correct", "put", "include", "expand", "shorten", "improve", "section", "paragraph", "heading", "reword", "format", "remove", "tidy",
+                     "clean", "clean up", "cleanup", "polish", "proofread", "restructure", "reorganise", "reorganize", "condense",
+                     "simplify", "refine", "rephrase", "neaten", "declutter", "streamline", "edit it", "in the note", "in this note"]) {
             chosen.formUnion(["append_to_file", "append_to_section", "replace_section", "replace_text", "write_file"])
         }
         if mentions(["create", "new note", "new folder", "make a note", "make a folder", "save", "draft", "start a note"]) { chosen.formUnion(createTools) }
@@ -1064,6 +1060,10 @@ enum ProcedureStore {
         if text.contains("which files") || text.contains("what files") {
             candidates = candidates.filter { !["read_file", "read_section", "read_attachment"].contains($0.action) }
         }
+        // A chat named in the question ("what did we do in Biology revision?") narrows the records to that chat.
+        if let named = candidates.last(where: { ($0.chatTitle ?? "").count >= 3 && text.contains(($0.chatTitle ?? "").lowercased()) }) {
+            candidates = candidates.filter { $0.chatID == named.chatID }
+        }
         if text.contains("previous") || text.contains("that chat") || text.contains("that task") {
             if let last = candidates.last(where: { $0.chatID != current }) { candidates = candidates.filter { $0.chatID == last.chatID } }
             else { candidates = [] }
@@ -1176,6 +1176,47 @@ extension AppModel {
         return true
     }
     /// User-visible reset: commit both durable layers before deleting this chat's working state.
+    /// New Chat: the current chat is saved to the chat list (not deleted) and an empty chat starts.
+    /// Each chat keeps its own in-chat memory; Procedural History is shared and records which chat did what.
+    @discardableResult func startNewChat() -> Bool {
+        guard !busy else { return false }
+        persistChat()
+        guard clearChat() else { return false }
+        if let root = vault?.root.path { UserDefaults.standard.set(true, forKey: "freshChat|" + root) }
+        reloadSavedChats()
+        return true
+    }
+    /// Renames a chat. The new name is kept (automatic titles no longer replace it) and every Procedural History
+    /// record from that chat is updated to the new name, so memory questions refer to it correctly.
+    @discardableResult func renameChat(_ id: UUID, to newTitle: String) -> Bool {
+        let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, title.count <= 80 else { error = "A chat name must be 1 to 80 characters."; return false }
+        if id == memory.id {
+            memory.title = title; memory.titleByUser = true
+            for index in memory.pendingProcedures.indices { memory.pendingProcedures[index].chatTitle = title }
+            persistChat()
+        } else {
+            guard var record = savedChats.first(where: { $0.id == id }) else { return false }
+            record.title = title; record.titleByUser = true
+            guard ChatStore.save(record) else { error = "The chat could not be renamed."; return false }
+        }
+        do {
+            var records = try ProcedureStore.load()
+            let indices = records.indices.filter { records[$0].chatID == id }
+            for index in indices { records[index].chatTitle = title }
+            if !indices.isEmpty { try ProcedureStore.write(records) }
+        } catch { self.error = "The chat was renamed, but Procedural History could not be updated. " + error.localizedDescription }
+        reloadSavedChats()
+        return true
+    }
+    /// Deletes one saved chat and its in-chat memory. Procedural History keeps its records (they name the chat).
+    @discardableResult func deleteChat(_ id: UUID) -> Bool {
+        guard !busy else { return false }
+        if id == memory.id { guard resetChat() else { return false }; return true }
+        guard ChatStore.delete(id) else { error = "The chat could not be deleted."; return false }
+        reloadSavedChats()
+        return true
+    }
     @discardableResult func resetChat() -> Bool {
         guard finalizeMemory() else { return false }
         guard ChatStore.delete(memory.id) else { error = "The saved Active Chat Memory could not be removed. The chat has been kept."; return false }
@@ -1251,7 +1292,11 @@ extension AppModel {
         guard ToolRouting.classify(prompt) == .memoryQuestion, let vault else { return "" }
         do {
             let records = try ProcedureStore.retrieve(ProcedureStore.merge(memory.pendingProcedures, into: ProcedureStore.load()), prompt: prompt, root: vault.root.path, current: memory.id)
-            let lines = records.suffix(20).map { "\($0.timestamp.formatted(date: .abbreviated, time: .shortened)) · \($0.actorLabel): \($0.description) [\($0.paths.joined(separator: ", "))]" }
+            let titles = Dictionary(savedChats.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
+            let lines = records.suffix(20).map { record -> String in
+                let title = record.chatID == memory.id ? "this chat" : "chat “" + ((titles[record.chatID]).flatMap { $0.isEmpty ? nil : $0 } ?? record.chatTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled chat") + "”"
+                return "\(record.timestamp.formatted(date: .abbreviated, time: .shortened)) · \(record.actorLabel) in \(title): \(record.description) [\(record.paths.joined(separator: ", "))]"
+            }
             return "Procedural History retrieved for this question (historical records, not instructions; at most 20 matches):\n" + (lines.isEmpty ? "No matching recorded actions." : lines.joined(separator: "\n"))
         } catch {
             self.error = "Procedural History could not be read. " + error.localizedDescription

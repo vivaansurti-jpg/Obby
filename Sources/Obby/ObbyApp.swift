@@ -357,6 +357,7 @@ struct AIView: View {
     @State var prompt = ""
     @State var showMemory = false
     @State private var showProviders = false
+    @State private var showChats = false
     @FocusState private var promptFocused: Bool
     @StateObject private var speech = SpeechInput()
     @State private var atBottom = true // The end of the chat is on screen; streamed text is followed only then.
@@ -366,19 +367,16 @@ struct AIView: View {
             HStack(spacing: 8) {
                 Text("Obby AI").font(.headline).fixedSize()
                 Spacer(minLength: 0)
+                Button { model.persistChat(); showChats.toggle() } label: { Image(systemName: "bubble.left.and.bubble.right") }
+                    .buttonStyle(.borderless).help("Chats").accessibilityLabel("Chats")
+                    .popover(isPresented: $showChats, arrowEdge: .bottom) { ChatListView(close: { showChats = false }).environmentObject(model) }
+                Button { model.startNewChat() } label: { Image(systemName: "square.and.pencil") }
+                    .buttonStyle(.borderless).help("New Chat").accessibilityLabel("New Chat").disabled(model.busy)
                 Menu {
                     Button {
                         DispatchQueue.main.async { showMemory = true } // After the menu closes, so the popover can open.
                     } label: { Label("Memory (\(model.memory.itemCount + model.globalMemory.preferences.count) items)…", systemImage: "brain") }
-                    Button { model.resetChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
-                    if !model.savedChats.isEmpty {
-                        Menu {
-                            ForEach(model.savedChats) { record in
-                                Button("\(record.title.isEmpty ? "Untitled chat" : record.title) (\(record.updatedAt.formatted(date: .abbreviated, time: .shortened)))") { model.openChat(record) }
-                                    .disabled(record.id == model.memory.id)
-                            }
-                        } label: { Label("Chat History", systemImage: "clock.arrow.circlepath") }.disabled(model.busy)
-                    }
+                    Button { model.startNewChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }.disabled(model.busy)
                     if model.showTechnical {
                         Divider()
                         Toggle(isOn: $model.showRawActions) { Label("Show technical action details", systemImage: "curlybraces") }
@@ -1024,6 +1022,55 @@ struct WindowCloseGuard: NSViewRepresentable {
     }
 }
 
+/// Every saved chat, newest first: click to open it, trash to delete it (after asking). Each chat has its own memory.
+struct ChatListView: View {
+    @EnvironmentObject var model: AppModel
+    var close: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Chats").font(.headline)
+                Spacer()
+                Button { model.startNewChat(); close() } label: { Label("New Chat", systemImage: "square.and.pencil") }.disabled(model.busy)
+            }.padding(10)
+            Divider()
+            if model.savedChats.isEmpty {
+                Text("No saved chats yet. Chats with real work are kept here until you delete them.")
+                    .font(.caption).foregroundStyle(.secondary).padding(10)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(model.savedChats) { record in
+                            HStack(spacing: 6) {
+                                Button { model.openChat(record); close() } label: {
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(record.title.isEmpty ? "Untitled chat" : record.title).lineLimit(1)
+                                        Text(record.updatedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption2).foregroundStyle(.secondary)
+                                    }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                                }.buttonStyle(.plain).disabled(model.busy || record.id == model.memory.id)
+                                if record.id == model.memory.id { Text("Open").font(.caption2).foregroundStyle(.secondary) }
+                                Button {
+                                    if let name = model.input("Rename chat", value: record.title) { model.renameChat(record.id, to: name) }
+                                } label: { Image(systemName: "pencil") }.buttonStyle(.borderless).help("Rename this chat").disabled(model.busy)
+                                Button { if Self.confirmDelete(record) { model.deleteChat(record.id) } } label: { Image(systemName: "trash") }
+                                    .buttonStyle(.borderless).help("Delete this chat").disabled(model.busy)
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(record.id == model.memory.id ? Color.secondary.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                        }
+                    }.padding(6)
+                }.frame(maxHeight: 360)
+            }
+        }.frame(width: 300)
+    }
+    static func confirmDelete(_ record: ChatRecord) -> Bool {
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = "Delete “\(record.title.isEmpty ? "Untitled chat" : record.title)”?"
+        alert.informativeText = "Its messages and in-chat memory are removed. Your notes, Permanent Memory and Procedural History are not affected."
+        alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+}
 /// Provider drop-down: providers that are ready to use (Ollama, or a cloud provider with a saved key).
 /// Switching uses the existing switchProvider logic. With nothing else set up, it points to Settings.
 struct ProviderMenu: View {

@@ -143,6 +143,12 @@ Procedural History contributes no context to ordinary AI requests. Explicit acti
 
 **Settings → Memory** provides separate Permanent Memory, Active Chat Memory, and Procedural History sections. Permanent items can be edited or removed individually. Procedural History is displayed as a chronological action list rather than raw JSON. Independent destructive controls use the existing Danger Zone presentation and require confirmation; each states which store is removed. None of these controls deletes notes or attachments. Clearing Permanent Memory also dismisses the current chat's pending permanent promotions.
 
+## Chats
+
+The chat button in the AI panel lists every saved chat, newest first. Selecting a chat reopens it with its own messages and in-chat memory; **New Chat** saves the current chat and starts an empty one. The pencil button renames a chat; the chosen name is kept and is also applied to that chat's records in Procedural History. Chats remain in the list until they are deleted with the trash button, which asks for confirmation. Deleting a chat does not affect notes, Permanent Memory or Procedural History. Procedural History is shared by all chats, and each record states the chat in which the action took place. Chats that contain only small talk are not saved.
+
+When a note is open, work requests can always edit that note. Each work request also tells the model today's date and the names of the top-level folders, and asks it to put a short question to the user when a request is ambiguous rather than guess.
+
 ## Hiding the AI panel
 
 The sidebar button at the top right of the window (or **View → Hide AI / Show AI**, **Shift+Cmd+A**) hides or shows the AI panel; the editor takes the freed width and the folders sidebar is unchanged. Hiding only removes the panel from view: the chat, its memory, an unsent draft, the provider and model stay as they are, a running request finishes normally, and nothing is unloaded. The hidden panel does no rendering or refresh work. When shown again it returns to the latest message of the same chat. The choice is remembered between launches.

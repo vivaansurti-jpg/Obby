@@ -116,15 +116,44 @@ extension AppModel {
         let tags = WikiLinks.tags(in: text).map { "#" + $0.name }.filter { tagSeen.insert($0.lowercased()).inserted }
         return "Links from \(path):\n" + list(outgoing) + "\nLinked from:\n" + list(Self.findBacklinks(to: path, in: vault)) + "\nTags: " + (tags.isEmpty ? "none" : tags.joined(separator: " "))
     }
+    /// Added to each work request: today's date, the top-level folders, and to ask rather than guess.
+    func workContext() -> String {
+        let date = Date().formatted(.dateTime.weekday(.wide).day().month(.wide).year())
+        var top: [Entry] = []
+        if let vault, let found = try? vault.entries() { top = found }
+        let folders = top.filter(\.isDirectory).map(\.name).prefix(30)
+        return "[Obby: today is \(date). Top-level folders: \(folders.isEmpty ? "none" : folders.joined(separator: ", ")). If the request is ambiguous (which note, which folder), ask one short question instead of guessing.]"
+    }
+    /// A short description of a note after a change: its length and how it starts.
+    static func snapshot(_ text: String) -> String {
+        let lines = text.isEmpty ? 0 : text.components(separatedBy: "\n").count
+        let start = text.replacingOccurrences(of: "\n", with: " ").prefix(80)
+        return "(Now \(lines) line\(lines == 1 ? "" : "s"); starts: \"\(start)\")"
+    }
     /// "Biology/Enzymes.md" when the note is really titled "Biology ／ Enzymes.md" (reads and edits only).
     func noteWithSlashTitle(_ path: String) -> String? {
         guard let vault, (try? vault.read(path)) == nil else { return nil }
         return NoteTitles.slashTitleCandidates(path).first { (try? vault.read($0)) != nil }
     }
+    /// The open note, when the model refers to it as "current" or writes a garbled version of its name (small models
+    /// often mangle unusual characters such as the title slash "／"). Only used when the given path doesn't exist,
+    /// and only for reads and edits, which still require reading before a rewrite.
+    func openNoteAlias(_ path: String) -> String? {
+        guard let note, let vault, (try? vault.read(path)) == nil else { return nil }
+        let asked = path.lowercased().trimmingCharacters(in: .whitespaces)
+        if ["current", "current note", "this note", "the note", "@current", "current.md"].contains(asked) { return note }
+        func loose(_ text: String) -> [Character] {
+            Array(((text as NSString).lastPathComponent as NSString).deletingPathExtension.lowercased().filter { $0.isLetter || $0.isNumber })
+        }
+        let given = loose(path), open = loose(note)
+        guard given.count >= 4, open.count >= 4, given.prefix(4) == open.prefix(4), abs(given.count - open.count) <= 3 else { return nil }
+        let differing = zip(given, open).filter { $0 != $1 }.count + abs(given.count - open.count)
+        return differing <= max(3, open.count / 3) ? note : nil
+    }
     static let folderNoteTools: Set<String> = ["read_file", "read_section", "write_file", "append_to_file", "replace_section", "append_to_section", "replace_text"]
     func executeTool(_ name: String, arguments original: [String: Any]) throws -> String {
         var arguments = original
-        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) ?? noteWithSlashTitle(path) { arguments["path"] = real }
+        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) ?? noteWithSlashTitle(path) ?? openNoteAlias(path) { arguments["path"] = real }
         let result = try executeToolOperation(name, arguments: arguments)
         if !result.hasPrefix("User declined") {
             if name == "read_attachment", let path = arguments["path"] as? String,
@@ -136,7 +165,7 @@ extension AppModel {
     private func executeToolOperation(_ name: String, arguments original: [String: Any]) throws -> String {
         guard let vault else { throw ObbyError("Choose an Obby folder first.") }
         var arguments = original
-        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) ?? noteWithSlashTitle(path) { arguments["path"] = real }
+        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) ?? noteWithSlashTitle(path) ?? openNoteAlias(path) { arguments["path"] = real }
         func arg(_ key: String) throws -> String { guard let value = arguments[key] as? String else { throw ObbyError("Missing argument: \(key)") }; return value }
         guard save() else { throw ObbyError("Save failed. Resolve the note error first.") }
         var feedback: String
@@ -281,10 +310,12 @@ extension AppModel {
                 var route: Set<String> = kind == .work ? ToolRouting.tools(for: routing, hasAttachments: !originAttachments.isEmpty) : []
                 if originNote != nil, ToolRouting.isCurrentNoteSummary(routing) {
                     route = route.intersection(["read_file", "read_section", "read_attachment"])
+                } else if originNote != nil, kind == .work {
+                    route.formUnion(ToolRouting.editTools) // The open note can always be edited, whatever words the request uses.
                 }
                 let wantsChange = kind == .work && !ToolRouting.matched(routing, hasAttachments: false).isDisjoint(with: ToolRouting.changing)
                 var sourceNotes: Set<String> = []
-                var nudged = false, ranTools = false // One reminder if a change request ends without any action.
+                var nudged = false // One reminder if a change request ends without any action.
                 var planApproved = false, planDeclined = false, touched: Set<String> = [] // Preview before large changes.
                 let routedTools = toolDefinitions.filter { definition in
                     guard let name = (definition["function"] as? [String: Any])?["name"] as? String else { return false }
@@ -327,6 +358,10 @@ extension AppModel {
                 if !quiet, let note = originNote {
                     let fitted = try await condenseLongText(originText, title: (note as NSString).lastPathComponent, request: prompt, provider: provider, window: window, allowance: noteAllowance)
                     userMessage = ChatMemory.withCurrentNote(prompt, path: note, text: fitted)
+                    // A change request with a note open and no other note named: edit the open note itself, not the chat.
+                    if wantsChange, useTools, !prompt.lowercased().contains(".md") {
+                        userMessage += "\n\n[Obby: apply this change to the open note with the edit tools (read it first; its path can be written as \"current\"). Don't only show the result in the chat.]"
+                    }
                 }
                 for item in requested {
                     let share = max((allowance - (originNote == nil ? 0 : noteAllowance)) / requested.count, 256)
@@ -355,6 +390,7 @@ extension AppModel {
                         appendNotice("Using: " + Array(Set(related.map { ($0.path as NSString).lastPathComponent })).sorted().joined(separator: ", "))
                     }
                 }
+                if kind == .work { userMessage += "\n\n" + workContext() }
                 messages.append(["role": "user", "content": userMessage])
                 let current = previousHistory.count
                 var invalidCalls = 0
@@ -428,10 +464,10 @@ extension AppModel {
                         return
                     }
                     // A change was asked for but the model only wrote text: remind it once to act (or say it can't).
-                    if toolCalls.isEmpty, wantsChange, useTools, !ranTools, !nudged, memory.completedActions.count == actionsBefore {
+                    if toolCalls.isEmpty, wantsChange, useTools, !nudged, memory.completedActions.count == actionsBefore { // Also after failed or read-only tool calls.
                         nudged = true
                         messages.append(reply.message)
-                        messages.append(["role": "user", "content": "Obby: nothing has changed yet. If I asked for a change, use the tools now (read the note first; it may be inside a folder, e.g. b/note.md). Otherwise just answer, and never say a change was made unless a tool did it."])
+                        messages.append(["role": "user", "content": "Obby: nothing has changed yet. If I asked for a change, use the tools now (read the note first; the open note's path can be written as \"current\"; a note may be inside a folder, e.g. b/note.md). Otherwise just answer, and never say a change was made unless a tool did it."])
                         removeLive(live)
                         continue
                     }
@@ -439,7 +475,6 @@ extension AppModel {
                         let sources = [originNote] + sourceNotes.filter { $0 != originNote }.sorted()
                         prose += "\n\nFrom " + sources.joined(separator: " and ")
                     }
-                    if !toolCalls.isEmpty { ranTools = true }
                     messages.append(textCalls ? ["role": "assistant", "content": reply.text] : reply.message)
                     if let id = live.lineID, let index = chat.firstIndex(where: { $0.id == id }) { // The streamed line becomes the final reply.
                         if prose.isEmpty { chat.remove(at: index) } else { chat[index].text = prose }
@@ -494,6 +529,8 @@ extension AppModel {
                             if !notDone.contains(missed) { notDone.append(missed) }
                         } else { streak.removeAll() }
                         var content = blocked ? "Error: This exact call already failed twice; try a different approach or stop and tell the user." : result
+                        if !failed, !blocked, ToolRouting.changing.contains(call.name), let path = (call.arguments["path"] ?? call.arguments["newPath"]) as? String,
+                           let now = try? vault?.read(path) { content += " " + Self.snapshot(now) } // Lets the model check its own edit.
                         if !failed, call.name == "read_file" || readsAttachment(call), ContextBudget.tokens(result) > budget * 3 / 5 { // A long note or document read by a tool.
                             content = try await condenseLongText(result, title: call.arguments["path"] as? String ?? "note", request: prompt, provider: provider, window: window, allowance: budget * 3 / 5)
                         }

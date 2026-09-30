@@ -1111,6 +1111,43 @@ Earlier in this chat (condensed):
         check(spellView.isAutomaticSpellingCorrectionEnabled && spellView.isGrammarCheckingEnabled, "autocorrect and grammar follow the setting")
         if let savedAutocorrect { UserDefaults.standard.set(savedAutocorrect, forKey: "editorAutocorrect") } else { UserDefaults.standard.removeObject(forKey: "editorAutocorrect") }
 
+        // "Clean up" and similar requests get the edit tools, so the open note is changed rather than answered in chat.
+        for request in ["summarise and clean up my notes", "clean up this note", "polish this", "proofread my note", "restructure this note"] {
+            check(ToolRouting.tools(for: request, hasAttachments: false).contains("write_file"), "\"\(request)\" can edit the note")
+        }
+        check(!ToolRouting.tools(for: "summarise this note", hasAttachments: false).contains("write_file"), "a plain summary request stays read-only")
+
+        // Work context, edit snapshots, chat history kept until deleted, procedural records name their chat.
+        let context = model.workContext()
+        check(context.contains("today is") && context.contains("ask one short question"), "work requests get today's date and the ask-don't-guess rule")
+        check(AppModel.snapshot("# Title\nLine two") == "(Now 2 lines; starts: \"# Title Line two\")", "edit results describe the note after the change")
+        model.clearChat()
+        model.memory.title = "History chat one"; model.memory.remember(action: "Created One.md."); model.persistChat()
+        let firstChat = model.memory.id
+        check(model.startNewChat() && model.memory.id != firstChat && model.savedChats.contains { $0.id == firstChat }, "New Chat keeps the previous chat in the list")
+        model.memory.title = "History chat two"; model.memory.remember(action: "Created Two.md."); model.persistChat()
+        let secondChat = model.memory.id
+        if let first = model.savedChats.first(where: { $0.id == firstChat }) { model.openChat(first) }
+        check(model.memory.id == firstChat && model.memory.title == "History chat one" && model.savedChats.contains { $0.id == secondChat }, "opening an old chat restores its own memory; the other stays saved")
+        check(model.deleteChat(secondChat) && !model.savedChats.contains { $0.id == secondChat } && model.savedChats.contains { $0.id == firstChat }, "a chat stays until it is deleted")
+        // Renaming a chat renames its Procedural History records; memory stays unified, in-chat memory separate.
+        model.recordProcedure("create_file", arguments: ["path": "One.md"])
+        _ = model.flushProcedures()
+        check(model.renameChat(firstChat, to: "Cell biology revision") && model.memory.title == "Cell biology revision" && model.memory.titleByUser, "a chat can be renamed")
+        let renamedRecords = ((try? ProcedureStore.load()) ?? []).filter { $0.chatID == firstChat }
+        check(!renamedRecords.isEmpty && renamedRecords.allSatisfy { $0.chatTitle == "Cell biology revision" }, "renaming a chat updates its Procedural History records")
+        check(ProcedureStore.retrieve((try? ProcedureStore.load()) ?? [], prompt: "what did we do in cell biology revision?", root: vault.root.path, current: UUID()).allSatisfy { $0.chatID == firstChat }, "a chat named in a memory question narrows the records to it")
+        check(!model.renameChat(firstChat, to: "   "), "an empty chat name is refused")
+        _ = model.deleteChat(firstChat)
+
+        // Notes with a slash in the title: loose name search, "current" alias, garbled names resolve to the open note.
+        try vault.write("BM 30 \u{FF0F} 09 \u{FF0F} 2026.md", content: "Business notes", create: true)
+        check(Vault.nameMatches("BM 30 \u{FF0F} 09 \u{FF0F} 2026.md", "BM 30/09/2026") && !Vault.nameMatches("Other.md", "BM 30/09/2026"), "search finds a slash-titled note written with ordinary slashes")
+        model.openNote("BM 30 \u{FF0F} 09 \u{FF0F} 2026.md")
+        check((try? model.executeTool("read_file", arguments: ["path": "current"])) == "Business notes", "\"current\" means the open note")
+        check((try? model.executeTool("read_file", arguments: ["path": "BM 30N\u{039B}2026.md"])) == "Business notes", "a garbled version of the open note's name reads the open note")
+        check(model.openNoteAlias("Completely different.md") == nil, "unrelated missing names are not redirected")
+
         // Follow-ups keep the previous task's tools; "note b" finds b's only note
         let task = "go into note b, and shorten the story to 10 words."
         check(ToolRouting.isFollowUp("yes") && ToolRouting.isFollowUp("did you do the task?") && !ToolRouting.isFollowUp("how are you?") && !ToolRouting.isFollowUp("thanks"), "follow-up detection")

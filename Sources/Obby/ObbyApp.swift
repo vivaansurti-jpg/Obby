@@ -512,14 +512,23 @@ struct AIView: View {
                     .accessibilityElement(children: .combine)
                 }
             }
-            if let note = model.note, !model.skipCurrentNoteOnce {
+            if let note = model.note {
+                // × leaves the note out of the next request; the line stays so it can be added back with +.
                 HStack(spacing: 6) {
-                    Text("Using: " + (note as NSString).lastPathComponent).lineLimit(1)
-                    Button { model.skipCurrentNoteOnce = true } label: { Image(systemName: "xmark") }
-                        .buttonStyle(.plain).help("Do not use the current note for the next request")
-                        .accessibilityLabel("Exclude current note from next request")
+                    if model.skipCurrentNoteOnce {
+                        Text("Not using: " + (note as NSString).lastPathComponent).lineLimit(1).strikethrough()
+                        Button { model.skipCurrentNoteOnce = false } label: { Image(systemName: "plus.circle") }
+                            .buttonStyle(.plain).help("Use the current note again")
+                            .accessibilityLabel("Include current note in next request")
+                    } else {
+                        Text("Using: " + (note as NSString).lastPathComponent).lineLimit(1)
+                        Button { model.skipCurrentNoteOnce = true } label: { Image(systemName: "xmark") }
+                            .buttonStyle(.plain).help("Do not use the current note for the next request")
+                            .accessibilityLabel("Exclude current note from next request")
+                    }
                     Spacer()
                 }.font(.caption).foregroundStyle(.secondary)
+                .onChange(of: model.note) { _ in model.skipCurrentNoteOnce = false } // A newly opened note is used again.
             }
             if speech.listening {
                 Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)

@@ -53,6 +53,9 @@ Pasting always inserts plain text exactly as copied: Markdown, code fences, JSON
 - Drag the panel dividers to resize. The editor is the largest panel by default.
 - External changes are detected immediately; a fallback check runs every 60 seconds. Conflicting external edits produce a save error with options to overwrite or reload. Unsaved edits remain only in memory until resolved. No autosave caches, snapshots, duplicate notes, or backups are maintained; atomic writes leave no temporary file after success.
 
+- Spelling mistakes are underlined as you type. **Correct spelling automatically** (Settings → Notes, off by default) also lets macOS correct words and check grammar. Smart quotes, smart dashes and text replacement always remain off so that Markdown is not altered.
+- A slash typed in a note title is stored as a full-width slash (／) in the file name. Paths, Markdown links and wikilinks written with an ordinary slash (for example `[[Biology / Enzymes]]`) still find such a note, and the AI can read and edit it.
+
 ## Ollama
 
 Run your installed Ollama app. Obby discovers models using `/api/tags`, and chats with `/api/chat`. Choose any installed compatible model from the dropdown. A tool-capable model is required for filesystem actions.

@@ -116,10 +116,15 @@ extension AppModel {
         let tags = WikiLinks.tags(in: text).map { "#" + $0.name }.filter { tagSeen.insert($0.lowercased()).inserted }
         return "Links from \(path):\n" + list(outgoing) + "\nLinked from:\n" + list(Self.findBacklinks(to: path, in: vault)) + "\nTags: " + (tags.isEmpty ? "none" : tags.joined(separator: " "))
     }
+    /// "Biology/Enzymes.md" when the note is really titled "Biology ／ Enzymes.md" (reads and edits only).
+    func noteWithSlashTitle(_ path: String) -> String? {
+        guard let vault, (try? vault.read(path)) == nil else { return nil }
+        return NoteTitles.slashTitleCandidates(path).first { (try? vault.read($0)) != nil }
+    }
     static let folderNoteTools: Set<String> = ["read_file", "read_section", "write_file", "append_to_file", "replace_section", "append_to_section", "replace_text"]
     func executeTool(_ name: String, arguments original: [String: Any]) throws -> String {
         var arguments = original
-        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) { arguments["path"] = real }
+        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) ?? noteWithSlashTitle(path) { arguments["path"] = real }
         let result = try executeToolOperation(name, arguments: arguments)
         if !result.hasPrefix("User declined") {
             if name == "read_attachment", let path = arguments["path"] as? String,
@@ -131,7 +136,7 @@ extension AppModel {
     private func executeToolOperation(_ name: String, arguments original: [String: Any]) throws -> String {
         guard let vault else { throw ObbyError("Choose an Obby folder first.") }
         var arguments = original
-        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) { arguments["path"] = real }
+        if Self.folderNoteTools.contains(name), let path = arguments["path"] as? String, let real = noteInFolder(path) ?? noteWithSlashTitle(path) { arguments["path"] = real }
         func arg(_ key: String) throws -> String { guard let value = arguments[key] as? String else { throw ObbyError("Missing argument: \(key)") }; return value }
         guard save() else { throw ObbyError("Save failed. Resolve the note error first.") }
         var feedback: String

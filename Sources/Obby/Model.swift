@@ -85,6 +85,12 @@ import CoreServices
     }
     var currentTaskID: UUID? // Groups one request's changes so they can be undone together.
     @Published var backlinks: [String] = [] // Notes that link to the open note ("Linked from").
+    @Published var editorAutocorrect = UserDefaults.standard.bool(forKey: "editorAutocorrect") {
+        didSet {
+            UserDefaults.standard.set(editorAutocorrect, forKey: "editorAutocorrect")
+            NotificationCenter.default.post(name: .init("ObbyEditorSpelling"), object: nil)
+        }
+    }
     @Published var editorFontSize = Double(RichMarkdown.baseSize) { // Display only; saved files are unchanged.
         didSet {
             let clamped = RichMarkdown.clampFontSize(editorFontSize)
@@ -517,11 +523,17 @@ import CoreServices
             }
             error = "There is no note named “\(name)” yet."; return
         }
-        guard NoteLinks.target(destination) != nil else { return }
+        guard let target = NoteLinks.target(destination) else { return }
         do {
             let found = try resolveAttachment(destination)
             if found.url.pathExtension.lowercased() == "md" { openNote(found.path) } else { NSWorkspace.shared.open(found.url) }
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            // [Enzymes](Biology/Enzymes.md) may point at a note titled "Biology / Enzymes" (stored with "／").
+            let folder = (note.map { ($0 as NSString).deletingLastPathComponent } ?? "")
+            let bases = folder.isEmpty ? [target] : [folder + "/" + target, target]
+            if let vault, let path = bases.flatMap(NoteTitles.slashTitleCandidates).first(where: { (try? vault.read($0)) != nil }) { openNote(path); return }
+            self.error = error.localizedDescription
+        }
     }
     /// Inline title rename. Goes through the same Vault move validation as the sidebar and AI tools.
     @discardableResult func renameNote(_ path: String, to rawName: String) -> Bool {

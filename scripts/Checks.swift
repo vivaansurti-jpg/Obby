@@ -1097,6 +1097,20 @@ Earlier in this chat (condensed):
         model.globalMemory.remembered.removeAll { $0 == "my birthday is on 29 September" }; _ = model.globalMemory.save()
         model.requestOverride = savedMemoryOverride
 
+        // Slashes in note titles are stored as "／"; paths and links written with "/" still find the note.
+        check(NoteTitles.slashTitleCandidates("A/B/C.md") == ["A/B\u{FF0F}C.md", "A\u{FF0F}B\u{FF0F}C.md"] && NoteTitles.slashTitleCandidates("Plain.md").isEmpty, "slash title candidates")
+        try vault.write("Bio \u{FF0F} Enzymes.md", content: "Enzymes speed up reactions", create: true)
+        check((try? model.executeTool("read_file", arguments: ["path": "Bio / Enzymes.md"])) == "Enzymes speed up reactions", "the AI can read a note whose title contains a slash")
+        check(WikiLinks.resolve("Bio / Enzymes", from: "", in: ["Bio \u{FF0F} Enzymes.md", "Other.md"]) == "Bio \u{FF0F} Enzymes.md", "[[links]] written with a slash find the note")
+        // Spelling: underlines always on; autocorrect and grammar only when turned on.
+        let savedAutocorrect = UserDefaults.standard.object(forKey: "editorAutocorrect")
+        let spellView = NSTextView()
+        UserDefaults.standard.set(false, forKey: "editorAutocorrect"); MarkdownEditor.applySpelling(to: spellView)
+        check(spellView.isContinuousSpellCheckingEnabled && !spellView.isAutomaticSpellingCorrectionEnabled && !spellView.isGrammarCheckingEnabled, "spell-check underlines on, autocorrect off by default")
+        UserDefaults.standard.set(true, forKey: "editorAutocorrect"); MarkdownEditor.applySpelling(to: spellView)
+        check(spellView.isAutomaticSpellingCorrectionEnabled && spellView.isGrammarCheckingEnabled, "autocorrect and grammar follow the setting")
+        if let savedAutocorrect { UserDefaults.standard.set(savedAutocorrect, forKey: "editorAutocorrect") } else { UserDefaults.standard.removeObject(forKey: "editorAutocorrect") }
+
         // Follow-ups keep the previous task's tools; "note b" finds b's only note
         let task = "go into note b, and shorten the story to 10 words."
         check(ToolRouting.isFollowUp("yes") && ToolRouting.isFollowUp("did you do the task?") && !ToolRouting.isFollowUp("how are you?") && !ToolRouting.isFollowUp("thanks"), "follow-up detection")

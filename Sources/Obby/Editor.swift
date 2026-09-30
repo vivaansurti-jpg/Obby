@@ -389,6 +389,16 @@ final class PlainTextView: NSTextView {
         return text // Literal text, including its line endings.
     }
 }
+extension MarkdownEditor {
+    /// macOS spelling: red underlines are always on (they never change text). Autocorrect and grammar follow
+    /// Settings → Notes → "Correct spelling automatically" (off by default). Quotes, dashes and text replacement stay off.
+    static func applySpelling(to view: NSTextView) {
+        let correct = UserDefaults.standard.bool(forKey: "editorAutocorrect")
+        view.isContinuousSpellCheckingEnabled = true
+        view.isAutomaticSpellingCorrectionEnabled = correct
+        view.isGrammarCheckingEnabled = correct
+    }
+}
 struct MarkdownEditor: NSViewRepresentable {
     @Binding var text: String
     let bridge: EditorBridge
@@ -417,7 +427,7 @@ struct MarkdownEditor: NSViewRepresentable {
         view.isAutomaticQuoteSubstitutionEnabled = false
         view.isAutomaticDashSubstitutionEnabled = false
         view.isAutomaticTextReplacementEnabled = false
-        view.isAutomaticSpellingCorrectionEnabled = false
+        Self.applySpelling(to: view) // Spell-check underlines always; autocorrect and grammar only if turned on.
         view.isAutomaticLinkDetectionEnabled = false
         view.isAutomaticDataDetectionEnabled = false
         view.isAutomaticTextCompletionEnabled = false

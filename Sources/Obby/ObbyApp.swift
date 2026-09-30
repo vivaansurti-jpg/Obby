@@ -188,6 +188,7 @@ struct ContentView: View {
                             }
                             MarkdownEditor(text: $model.text, bridge: bridge, readOnly: model.editorReadOnly, importAttachments: { model.importAttachments($0) }, openLink: { model.openLink($0) }).id(note)
                                 .onReceive(NotificationCenter.default.publisher(for: .init("ObbyEditorFontSize"))) { _ in bridge.applyFontSize() }
+                                .onReceive(NotificationCenter.default.publisher(for: .init("ObbyEditorSpelling"))) { _ in if let view = bridge.view { MarkdownEditor.applySpelling(to: view) } }
                             if !model.backlinks.isEmpty { // Notes that link here; click to open.
                                 Divider()
                                 ScrollView(.horizontal, showsIndicators: false) {
@@ -674,6 +675,9 @@ struct SettingsView: View {
             Section("Editor") {
                 Stepper("Editor text size: \(Int(model.editorFontSize)) pt", value: $model.editorFontSize, in: 11...28, step: 1)
                 Text("Changes only how notes look in the editor (also View → Bigger, Smaller, Actual Size). Saved files are unchanged.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Correct spelling automatically", isOn: $model.editorAutocorrect)
+                Text("Spelling mistakes are always underlined. With this on, macOS also corrects words and checks grammar as you type. It can change technical words, names and file names, so it is off by default.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }.formStyle(.grouped)

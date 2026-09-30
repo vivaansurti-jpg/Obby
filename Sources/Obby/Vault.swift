@@ -684,6 +684,14 @@ enum WikiLinks {
     /// folder, otherwise a note with that name, preferring the linking note's folder, then the shortest path.
     /// `files` are Obby-relative note paths. Nil when nothing matches.
     static func resolve(_ target: String, from source: String, in files: [String]) -> String? {
+        if let found = resolveExact(target, from: source, in: files) { return found }
+        // [[Biology/Enzymes]] may mean a note titled "Biology / Enzymes" (stored with "／"), not a folder.
+        for alternative in NoteTitles.slashTitleCandidates(target) {
+            if let found = resolveExact(alternative, from: source, in: files) { return found }
+        }
+        return nil
+    }
+    private static func resolveExact(_ target: String, from source: String, in files: [String]) -> String? {
         var name = target.trimmingCharacters(in: .whitespaces)
         while name.hasPrefix("/") { name.removeFirst() }
         guard !name.isEmpty, !name.split(separator: "/").contains("..") else { return nil }
@@ -712,5 +720,19 @@ enum WikiLinks {
         let short = (full as NSString).lastPathComponent
         if resolve(short, from: source, in: files) == path { return short }
         return resolve(full, from: source, in: files) == path ? full : path
+    }
+}
+
+/// A "/" typed in a note title is stored as "／" (U+FF0F) because "/" separates folders. When a path written with "/"
+/// (by the AI, a link or a wikilink) doesn't exist, these are the same path read as titles containing slashes,
+/// keeping as many leading parts as folders as possible first: "A/B/C.md" → "A/B／C.md", then "A／B／C.md".
+enum NoteTitles {
+    static func slashTitleCandidates(_ path: String) -> [String] {
+        let parts = path.components(separatedBy: "/")
+        guard parts.count > 1 else { return [] }
+        return stride(from: parts.count - 2, through: 0, by: -1).map { split in
+            let folder = parts[..<split].joined(separator: "/"), title = parts[split...].joined(separator: "\u{FF0F}")
+            return folder.isEmpty ? title : folder + "/" + title
+        }
     }
 }

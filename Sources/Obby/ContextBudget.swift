@@ -202,7 +202,7 @@ extension AppModel {
         let combined = "[\"\(title)\" was too large to send at once; Obby read it in \(sections.count) sections. Notes from each section:]\n\n" + (digests.isEmpty ? "No section was relevant to the request." : digests.joined(separator: "\n\n"))
         if ContextBudget.tokens(combined) > allowance {
             if depth < 2 { return try await condenseLongText(combined, title: title, request: request, provider: provider, window: window, allowance: allowance, depth: depth + 1) }
-            return String(combined.prefix(allowance * 4)) // Several passes already; keep what fits.
+            throw ObbyError("The condensed note still exceeds the context budget. Ask about a specific section or increase the Context Window.")
         }
         return combined
     }

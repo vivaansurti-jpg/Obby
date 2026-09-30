@@ -9,10 +9,10 @@ enum ChatMemory {
             throw ObbyError("This request is larger than the \(ContextBudget.label(window)) context window. Try a larger Context Window in Settings or a more focused request.")
         }
     }
-    /// Attaches the open note (already fitted by ContextBudget, including unsaved edits) to a chat-only request.
+    /// Attaches the open note (already fitted by ContextBudget, including unsaved edits) to a request.
     static func withCurrentNote(_ prompt: String, path: String?, text: String) -> String {
         guard let path else { return prompt }
-        return prompt + "\n\n<current_note path=\"\(path)\">\n\(text)\n</current_note>"
+        return prompt + "\n\n<current_note path=\"\(path)\" title=\"\((path as NSString).lastPathComponent)\">\n\(text)\n</current_note>"
     }
     static func clipped(_ text: String, limit: Int) -> String {
         text.count > limit ? String(text.prefix(limit)) + "\n[Earlier content truncated]" : text
@@ -870,6 +870,12 @@ enum ToolRouting {
         let set = Set(words)
         let pointsAtNotes = noteWords.contains { key in set.contains(key) || (key.count >= 5 && set.contains { $0.hasPrefix(key) }) }
         return !pointsAtNotes && matched(prompt, hasAttachments: false).isEmpty
+    }
+    /// Only unambiguously local summaries suppress discovery; broader questions retain fallback tools.
+    static func isCurrentNoteSummary(_ prompt: String) -> Bool {
+        let text = prompt.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        return ["summarise this", "summarize this", "summarise this note", "summarize this note",
+                "what's the main argument here", "what is the main argument here"].contains(text.trimmingCharacters(in: CharacterSet(charactersIn: ".?!")))
     }
     /// The tools for a request: an empty set means none (small talk).
     static func tools(for prompt: String, hasAttachments: Bool) -> Set<String> {

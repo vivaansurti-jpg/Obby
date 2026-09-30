@@ -7,6 +7,7 @@ import CoreServices
     @Published var tree: [Entry] = []
     @Published var selection: String?
     @Published var note: String? 
+    @Published var skipCurrentNoteOnce = false
     @Published var text = "" { didSet { if !loading && !text.utf8.elementsEqual(oldValue.utf8) { dirty = true; scheduleSave() } } }
     @Published var editorReadOnly = false
     @Published var dirty = false

@@ -513,6 +513,15 @@ struct AIView: View {
                     .accessibilityElement(children: .combine)
                 }
             }
+            if let note = model.note, !model.skipCurrentNoteOnce {
+                HStack(spacing: 6) {
+                    Text("Using: " + (note as NSString).lastPathComponent).lineLimit(1)
+                    Button { model.skipCurrentNoteOnce = true } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).help("Do not use the current note for the next request")
+                        .accessibilityLabel("Exclude current note from next request")
+                    Spacer()
+                }.font(.caption).foregroundStyle(.secondary)
+            }
             if speech.listening {
                 Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
             }

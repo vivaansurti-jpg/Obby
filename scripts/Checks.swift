@@ -514,6 +514,38 @@ final class SourceUndoDelegate: NSObject, NSTextViewDelegate {
         check(sent.contains("Photosynthesis notes") && !sent.contains("Unrelated secret"), "chat-only model receives only the open note")
         check(!model.history.contains { ($0["content"] as? String)?.contains("Photosynthesis notes") == true }, "note content not kept in chat history")
 
+        // Current-note context also reaches tool-capable models, once per editor snapshot.
+        model.toolSupport = [:]
+        model.requestOverride = { route, body in
+            ollamaRequests.append((route, body))
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            return ["message": ["role": "assistant", "content": "Answer"]]
+        }
+        try vault.write("Cells.md", content: "Older disk cells", create: true)
+        model.openNote("Cells.md"); model.text = "Unsaved cells divide"
+        check(try vault.read("Cells.md") == "Older disk cells", "current-note fixture has unsaved editor changes")
+        func currentRequest(_ prompt: String) async -> [String: Any] {
+            ollamaRequests = []; model.send(prompt)
+            while model.busy { try? await Task.sleep(nanoseconds: 10_000_000) }
+            return ollamaRequests.first { $0.0 == "/api/chat" }?.1 ?? [:]
+        }
+        func offered(_ body: [String: Any]) -> Set<String> {
+            Set((body["tools"] as? [[String: Any]] ?? []).compactMap { ($0["function"] as? [String: Any])?["name"] as? String })
+        }
+        let local = await currentRequest("summarise this")
+        check(String(describing: local).contains("Unsaved cells divide") && !String(describing: local).contains("Older disk cells"), "tool request uses editor snapshot")
+        check(offered(local).isSubset(of: ["read_file", "read_section", "read_attachment"]), "current summary cannot search or change notes")
+        check(model.chat.last(where: { $0.role == "Obby" })?.text.hasSuffix("From Cells.md") == true, "current-note answer has a source line")
+        check(offered(await currentRequest("compare this with Enzymes.md")).contains("read_file"), "comparison can read another note")
+        check(offered(await currentRequest("what have I written about photosynthesis across my notes?")).contains("search_notes"), "vault question can search")
+        model.skipCurrentNoteOnce = true
+        let excluded = await currentRequest("summarise this")
+        check(!String(describing: excluded).contains("<current_note") && !model.skipCurrentNoteOnce, "dismiss excludes next snapshot and resets")
+        check(String(describing: await currentRequest("summarise this")).contains("<current_note"), "following request resumes current-note context")
+        model.selectFolder(nil)
+        let noNote = await currentRequest("summarise this")
+        check(!String(describing: noNote).contains("<current_note") && offered(noNote) == ToolRouting.tools(for: "summarise this", hasAttachments: false), "no open note retains existing routing")
+        model.openNote("Current.md")
         // Attachments: Obby resolves links relative to the open note, reads them, and sends the text itself.
         try vault.mkdir("School/Biology/Attachments"); try vault.mkdir("Attachments")
         try Self.pdf("Synapses transmit signals across neurons").write(to: root.appendingPathComponent("School/Biology/Attachments/Synapses Paper.pdf"))
@@ -842,6 +874,10 @@ Earlier in this chat (condensed):
                 stream.yield(["done": true]); stream.finish()
             }
         }
+        func sourced(_ reply: String, read: [String] = []) -> String {
+            guard let note = model.note else { return reply }
+            return reply + "\n\nFrom " + ([note] + Set(read).filter { $0 != note }.sorted()).joined(separator: " and ")
+        }
         var streamRound = 0, plainChats = 0
         model.toolSupport = [:]; model.streamReplies = true
         model.requestOverride = { route, _ in
@@ -854,20 +890,20 @@ Earlier in this chat (condensed):
         model.clearChat()
         model.send("explain photosynthesis in a few sentences please")
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
-        check(model.chat.filter { $0.role == "Obby" }.map(\.text) == ["Photosynthesis makes sugar."] && model.history.last?["content"] as? String == "Photosynthesis makes sugar.", "streamed chunks join into one final reply")
+        check(model.chat.filter { $0.role == "Obby" }.map(\.text) == [sourced("Photosynthesis makes sugar.")] && model.history.last?["content"] as? String == sourced("Photosynthesis makes sugar."), "streamed chunks join into one final reply")
         check(TextToolCall.visiblePrefix("read_") == "" && TextToolCall.visiblePrefix(#"write_file{"pa"#) == "" && TextToolCall.visiblePrefix("Sure.\n```json\n{") == "Sure." && TextToolCall.visiblePrefix("Cells divide") == "Cells divide", "possible tool calls are held back while streaming")
         streamRound = 0
         model.streamOverride = { _, _ in streamRound += 1; return streamRound == 1 ? chunks(["read_", #"file{"path":"Current.md"}"#]) : chunks(["It says ", "TOK."]) }
         model.clearChat()
         model.send("read Current.md and tell me what it says")
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
-        check(!model.chat.contains { $0.role == "Obby" && $0.text.contains("read_") } && model.chat.contains { $0.text == "Read Current.md." } && model.chat.last(where: { $0.role == "Obby" })?.text == "It says TOK.", "streamed tool call runs and is never shown as text")
+        check(!model.chat.contains { $0.role == "Obby" && $0.text.contains("read_") } && model.chat.contains { $0.text == "Read Current.md." } && model.chat.last(where: { $0.role == "Obby" })?.text == sourced("It says TOK.", read: ["Current.md"]), "streamed tool call runs and is never shown as text")
         plainChats = 0
         model.streamOverride = { _, _ in AsyncThrowingStream { $0.finish(throwing: ObbyError("connection reset")) } }
         model.clearChat()
         model.send("explain osmosis in a few sentences please")
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
-        check(model.chat.last(where: { $0.role == "Obby" })?.text == "Fallback reply" && plainChats >= 1, "a failure before the first chunk falls back to the normal request")
+        check(model.chat.last(where: { $0.role == "Obby" })?.text == sourced("Fallback reply") && plainChats >= 1, "a failure before the first chunk falls back to the normal request")
         model.streamOverride = { _, _ in
             AsyncThrowingStream { stream in
                 stream.yield(["message": ["role": "assistant", "content": "Partial answer"]])
@@ -886,7 +922,7 @@ Earlier in this chat (condensed):
         model.clearChat()
         model.send("explain respiration in a few sentences please")
         while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
-        check(streamRound == 0 && plainChats >= 1 && model.chat.last(where: { $0.role == "Obby" })?.text == "Fallback reply", "\"Stream replies\" off uses the normal request")
+        check(streamRound == 0 && plainChats >= 1 && model.chat.last(where: { $0.role == "Obby" })?.text == sourced("Fallback reply"), "\"Stream replies\" off uses the normal request")
         model.streamReplies = true; model.streamOverride = nil
         struct WholeReplyProvider: AIProvider {
             var kind: ProviderKind { .anthropic }

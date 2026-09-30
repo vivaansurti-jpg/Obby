@@ -147,7 +147,7 @@ Procedural History contributes no context to ordinary AI requests. Explicit acti
 
 The chat button in the AI panel lists every saved chat, newest first. Selecting a chat reopens it with its own messages and in-chat memory; **New Chat** saves the current chat and starts an empty one. The pencil button renames a chat; the chosen name is kept and is also applied to that chat's records in Procedural History. Chats remain in the list until they are deleted with the trash button, which asks for confirmation. Deleting a chat does not affect notes, Permanent Memory or Procedural History. Procedural History is shared by all chats, and each record states the chat in which the action took place. Chats that contain only small talk are not saved.
 
-When a note is open, work requests can always edit that note. Each work request also tells the model today's date and the names of the top-level folders, and asks it to put a short question to the user when a request is ambiguous rather than guess.
+Each chat has its own note reference, chosen from the menu above the message box: **Follow the open note** (the default), **No note**, or a specific note, which that chat keeps using whichever note is open. A chosen note follows renames and moves, and the chat returns to following the open note if the chosen note is deleted. The × button leaves the note out of the next request only, and + includes it again. When a note is open, work requests can always edit that note. Each work request also tells the model today's date and the names of the top-level folders, and asks it to put a short question to the user when a request is ambiguous rather than guess.
 
 ## Hiding the AI panel
 

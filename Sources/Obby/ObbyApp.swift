@@ -512,24 +512,41 @@ struct AIView: View {
                     .accessibilityElement(children: .combine)
                 }
             }
-            if let note = model.note {
-                // × leaves the note out of the next request; the line stays so it can be added back with +.
-                HStack(spacing: 6) {
-                    if model.skipCurrentNoteOnce {
-                        Text("Not using: " + (note as NSString).lastPathComponent).lineLimit(1).strikethrough()
-                        Button { model.skipCurrentNoteOnce = false } label: { Image(systemName: "plus.circle") }
-                            .buttonStyle(.plain).help("Use the current note again")
-                            .accessibilityLabel("Include current note in next request")
-                    } else {
-                        Text("Using: " + (note as NSString).lastPathComponent).lineLimit(1)
-                        Button { model.skipCurrentNoteOnce = true } label: { Image(systemName: "xmark") }
-                            .buttonStyle(.plain).help("Do not use the current note for the next request")
-                            .accessibilityLabel("Exclude current note from next request")
+            // Which note this chat refers to: follows the open note by default, or a note chosen for this chat.
+            HStack(spacing: 6) {
+                Menu {
+                    Button { model.setReferencedNote(nil) } label: {
+                        Label("Follow the open note", systemImage: model.memory.referencedNote == nil ? "checkmark" : "doc.text")
                     }
-                    Spacer()
-                }.font(.caption).foregroundStyle(.secondary)
-                .onChange(of: model.note) { _ in model.skipCurrentNoteOnce = false } // A newly opened note is used again.
-            }
+                    Button { model.setReferencedNote("") } label: {
+                        Label("No note", systemImage: model.memory.referencedNote == "" ? "checkmark" : "nosign")
+                    }
+                    Divider()
+                    if let vault = model.vault {
+                        ForEach(Array(AppModel.notePaths(in: vault).prefix(300)), id: \.self) { path in
+                            Button { model.setReferencedNote(path) } label: {
+                                if model.memory.referencedNote == path { Label(path, systemImage: "checkmark") } else { Text(path) }
+                            }
+                        }
+                    }
+                } label: {
+                    Text(model.skipCurrentNoteOnce ? "Not using: " + ((model.referencedNote ?? "") as NSString).lastPathComponent
+                         : model.referencedNote.map { "Using: " + ($0 as NSString).lastPathComponent + (model.memory.referencedNote == nil ? "" : " (this chat)") } ?? "No note")
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.visible).fixedSize().help("Choose the note this chat refers to")
+                if model.referencedNote != nil {
+                    if model.skipCurrentNoteOnce {
+                        Button { model.skipCurrentNoteOnce = false } label: { Image(systemName: "plus.circle") }
+                            .buttonStyle(.plain).help("Use the note again").accessibilityLabel("Include the note in the next request")
+                    } else {
+                        Button { model.skipCurrentNoteOnce = true } label: { Image(systemName: "xmark") }
+                            .buttonStyle(.plain).help("Leave the note out of the next request").accessibilityLabel("Exclude the note from the next request")
+                    }
+                }
+                Spacer()
+            }.font(.caption).foregroundStyle(.secondary)
+            .onChange(of: model.note) { _ in model.skipCurrentNoteOnce = false } // A newly opened note is used again.
             if speech.listening {
                 Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
             }

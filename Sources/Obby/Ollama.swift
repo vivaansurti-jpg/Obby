@@ -116,6 +116,19 @@ extension AppModel {
         let tags = WikiLinks.tags(in: text).map { "#" + $0.name }.filter { tagSeen.insert($0.lowercased()).inserted }
         return "Links from \(path):\n" + list(outgoing) + "\nLinked from:\n" + list(Self.findBacklinks(to: path, in: vault)) + "\nTags: " + (tags.isEmpty ? "none" : tags.joined(separator: " "))
     }
+    /// The note the current chat refers to: its chosen note, nothing, or (by default) whichever note is open.
+    var referencedNote: String? {
+        switch memory.referencedNote {
+        case nil: return note
+        case let chosen?: return chosen.isEmpty ? nil : chosen
+        }
+    }
+    /// Sets the chat's note: nil follows the open note, "" uses no note, a path uses that note. Saved with the chat.
+    func setReferencedNote(_ path: String?) {
+        memory.referencedNote = path
+        skipCurrentNoteOnce = false
+        persistChat()
+    }
     /// Added to each work request: today's date, the top-level folders, and to ask rather than guess.
     func workContext() -> String {
         let date = Date().formatted(.dateTime.weekday(.wide).day().month(.wide).year())
@@ -139,7 +152,7 @@ extension AppModel {
     /// often mangle unusual characters such as the title slash "／"). Only used when the given path doesn't exist,
     /// and only for reads and edits, which still require reading before a rewrite.
     func openNoteAlias(_ path: String) -> String? {
-        guard let note, let vault, (try? vault.read(path)) == nil else { return nil }
+        guard let note = requestNote ?? note, let vault, (try? vault.read(path)) == nil else { return nil }
         let asked = path.lowercased().trimmingCharacters(in: .whitespaces)
         if ["current", "current note", "this note", "the note", "@current", "current.md"].contains(asked) { return note }
         func loose(_ text: String) -> [Character] {
@@ -268,16 +281,23 @@ extension AppModel {
         }
         if let note { memory.remember(file: note) }
         pinFromRequest(prompt) // "Remember that…" is pinned by Obby itself.
-        let originNote = skipCurrentNoteOnce ? nil : note, originText = text, originFolder = folder
+        // The chat's chosen note (if any) is used instead of the open note; the open note's unsaved text is used
+        // when they are the same note.
+        let referenced = referencedNote
+        let originNote = skipCurrentNoteOnce ? nil : referenced
+        let originText = originNote == nil ? "" : originNote == note ? text : ((try? vault?.read(originNote!)) ?? nil) ?? ""
+        let originFolder = folder
         let omittedCurrentNote = skipCurrentNoteOnce
         skipCurrentNoteOnce = false
-        let originAttachments = originNote == nil ? [] : noteAttachments
-        let requestedAttachments = originNote == nil ? [] : attachmentsForRequest(prompt)
-        requestNoteFolder = noteFolder
+        let originIsOpen = originNote != nil && originNote == note
+        let originAttachments = originIsOpen ? noteAttachments : []
+        let requestedAttachments = originIsOpen ? attachmentsForRequest(prompt) : []
+        requestNoteFolder = originIsOpen ? noteFolder : originNote.map { ($0 as NSString).deletingLastPathComponent }
+        requestNote = originNote
         let session = chatSession
         currentTaskID = UUID() // This request's changes can be undone together.
         aiTask = Task {
-            defer { if session == chatSession { guardWrites = false; pendingUndo = nil; modelLoading = false; currentTaskID = nil; requestNoteFolder = nil; busy = false; aiTask = nil; directoryResults.removeAll() }; Task { await refreshModelStatus() } }
+            defer { if session == chatSession { guardWrites = false; pendingUndo = nil; modelLoading = false; currentTaskID = nil; requestNoteFolder = nil; requestNote = nil; busy = false; aiTask = nil; directoryResults.removeAll() }; Task { await refreshModelStatus() } }
             let live = LiveReply() // The streamed reply's chat line, if one is on screen.
             do {
                 if self.provider == .ollama { // Starts Ollama.app if needed (setting permitting); loads no model by itself.

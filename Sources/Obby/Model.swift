@@ -75,6 +75,7 @@ import CoreServices
     var pendingUndo: UndoEdit? // Set by executeTool for the action line it is about to produce.
     var readVersions: [String: Data] = [:]
     var requestNoteFolder: String?
+    var requestNote: String? // The note this request refers to (the chat's chosen note, or the open note).
     var readThisRequest: Set<String> = [] // Notes the model has read (or was given) during the current AI request.
     var shrinkOverride: ((String) -> Bool)? // The checks answer the shrink question without a dialog.
     var planOverride: (([String]) -> Bool)? // The checks answer the change-preview question without a dialog.

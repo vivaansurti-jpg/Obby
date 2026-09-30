@@ -201,6 +201,8 @@ struct ChatRecord: Codable, Identifiable, Equatable {
     var id = UUID()
     var title = ""
     var titleByUser = false // Renamed by the user: automatic titles never replace it.
+    /// The note this chat refers to: nil follows whichever note is open, "" means no note, a path means that note.
+    var referencedNote: String? = nil
     var createdAt = Date()
     var updatedAt = Date()
     var notesRoot = "" // Chats are listed per notes folder, since their file paths are relative to it.
@@ -307,6 +309,7 @@ extension ChatRecord {
         id = try c.decode(UUID.self, forKey: .id)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
         titleByUser = try c.decodeIfPresent(Bool.self, forKey: .titleByUser) ?? false
+        referencedNote = try c.decodeIfPresent(String.self, forKey: .referencedNote)
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
         notesRoot = try c.decodeIfPresent(String.self, forKey: .notesRoot) ?? ""
@@ -752,7 +755,12 @@ extension AppModel {
         updateProcedureReferences(old, new)
         func moved(_ path: String) -> String { path == old ? new : path.hasPrefix(old + "/") ? new + path.dropFirst(old.count) : path }
         memory.relevantFiles = memory.relevantFiles.map(moved)
+        if let chosen = memory.referencedNote, !chosen.isEmpty { memory.referencedNote = moved(chosen) }
         if let root = vault?.root.path {
+            for var record in ChatStore.all(root: root) where record.id != memory.id {
+                guard let chosen = record.referencedNote, !chosen.isEmpty, moved(chosen) != chosen else { continue }
+                record.referencedNote = moved(chosen); ChatStore.save(record) // Each chat keeps pointing at its note.
+            }
             for var record in ChatStore.all(root: root) where record.id != memory.id && record.relevantFiles.contains(where: { moved($0) != $0 }) {
                 record.relevantFiles = record.relevantFiles.map(moved); ChatStore.save(record)
             }
@@ -771,7 +779,12 @@ extension AppModel {
     func memoryDidDelete(_ path: String) {
         func gone(_ item: String) -> Bool { item == path || item.hasPrefix(path + "/") }
         memory.relevantFiles.removeAll(where: gone)
+        if let chosen = memory.referencedNote, gone(chosen) { memory.referencedNote = nil } // Back to the open note.
         if let root = vault?.root.path {
+            for var record in ChatStore.all(root: root) where record.id != memory.id {
+                guard let chosen = record.referencedNote, !chosen.isEmpty, gone(chosen) else { continue }
+                record.referencedNote = nil; ChatStore.save(record)
+            }
             for var record in ChatStore.all(root: root) where record.id != memory.id && record.relevantFiles.contains(where: gone) {
                 record.relevantFiles.removeAll(where: gone); ChatStore.save(record)
             }

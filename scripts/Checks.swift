@@ -1148,6 +1148,31 @@ Earlier in this chat (condensed):
         check((try? model.executeTool("read_file", arguments: ["path": "BM 30N\u{039B}2026.md"])) == "Business notes", "a garbled version of the open note's name reads the open note")
         check(model.openNoteAlias("Completely different.md") == nil, "unrelated missing names are not redirected")
 
+        // Each chat can choose the note it refers to; the default follows the open note.
+        try vault.write("RefA.md", content: "Alpha text", create: true); try vault.write("RefB.md", content: "Bravo unique text", create: true)
+        model.clearChat(); model.openNote("RefA.md")
+        check(model.referencedNote == "RefA.md", "by default a chat uses the open note")
+        model.setReferencedNote("RefB.md")
+        check(model.referencedNote == "RefB.md", "a chat can use a chosen note instead of the open one")
+        var referenceBodies: [String] = []
+        let savedReferenceOverride = model.requestOverride
+        model.requestOverride = { route, body in
+            if route == "/api/show" { return ["capabilities": ["completion"]] }
+            if route == "/api/chat" { referenceBodies.append(String(describing: body ?? [:])) }
+            return ["message": ["role": "assistant", "content": "Done."]]
+        }
+        model.provider = .ollama; model.selectedModel = "reference-model"; model.toolSupport = [:]
+        model.send("summarise this note please in two lines")
+        while model.busy { try await Task.sleep(nanoseconds: 10_000_000) }
+        check(referenceBodies.contains { $0.contains("Bravo unique text") } && !referenceBodies.contains { $0.contains("Alpha text") }, "requests use the chat's chosen note, not the open note")
+        model.setReferencedNote("")
+        check(model.referencedNote == nil, "a chat can use no note")
+        model.setReferencedNote("RefB.md"); model.didMove("RefB.md", "RefC.md")
+        check(model.memory.referencedNote == "RefC.md", "the chosen note follows a rename")
+        model.setReferencedNote(nil)
+        check(model.referencedNote == "RefA.md", "back to following the open note")
+        model.requestOverride = savedReferenceOverride; model.clearChat()
+
         // Follow-ups keep the previous task's tools; "note b" finds b's only note
         let task = "go into note b, and shorten the story to 10 words."
         check(ToolRouting.isFollowUp("yes") && ToolRouting.isFollowUp("did you do the task?") && !ToolRouting.isFollowUp("how are you?") && !ToolRouting.isFollowUp("thanks"), "follow-up detection")

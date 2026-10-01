@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 extension AppModel {
     func localURL(_ route: String) throws -> URL {
@@ -47,6 +48,8 @@ extension AppModel {
             let list = try await makeProvider().listModels()
             guard kind == provider else { return }
             models = list; connected = true; modelSettingsError = nil
+            // Plug and try: with no model chosen yet, pick a sensible default from the provider's own list.
+            if selectedModel.isEmpty, activeCustom == nil, let pick = ModelDefaults.pick(kind, from: list) { selectedModel = pick }
             persistSettings()
         } catch {
             guard kind == provider else { return }
@@ -324,6 +327,16 @@ extension AppModel {
                 // The editor snapshot is context, not a disk read authorizing a whole-note rewrite.
                 // Only the tools this request needs; unclear requests get all of them.
                 let kind = ToolRouting.classify(routing)
+                // Whole-note jobs on one note (clean up, fix spelling, finish…): no tools. The model only writes the
+                // revised text and Obby saves it, which small models manage far better than a write_file tool call.
+                if kind == .work, let path = originNote, let mode = DirectEdit.mode(routing) {
+                    let editWindow = await effectiveContextWindow(provider)
+                    let noteTokens = ContextBudget.tokens(originText)
+                    if (mode == .rewrite ? noteTokens * 2 : noteTokens) + 800 <= editWindow {
+                        try await runDirectEdit(mode, prompt: prompt, path: path, text: originText, provider: provider, window: editWindow, session: session)
+                        return
+                    }
+                }
                 let smallTalk = kind == .chat // Greetings, thanks, "ok": no tools, no task memory, no related notes, no action format.
                 let activity = procedurePacket(for: prompt)
                 let quiet = kind != .work // Chat and memory questions: no tools, no note excerpts, no text tool calls.
@@ -718,3 +731,291 @@ final class NoRedirect: NSObject, URLSessionTaskDelegate {
 /// The streamed reply's chat line and when it was last redrawn (for throttling).
 @MainActor final class LiveReply { var lineID: UUID?; var lastShown = Date.distantPast }
 
+
+/// Whole-note edits of one note without tools: the model returns plain Markdown and Obby writes it.
+enum DirectEdit {
+    enum Mode { case rewrite, finish, spelling }
+    static let rewriteSystem = "You are a careful editor of Markdown notes. Apply the instruction to the note between <note> tags. Reply with only the complete revised note in Markdown: no introduction, no explanation, no code fences. Keep every fact, heading, list, link and the note's language. Change only what the instruction asks for."
+    static let finishSystem = "You help finish Markdown notes. Continue the note between <note> tags from exactly where it stops, in the same style, format and language, following the instruction. Reply with only the new text: do not repeat the existing note, and add no introduction, explanation or code fences."
+    /// The mode for a request about the note as a whole, or nil when it needs tools (other notes, files, search…).
+    static func mode(_ prompt: String) -> Mode? {
+        let lowered = prompt.lowercased().replacingOccurrences(of: "’", with: "'")
+        let needsTools = [".md", "move", "rename", "delete", "trash", "folder", "new note", "create", "another note", "other note", "notes",
+                          "search", "find", "link", "attach", "pdf", "summar", "flashcard", "quiz", "translate", "section", "heading"]
+        if needsTools.contains(where: lowered.contains) { return nil }
+        let words = lowered.split(whereSeparator: { !$0.isLetter }).map(String.init)
+        guard !words.isEmpty, words.count <= 30 else { return nil }
+        // Questions about the note ("is this correct?") are answered, not applied.
+        if ["is", "are", "was", "does", "do", "what", "why", "how", "which", "who", "when", "where", "should"].contains(words[0]) { return nil }
+        if !Set(words).isDisjoint(with: ["finish", "continue", "complete"])
+            || ["keep writing", "carry on", "write the rest", "add the rest", "wrap it up", "wrap up"].contains(where: lowered.contains) { return .finish }
+        // Spelling only ("fix the spelling", "correct the typos"): the spell checker finds the words, not the model.
+        let spellingWords = ["spell", "typo", "misspel"], styleWords = ["clean", "tidy", "rewrite", "reword", "rephrase", "improve", "polish", "refine", "restructure",
+                             "reorganise", "reorganize", "simplify", "condense", "shorten", "format", "streamline", "declutter", "neaten", "grammar", "proofread"]
+        func has(_ keys: [String]) -> Bool { words.contains { word in keys.contains { word.hasPrefix($0) } } }
+        if has(spellingWords), !has(styleWords) { return .spelling }
+        let rewrite = ["clean", "tidy", "fix", "proofread", "spelling", "spell", "typo", "grammar", "correct", "polish", "neaten", "rewrite", "reword",
+                       "rephrase", "improve", "refine", "declutter", "streamline", "format", "restructure", "reorganise", "reorganize", "simplify", "condense", "shorten", "mistake", "error"]
+        return words.contains(where: { word in rewrite.contains { word.hasPrefix($0) } }) ? .rewrite : nil
+    }
+    /// Whether a rewrite should start with a spelling pass (requests about mistakes, typos, cleaning up…).
+    static func wantsSpelling(_ prompt: String) -> Bool {
+        let words = prompt.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
+        let keys = ["spell", "typo", "misspel", "mistake", "error", "proofread", "clean", "tidy", "correct", "fix", "polish"]
+        return words.contains { word in keys.contains { word.hasPrefix($0) } }
+    }
+    /// The same words in the same order (spacing and line breaks ignored): the model returned the note unchanged.
+    static func same(_ a: String, _ b: String) -> Bool {
+        a.split(whereSeparator: { $0.isWhitespace }) == b.split(whereSeparator: { $0.isWhitespace })
+    }
+    /// YAML frontmatter (kept by Obby, never sent for rewriting) and the rest of the note.
+    static func splitFrontmatter(_ text: String) -> (String, String) {
+        guard text.hasPrefix("---\n"), let end = text.range(of: "\n---\n", range: text.index(text.startIndex, offsetBy: 3)..<text.endIndex) else { return ("", text) }
+        return (String(text[..<end.upperBound]), String(text[end.upperBound...]))
+    }
+    /// The model's text without wrappers small models like to add: think blocks, code fences, echoed tags, "Here is…:".
+    static func clean(_ reply: String) -> String {
+        var text = reply.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: "</?note>", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+        var lines = text.components(separatedBy: "\n")
+        if let first = lines.first, first.range(of: "^(here('s| is| are)|sure|certainly|okay|ok)\\b.*:\\s*$", options: [.regularExpression, .caseInsensitive]) != nil { lines.removeFirst() }
+        while lines.first?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeFirst() }
+        if lines.first?.hasPrefix("```") == true { lines.removeFirst(); if lines.last?.trimmingCharacters(in: .whitespaces) == "```" { lines.removeLast() } }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    /// Why a rewrite shouldn't be saved, if it lost the note's structure.
+    static func problem(original: String, revised: String) -> String? {
+        func headings(_ text: String) -> Int { text.components(separatedBy: "\n").filter { $0.hasPrefix("#") }.count }
+        if headings(original) > 0, headings(revised) == 0 { return "The model's version dropped the note's headings." }
+        if original.count > 200, revised.count < original.count / 4 { return "The model's version left out most of the note." }
+        return nil
+    }
+    /// The note with the continuation added: joined mid-sentence, as the next list item, or as a new paragraph.
+    static func joined(_ text: String, _ reply: String) -> String {
+        var addition = reply
+        let existing = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !existing.isEmpty, addition.hasPrefix(existing) { addition = String(addition.dropFirst(existing.count)) } // The model repeated the note.
+        addition = addition.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return addition + "\n" }
+        let lastLine = text.components(separatedBy: "\n").last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
+        func isItem(_ line: String) -> Bool { let t = line.trimmingCharacters(in: .whitespaces); return t.hasPrefix("- ") || t.hasPrefix("* ") || t.range(of: "^\\d+[.)] ", options: .regularExpression) != nil }
+        let separator: String
+        if !text.hasSuffix("\n"), let last = text.last, last.isLetter || last == "," { separator = addition.first.map { $0.isLetter || $0.isNumber } == true ? " " : "" }
+        else if isItem(lastLine), isItem(addition) { separator = text.hasSuffix("\n") ? "" : "\n" }
+        else { separator = text.hasSuffix("\n\n") ? "" : text.hasSuffix("\n") ? "\n" : "\n\n" }
+        return text + separator + addition + "\n"
+    }
+}
+
+extension AppModel {
+    /// A whole-note job in up to two short, tool-free steps. Spelling: the macOS spell checker finds the mistakes, the
+    /// model only picks the right word for each, and Obby applies them. Rewrite or finish: the model writes text and Obby
+    /// saves it through the normal write_file path (same checks, shrink confirmation and Undo). The open note shows the
+    /// changes live and is locked meanwhile; nothing is saved unless the whole job succeeds.
+    func runDirectEdit(_ mode: DirectEdit.Mode, prompt: String, path: String, text: String, provider: AIProvider, window: Int, session: UUID) async throws {
+        guard let vault else { throw ObbyError("Choose an Obby folder first.") }
+        let title = (path as NSString).lastPathComponent
+        let live = LiveReply()
+        let inEditor = path == note && !editorReadOnly
+        let spelling = mode == .spelling || DirectEdit.wantsSpelling(prompt)
+        var saved = false
+        if inEditor { aiEditingNote = true }
+        showLive(spelling ? "Checking the spelling in \(title)…" : "Editing \(title)…", live)
+        defer {
+            removeLive(live)
+            if inEditor { aiEditingNote = false; if !saved, note == path { showInEditor(text) } }
+        }
+        func finish(_ answer: String) {
+            appendChat(role: "Obby", text: answer)
+            history = ChatMemory.retainingExchange(history, prompt: prompt, reply: answer)
+            persistChat()
+        }
+        // 1. Spelling, on the whole note.
+        var working = text, fixes: [String] = []
+        if spelling {
+            (working, fixes) = try await spellingPass(text, provider: provider, window: window)
+            try Task.checkCancellation()
+            guard session == chatSession else { return }
+            if inEditor, note == path, !fixes.isEmpty { showInEditor(working) }
+        }
+        if mode == .spelling, fixes.isEmpty { return finish("No spelling mistakes found in \(title).") }
+        // 2. The model's own edit (rewrite or continuation), on the corrected text.
+        var content = working, edited = false, modelNote: String?
+        if mode != .spelling {
+            let (frontmatter, body) = DirectEdit.splitFrontmatter(working)
+            let closing = mode == .rewrite ? "Apply the instruction to the note above. Reply with the complete revised note." : "Continue the note above, following the instruction. Reply with only the new text."
+            let request = ChatRequest(model: selectedModel, system: mode == .rewrite ? DirectEdit.rewriteSystem : DirectEdit.finishSystem,
+                                      messages: [["role": "user", "content": "Instruction: \(prompt)\n\n<note>\n\(mode == .rewrite ? body : working)\n</note>\n\nInstruction again: \(prompt)\n\(closing)"]],
+                                      tools: nil, temperature: min(temperature, 0.2), contextWindow: window, keepAlive: keepAlive.apiValue)
+            showLive(inEditor ? "Editing \(title) in the editor…" : "Editing \(title)…", live)
+            let base = working
+            func preview(_ partial: String) -> String {
+                let cleaned = DirectEdit.clean(partial)
+                if mode == .finish { return DirectEdit.joined(base, cleaned) }
+                let written = cleaned.components(separatedBy: "\n")
+                let rest = body.components(separatedBy: "\n").dropFirst(written.count) // Not rewritten yet.
+                return frontmatter + ([cleaned] + rest).joined(separator: "\n")
+            }
+            let reply: ChatReply
+            if provider.kind == .ollama, streamReplies {
+                reply = try await provider.chatStream(request) { [weak self] partial in
+                    guard let self, session == self.chatSession else { return }
+                    if self.modelLoading { self.modelLoading = false; self.loadedModels.insert(self.selectedModel) }
+                    guard Date().timeIntervalSince(live.lastShown) >= 0.1 else { return }
+                    live.lastShown = Date()
+                    if inEditor { if self.note == path { self.showInEditor(preview(partial)) } }
+                    else { self.showLive(partial, live) }
+                }
+            } else {
+                reply = try await provider.chat(request)
+            }
+            if provider.kind == .ollama { modelLoading = false; loadedModels.insert(selectedModel) }
+            try Task.checkCancellation()
+            guard session == chatSession else { return }
+            let output = DirectEdit.clean(reply.text)
+            let failure: String?
+            if output.isEmpty { failure = "The model returned no text." }
+            else if mode == .rewrite, let problem = DirectEdit.problem(original: body, revised: output) { failure = problem }
+            else if mode == .rewrite, DirectEdit.same(output, body) { failure = "The model returned the note without other changes." }
+            else { failure = nil }
+            if let failure {
+                // Spelling fixes are still worth saving; otherwise nothing changes.
+                guard !fixes.isEmpty else { return finish(failure + " \(title) was not changed. Try a more specific request, or a larger model.") }
+                modelNote = failure
+            } else {
+                content = mode == .rewrite ? frontmatter + output + "\n" : DirectEdit.joined(working, output)
+                edited = true
+            }
+        }
+        // 3. Save, unless the note changed meanwhile (typing, another app).
+        if inEditor, note == path { showInEditor(text) } // Back to the saved text before the checks and the write.
+        guard save(), let current = try? vault.read(path), current == text else { return finish("\(title) changed while Obby was working on it, so nothing was changed. Try again.") }
+        readThisRequest.insert(path); readVersions[path] = Vault.contentVersion(current)
+        let arguments: [String: Any] = ["path": path, "content": content]
+        pendingUndo = nil
+        let result: String; var failed = false
+        do { result = try executeTool("write_file", arguments: arguments) }
+        catch { failed = true; result = "Error: \(error.localizedDescription)" }
+        appendAction(call: ["direct_edit": mode == .finish ? "finish" : mode == .spelling ? "spelling" : "rewrite", "path": path], name: "write_file", arguments: arguments,
+                     response: ["role": "tool", "content": result], failed: failed, undo: pendingUndo)
+        pendingUndo = nil
+        if failed { return finish("Obby couldn’t save the change to \(title): \(result.replacingOccurrences(of: "Error: ", with: ""))") }
+        if result.hasPrefix("User declined") { return finish("\(title) was not changed.") }
+        saved = true
+        if note == path, let source = try? vault.readSource(path) { loadEditorSource(source) } // Show the saved result now.
+        memory.remember(file: path)
+        memory.remember(action: ActionPresentation.summary("write_file", arguments: arguments, result: result, failed: false))
+        var parts: [String] = []
+        if !fixes.isEmpty {
+            parts.append("Fixed \(fixes.count) spelling mistake\(fixes.count == 1 ? "" : "s") in \(title): " + fixes.prefix(12).joined(separator: ", ") + (fixes.count > 12 ? ", and \(fixes.count - 12) more." : "."))
+        }
+        if edited { parts.append(mode == .finish ? "Added the rest of \(title)." : "Updated \(title).") }
+        if let modelNote { parts.append(modelNote + " Only the spelling was changed.") }
+        parts.append("You can undo it from the line above.")
+        finish(parts.joined(separator: " "))
+    }
+    /// Finds misspellings with the macOS spell checker, asks the model (one short request) to pick the right word for
+    /// each in context, and applies the fixes. Returns the corrected text and the changes ("destory → destroy").
+    func spellingPass(_ text: String, provider: AIProvider, window: Int) async throws -> (String, [String]) {
+        let issues = Array((spellIssuesOverride?(text) ?? SpellFix.issues(in: text)).prefix(80))
+        guard !issues.isEmpty else { return (text, []) }
+        var picks: [Int: String] = [:]
+        let request = ChatRequest(model: selectedModel, system: SpellFix.system, messages: [["role": "user", "content": SpellFix.prompt(issues)]],
+                                  tools: nil, temperature: 0, contextWindow: window, keepAlive: keepAlive.apiValue)
+        do { picks = SpellFix.parse(try await provider.chat(request).text) }
+        catch is CancellationError { throw CancellationError() }
+        catch { appendNotice("The model couldn’t review the spelling suggestions, so the spell checker’s own corrections were used.") }
+        if provider.kind == .ollama { modelLoading = false; loadedModels.insert(selectedModel) }
+        let ns = text as NSString
+        var changes: [(NSRange, String)] = [], summary: [String] = []
+        for (index, issue) in issues.enumerated() {
+            guard let fix = SpellFix.choose(issue, pick: picks[index + 1]) else { continue }
+            for range in issue.ranges { changes.append((range, SpellFix.matchCase(fix, like: ns.substring(with: range)))) }
+            summary.append("\(issue.word) → \(SpellFix.matchCase(fix, like: issue.word))")
+        }
+        return (SpellFix.apply(text, changes), summary)
+    }
+
+}
+
+/// Spelling mistakes found by the macOS spell checker. The model, when used, only chooses between its suggestions,
+/// which small models do reliably; they are poor at spotting mistakes in a long note themselves.
+enum SpellFix {
+    struct Issue { var word: String; var ranges: [NSRange]; var options: [String]; var correction: String?; var context: String }
+    static let system = "You correct spelling. Each numbered item gives a misspelled word, the text around it, and suggested spellings. For each item, reply with the correct word for that context, usually one of the suggestions. If the word is a name or is already right, repeat it unchanged. Reply with one line per item and nothing else, like:\n1. destroy\n2. prescribe"
+    /// Text the spell checker skips: frontmatter, code, links, URLs, wikilinks, tags and HTML.
+    static func protectedRanges(_ text: String) -> [NSRange] {
+        let whole = NSRange(location: 0, length: (text as NSString).length)
+        let patterns = ["\\A---\\n[\\s\\S]*?\\n---\\n", "(?m)^(```|~~~)[\\s\\S]*?^\\1", "`[^`\\n]+`", "\\[\\[[^\\]]*\\]\\]", "\\]\\([^)]*\\)",
+                        "https?://\\S+", "<[^>\\n]+>", "(?<![\\p{L}])#[\\p{L}_/-]+"]
+        return patterns.flatMap { pattern in (try? NSRegularExpression(pattern: pattern))?.matches(in: text, range: whole).map(\.range) ?? [] }
+    }
+    /// Acronyms, short words, codes and words with digits are left alone.
+    static func shouldSkip(_ word: String) -> Bool {
+        word.count < 3 || word.contains(where: \.isNumber) || word.filter(\.isUppercase).count >= 2 || word.contains("_")
+    }
+    @MainActor static func issues(in text: String) -> [Issue] {
+        let checker = NSSpellChecker.shared
+        let tag = NSSpellChecker.uniqueSpellDocumentTag()
+        defer { checker.closeSpellDocument(withTag: tag) }
+        let ns = text as NSString, protected = protectedRanges(text), language = checker.language()
+        var found: [String: Issue] = [:], order: [String] = [], start = 0
+        while start < ns.length {
+            let range = checker.checkSpelling(of: text, startingAt: start, language: nil, wrap: false, inSpellDocumentWithTag: tag, wordCount: nil)
+            guard range.location != NSNotFound, range.length > 0 else { break }
+            start = range.location + range.length
+            let word = ns.substring(with: range)
+            if shouldSkip(word) || protected.contains(where: { NSIntersectionRange($0, range).length > 0 }) { continue }
+            let key = word.lowercased()
+            if found[key] != nil { found[key]?.ranges.append(range); continue }
+            let options = Array((checker.guesses(forWordRange: range, in: text, language: language, inSpellDocumentWithTag: tag) ?? []).prefix(4))
+            let correction = checker.correction(forWordRange: range, in: text, language: language, inSpellDocumentWithTag: tag)
+            let low = max(0, range.location - 40), high = min(ns.length, range.location + range.length + 40)
+            let context = ns.substring(with: NSRange(location: low, length: high - low)).replacingOccurrences(of: "\n", with: " ")
+            found[key] = Issue(word: word, ranges: [range], options: options, correction: correction, context: context)
+            order.append(key)
+        }
+        return order.compactMap { found[$0] }
+    }
+    @MainActor static func isCorrect(_ word: String) -> Bool { NSSpellChecker.shared.checkSpelling(of: word, startingAt: 0).location == NSNotFound }
+    static func prompt(_ issues: [Issue]) -> String {
+        issues.enumerated().map { index, issue in
+            "\(index + 1). \(issue.word) | text: \"…\(issue.context)…\" | suggestions: \(issue.options.isEmpty ? "none" : issue.options.joined(separator: ", "))"
+        }.joined(separator: "\n")
+    }
+    /// "1. destroy" lines (also "1) destroy", "1: destory → destroy", "**1.** destroy") as item number → word.
+    static func parse(_ reply: String) -> [Int: String] {
+        guard let regex = try? NSRegularExpression(pattern: "^[\\s*]*(\\d+)[.):]+[\\s*]*(.+)$") else { return [:] }
+        var picks: [Int: String] = [:]
+        for line in reply.components(separatedBy: "\n") {
+            let ns = line as NSString
+            guard let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)), let number = Int(ns.substring(with: match.range(at: 1))) else { continue }
+            var value = ns.substring(with: match.range(at: 2))
+            for arrow in ["→", "->", "=>"] { if let range = value.range(of: arrow, options: .backwards) { value = String(value[range.upperBound...]) } }
+            if let cut = value.range(of: " (") ?? value.range(of: " - ") ?? value.range(of: " | ") { value = String(value[..<cut.lowerBound]) }
+            value = value.trimmingCharacters(in: CharacterSet(charactersIn: " .,;:!\"'*`"))
+            let words = value.split(separator: " ")
+            guard !words.isEmpty, words.count <= 3, value.allSatisfy({ $0.isLetter || $0 == "'" || $0 == "’" || $0 == "-" || $0 == " " }) else { continue }
+            picks[number] = value
+        }
+        return picks
+    }
+    /// The model's pick when it is a suggestion or a correctly spelled word; nothing when it keeps a capitalised word
+    /// (probably a name); otherwise the spell checker's own correction, if it has one.
+    @MainActor static func choose(_ issue: Issue, pick: String?) -> String? {
+        if let pick, pick.lowercased() != issue.word.lowercased(),
+           issue.options.contains(where: { $0.lowercased() == pick.lowercased() }) || isCorrect(pick) { return pick }
+        if let pick, pick.lowercased() == issue.word.lowercased(), issue.word.first?.isUppercase == true { return nil }
+        return issue.correction
+    }
+    /// "destroy" written as "Destroy" when the misspelling started with a capital.
+    static func matchCase(_ fix: String, like original: String) -> String {
+        guard original.first?.isUppercase == true, let first = fix.first, first.isLowercase else { return fix }
+        return first.uppercased() + fix.dropFirst()
+    }
+    static func apply(_ text: String, _ changes: [(NSRange, String)]) -> String {
+        let result = NSMutableString(string: text)
+        for (range, fix) in changes.sorted(by: { $0.0.location > $1.0.location }) { result.replaceCharacters(in: range, with: fix) }
+        return result as String
+    }
+}

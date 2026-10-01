@@ -545,6 +545,38 @@ final class SourceUndoDelegate: NSObject, NSTextViewDelegate {
         model.selectFolder(nil)
         let noNote = await currentRequest("summarise this")
         check(!String(describing: noNote).contains("<current_note") && offered(noNote) == ToolRouting.tools(for: "summarise this", hasAttachments: false), "no open note retains existing routing")
+        // Direct edit end to end: one tool-free request, the cleaned reply saved with Undo.
+        let directEditOverride = model.requestOverride, savedStream = model.streamReplies
+        model.streamReplies = false
+        try vault.write("Typos.md", content: "# Cels\nCels devide.\n", create: true)
+        model.openNote("Typos.md")
+        model.requestOverride = { route, body in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            ollamaRequests.append((route, body))
+            return ["message": ["role": "assistant", "content": "Here is the revised note:\n```\n# Cells\nCells divide.\n```"]]
+        }
+        model.spellIssuesOverride = { _ in [] }
+        ollamaRequests = []; model.send("clean up this note and fix the spelling")
+        while model.busy { try? await Task.sleep(nanoseconds: 10_000_000) }
+        let directBody = ollamaRequests.first { $0.0 == "/api/chat" }?.1 ?? [:]
+        check(directBody["tools"] == nil && ollamaRequests.filter { $0.0 == "/api/chat" }.count == 1, "direct edit sends one request without tools")
+        check(try vault.read("Typos.md") == "# Cells\nCells divide.\n", "direct edit saves the cleaned note")
+        check(model.chat.contains { $0.role == "Action" && $0.undo != nil }, "direct edit can be undone")
+        // Spelling: the issues come from the spell checker; the model only picks the word; Obby applies it.
+        try vault.write("Spell.md", content: "Cells devide.\n", create: true)
+        model.openNote("Spell.md")
+        model.spellIssuesOverride = { _ in [SpellFix.Issue(word: "devide", ranges: [NSRange(location: 6, length: 6)], options: ["divide", "devise"], correction: "divide", context: "Cells devide.")] }
+        model.requestOverride = { route, body in
+            if route == "/api/show" { return ["capabilities": ["completion", "tools"]] }
+            ollamaRequests.append((route, body))
+            return ["message": ["role": "assistant", "content": "1. divide"]]
+        }
+        ollamaRequests = []; model.send("fix the spelling mistakes")
+        while model.busy { try? await Task.sleep(nanoseconds: 10_000_000) }
+        check(try vault.read("Spell.md") == "Cells divide.\n" && ollamaRequests.filter { $0.0 == "/api/chat" }.count == 1, "spelling fix applies the checker's issue in one request")
+        check(model.chat.last(where: { $0.role == "Obby" })?.text.contains("devide → divide") == true, "spelling reply lists the fixes")
+        model.spellIssuesOverride = nil
+        model.requestOverride = directEditOverride; model.streamReplies = savedStream
         model.openNote("Current.md")
         // Attachments: Obby resolves links relative to the open note, reads them, and sends the text itself.
         try vault.mkdir("School/Biology/Attachments"); try vault.mkdir("Attachments")
@@ -729,6 +761,19 @@ final class SourceUndoDelegate: NSObject, NSTextViewDelegate {
         check(ToolRouting.classify("hi there") == .chat && ToolRouting.classify("thanks!") == .chat && ToolRouting.classify("ok") == .chat, "greetings are chat")
         check(ToolRouting.classify("what did we decide?") == .memoryQuestion && ToolRouting.classify("Remind me where we left off") == .memoryQuestion, "memory questions recognised")
         check(ToolRouting.classify("add this to TOK.md") == .work, "edit request is work")
+        // Whole-note jobs on the open note skip tools; the model only returns text.
+        check(DirectEdit.mode("clean up this note and fix the spelling") == .rewrite && DirectEdit.mode("finish the document") == .finish && DirectEdit.mode("correct the spelling mistakes") == .spelling, "whole-note jobs use direct edit")
+        check(SpellFix.parse("1. destroy\n2) Prescribe.\n**3.** infectinos → infections\nSure!") == [1: "destroy", 2: "Prescribe", 3: "infections"], "spelling picks are parsed")
+        check(SpellFix.matchCase("destroy", like: "Destory") == "Destroy" && SpellFix.apply("a bb c", [(NSRange(location: 2, length: 2), "xyz")]) == "a xyz c", "spelling fixes keep case and position")
+        check(SpellFix.shouldSkip("HIV") && SpellFix.shouldSkip("ab") && !SpellFix.shouldSkip("destory"), "acronyms and short words are not spell-checked")
+        check(DirectEdit.same("# A\nb  c", "# A\n\nb c\n"), "unchanged rewrite is recognised")
+        check(DirectEdit.mode("is this correct?") == nil && DirectEdit.mode("fix the spelling in Cells.md") == nil && DirectEdit.mode("move this note to Biology") == nil, "questions and other-note requests keep tools")
+        check(DirectEdit.clean("Here is the revised note:\n```markdown\n# Cells\nText\n```") == "# Cells\nText", "direct edit strips wrappers")
+        check(DirectEdit.joined("Cells divide by", "mitosis.") == "Cells divide by mitosis.\n" && DirectEdit.joined("- one\n", "- two") == "- one\n- two\n", "continuation joins sentence and list")
+        check(ModelDefaults.pick(.anthropic, from: ["claude-opus-x", "claude-sonnet-x", "claude-haiku-x"]) == "claude-sonnet-x"
+              && ModelDefaults.pick(.openAI, from: ["text-embedding-3", "gpt-x-audio", "gpt-x", "gpt-x-mini"]) == "gpt-x-mini"
+              && ModelDefaults.pick(.gemini, from: ["gemini-x-pro", "gemini-x-flash-lite", "gemini-x-flash"]) == "gemini-x-flash", "cloud providers get a sensible default model")
+        check(DirectEdit.splitFrontmatter("---\ntags: a\n---\nBody").0 == "---\ntags: a\n---\n", "frontmatter kept out of rewrites")
         var sentBodies: [String] = []
         model.toolSupport = [:]
         model.requestOverride = { route, body in
@@ -1118,8 +1163,8 @@ Earlier in this chat (condensed):
         check(!ToolRouting.tools(for: "summarise this note", hasAttachments: false).contains("write_file"), "a plain summary request stays read-only")
 
         // Work context, edit snapshots, chat history kept until deleted, procedural records name their chat.
-        let context = model.workContext()
-        check(context.contains("today is") && context.contains("ask one short question"), "work requests get today's date and the ask-don't-guess rule")
+        let workContext = model.workContext()
+        check(workContext.contains("today is") && workContext.contains("ask one short question"), "work requests get today's date and the ask-don't-guess rule")
         check(AppModel.snapshot("# Title\nLine two") == "(Now 2 lines; starts: \"# Title Line two\")", "edit results describe the note after the change")
         model.clearChat()
         model.memory.title = "History chat one"; model.memory.remember(action: "Created One.md."); model.persistChat()

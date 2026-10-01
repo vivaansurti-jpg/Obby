@@ -41,6 +41,7 @@ Obby is a native macOS app for Markdown notes, with an AI assistant that can saf
 - Quick actions: summarise, flashcards, quiz, outline and revision notes (`/summarise`, `/flashcards`, and so on; add `save` to save the result as a note).
 - In-app dictation, on-device only.
 - Short follow-ups such as "yes" or "try again" continue the previous task.
+- **Whole-note edits**: requests such as "clean up this note", "fix the spelling" or "finish this note" are handled without tools. The model writes only the revised text, and Obby saves it with the usual checks and Undo. Spelling mistakes are found by the macOS spell checker; the model only chooses the right word for each, so even small local models fix them reliably. Code, links, frontmatter and acronyms are left alone.
 
 ## Safety and trust
 
@@ -52,6 +53,7 @@ Obby is a native macOS app for Markdown notes, with an AI assistant that can saf
 - The AI must read a note before rewriting it, and replacing a substantial note with a much shorter version asks first.
 - Obby never claims an action happened unless it did; if a change request produces no action, the model is reminded once to act or say it cannot.
 - Repeated failing actions are stopped, with a summary of what was and was not done.
+- **API keys in one place**: Settings, AI tab, has a field for Anthropic, OpenAI and Google Gemini. Save and Use switches to that provider and selects a model automatically.
 - API keys are stored only in the macOS Keychain.
 - Cloud providers receive only what a request needs; the whole folder is never sent by default.
 

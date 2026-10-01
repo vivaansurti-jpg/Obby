@@ -183,10 +183,12 @@ struct ContentView: View {
                                 Spacer()
                             }.buttonStyle(.borderless).padding(.horizontal).padding(.bottom, 10)
                             Divider()
-                            if model.editorReadOnly {
+                            if model.aiEditingNote {
+                                Text("Obby is editing this note. Stop the reply to edit it yourself.").font(.caption).foregroundStyle(.secondary).padding(.horizontal)
+                            } else if model.editorReadOnly {
                                 Text(NoteSource.readOnlyNotice).font(.caption).foregroundStyle(.secondary).padding(.horizontal)
                             }
-                            MarkdownEditor(text: $model.text, bridge: bridge, readOnly: model.editorReadOnly, importAttachments: { model.importAttachments($0) }, openLink: { model.openLink($0) }).id(note)
+                            MarkdownEditor(text: $model.text, bridge: bridge, readOnly: model.editorReadOnly || model.aiEditingNote, importAttachments: { model.importAttachments($0) }, openLink: { model.openLink($0) }).id(note)
                                 .onReceive(NotificationCenter.default.publisher(for: .init("ObbyEditorFontSize"))) { _ in bridge.applyFontSize() }
                                 .onReceive(NotificationCenter.default.publisher(for: .init("ObbyEditorSpelling"))) { _ in if let view = bridge.view { MarkdownEditor.applySpelling(to: view) } }
                             if !model.backlinks.isEmpty { // Notes that link here; click to open.
@@ -504,11 +506,12 @@ struct AIView: View {
                 // Read-only status from the existing /api/ps check; updating it never loads or unloads a model.
                 if let status = modelLoadStatus {
                     HStack(spacing: 4) {
-                        Image(systemName: status == "Loaded" ? "circle.fill" : status == "Loading" ? "circle.dotted" : status == "Offline" ? "circle.slash" : "circle")
-                            .font(.system(size: 7, weight: .semibold)).foregroundStyle(status == "Loaded" ? Color.green : Color.secondary)
+                        Image(systemName: ["Loaded", "Ready"].contains(status) ? "circle.fill" : ["Loading", "Starting"].contains(status) ? "circle.dotted" : status == "Offline" ? "circle.slash" : "circle")
+                            .font(.system(size: 7, weight: .semibold))
+                            .foregroundStyle(["Loaded", "Ready"].contains(status) ? Color.green : status == "Offline" ? Color.orange : Color.secondary)
                         Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }.fixedSize()
-                    .help(status == "Offline" ? "Ollama is not reachable" : "Model is \(status.lowercased()) in memory")
+                    .help(status == "Offline" ? "Ollama is not reachable" : status == "Starting" ? "Starting Ollama" : status == "Ready" ? "Ollama is connected" : "Model is \(status.lowercased()) in memory")
                     .accessibilityElement(children: .combine)
                 }
             }
@@ -530,11 +533,13 @@ struct AIView: View {
                         }
                     }
                 } label: {
-                    Text(model.skipCurrentNoteOnce ? "Not using: " + ((model.referencedNote ?? "") as NSString).lastPathComponent
-                         : model.referencedNote.map { "Using: " + ($0 as NSString).lastPathComponent + (model.memory.referencedNote == nil ? "" : " (this chat)") } ?? "No note")
+                    Label(model.skipCurrentNoteOnce ? "Not using " + ((model.referencedNote ?? "") as NSString).lastPathComponent
+                          : model.referencedNote.map { ($0 as NSString).lastPathComponent + (model.memory.referencedNote == nil ? "" : " · this chat") } ?? "No note",
+                          systemImage: model.referencedNote == nil ? "doc" : "doc.text")
                         .lineLimit(1).truncationMode(.middle)
                 }
                 .menuStyle(.borderlessButton).menuIndicator(.visible).fixedSize().help("Choose the note this chat refers to")
+                .foregroundStyle(model.referencedNote == nil || model.skipCurrentNoteOnce ? Color.secondary : Color.accentColor)
                 if model.referencedNote != nil {
                     if model.skipCurrentNoteOnce {
                         Button { model.skipCurrentNoteOnce = false } label: { Image(systemName: "plus.circle") }
@@ -544,8 +549,11 @@ struct AIView: View {
                             .buttonStyle(.plain).help("Leave the note out of the next request").accessibilityLabel("Exclude the note from the next request")
                     }
                 }
-                Spacer()
-            }.font(.caption).foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Color.accentColor.opacity(model.referencedNote == nil || model.skipCurrentNoteOnce ? 0.05 : 0.12), in: Capsule())
+            .frame(maxWidth: .infinity, alignment: .leading)
             .onChange(of: model.note) { _ in model.skipCurrentNoteOnce = false } // A newly opened note is used again.
             if speech.listening {
                 Label("Listening… click the microphone or pause to stop", systemImage: "waveform").font(.caption).foregroundStyle(.red)
@@ -613,9 +621,12 @@ struct AIView: View {
     static let examples = ["Organise my loose notes into folders", "Make flashcards from this note", "Summarise this note in five bullet points", "Find everything I wrote about "]
     /// Ollama only (cloud providers have no load state; their connection shows in the provider row).
     var modelLoadStatus: String? {
-        guard model.provider == .ollama, !model.selectedModel.isEmpty, !model.startingOllama else { return nil }
-        if !model.connected { return "Offline" } // Always shown: without it nothing works.
-        guard model.showTechnical else { return nil } // Loading / Loaded / Unloaded are technical details.
+        // Always one status for Ollama, so the row never jumps: Starting, Offline, or Ready (Loaded/Unloaded/Loading
+        // when technical details are on).
+        guard model.provider == .ollama, !model.selectedModel.isEmpty else { return nil }
+        if model.startingOllama { return "Starting" }
+        if !model.connected { return "Offline" }
+        guard model.showTechnical else { return "Ready" }
         if model.modelLoading { return "Loading" }
         return model.loadedModels.contains(model.selectedModel) ? "Loaded" : "Unloaded"
     }
@@ -646,6 +657,7 @@ struct SettingsView: View {
     @State private var newTools = true
     @State private var addError: String?
     @State private var settingsTab = "Notes"
+    @State private var keyDrafts: [ProviderKind: String] = [:]
     static let tabs = [("Notes", "folder"), ("AI", "sparkles"), ("Memory", "brain"), ("Advanced", "slider.horizontal.3")]
     var providerSelection: Binding<ProviderKind> {
         Binding(get: { model.provider }, set: { next in Task { await model.switchProvider(next); syncDrafts() } })
@@ -678,6 +690,7 @@ struct SettingsView: View {
         }
             .sheet(isPresented: $showMemory) { MemorySettingsSheet().environmentObject(model) }
             .sheet(isPresented: $showProcedures) { ProcedureHistoryView().environmentObject(model) }
+            .onAppear { if let tab = model.settingsStartTab { settingsTab = tab; model.settingsStartTab = nil } }
             .task { syncDrafts(); await model.connect() }
             .onChange(of: model.selectedModel) { value in manualModel = value }
     }
@@ -715,6 +728,7 @@ struct SettingsView: View {
                 Text(model.isLocalProvider ? "\(model.providerName) runs on this Mac." : "Relevant notes may be sent to \(model.providerName).")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            apiKeysSection
             savedProvidersSection
             Section("Model") {
                 if model.provider == .ollama {
@@ -796,6 +810,47 @@ struct SettingsView: View {
             }
         }.formStyle(.grouped)
     }
+    /// One place to paste a key for each cloud provider: saving it switches to that provider and picks a model.
+    var apiKeysSection: some View {
+        Section("API Keys") {
+            ForEach([ProviderKind.anthropic, .openAI, .gemini]) { kind in keyRow(kind) }
+            if model.provider != .ollama, model.activeCustom == nil {
+                if let error = model.modelSettingsError { Text(error).foregroundStyle(.red).font(.caption) }
+                else if model.connected, !model.selectedModel.isEmpty { Text("Connected to \(ModelDefaults.keyTitle(model.provider)). Model: \(model.selectedModel)").font(.caption).foregroundStyle(.secondary) }
+            }
+            Text("Paste a key and select Save and Use. Keys are stored only in your macOS Keychain.").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+    func keyRow(_ kind: ProviderKind) -> some View {
+        let saved = model.apiKey(for: kind) != nil
+        let inUse = model.provider == kind && model.activeCustom == nil
+        let draft = Binding(get: { keyDrafts[kind] ?? "" }, set: { keyDrafts[kind] = $0 })
+        let locked = model.busy || model.switchingModel
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(ModelDefaults.keyTitle(kind)).fontWeight(.medium)
+                if inUse { Text("In use").font(.caption).foregroundStyle(.green) }
+                else if saved { Text("Key saved").font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                if saved, !inUse { Button("Use") { Task { await model.switchProvider(kind); syncDrafts() } }.disabled(locked) }
+                if let page = ModelDefaults.keyPage(kind) { Link("Get a key", destination: page).font(.caption) }
+            }
+            HStack {
+                SecureField("\(ModelDefaults.keyTitle(kind)) API key", text: draft, prompt: Text(saved ? "Paste a new key to replace the saved one" : "Paste your API key"))
+                    .labelsHidden()
+                    .onSubmit { useKey(kind) }
+                Button(saved ? "Replace" : "Save and Use") { useKey(kind) }
+                    .disabled(locked || draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if saved { Button("Remove", role: .destructive) { model.removeAPIKey(for: kind); syncDrafts() }.disabled(locked) }
+            }
+        }.padding(.vertical, 2)
+    }
+    func useKey(_ kind: ProviderKind) {
+        let value = keyDrafts[kind] ?? ""
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        keyDrafts[kind] = ""
+        Task { await model.saveAndUseKey(value, for: kind); syncDrafts() }
+    }
     /// Saved OpenAI-compatible providers: each has its own name, base URL and Keychain key, and appears in the AI panel's provider menu.
     var savedProvidersSection: some View {
         Section("Saved Providers") {
@@ -858,13 +913,8 @@ struct SettingsView: View {
                     Button("Apply") { applyBaseURL() }
                 }
             }
-            HStack {
-                SecureField("API key", text: $apiKey, prompt: Text(model.hasAPIKey ? "Saved in Keychain" : (model.provider == .openAI ? "Optional for local servers" : "Required")))
-                    .onSubmit { saveKey() }
-                Button("Save") { saveKey() }.disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
             if let error = model.modelSettingsError { Text(error).foregroundStyle(.red) }
-            Text("API keys are stored in your macOS Keychain.").font(.caption).foregroundStyle(.secondary)
+            Text("Add or replace API keys in Settings, AI tab.").font(.caption).foregroundStyle(.secondary)
         }
     }
     var contextNote: String {
@@ -1155,8 +1205,8 @@ struct ProviderMenu: View {
                 }.buttonStyle(.plain).disabled(locked)
                 Button {
                     close()
-                    DispatchQueue.main.async { model.showSettings = true } // After the drop-down closes.
-                } label: { actionLabel("Set up another provider in Settings…", systemImage: "gearshape") }
+                    DispatchQueue.main.async { model.settingsStartTab = "AI"; model.showSettings = true } // After the drop-down closes.
+                } label: { actionLabel("Add an API key or provider…", systemImage: "key") }
                 .buttonStyle(.plain)
             }
             if model.busy { Text("Stop the current response to switch providers.").font(.caption).foregroundStyle(.secondary) }

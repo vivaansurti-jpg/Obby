@@ -284,6 +284,19 @@ extension AppModel {
             Task { await connect() }
         } catch { modelSettingsError = error.localizedDescription }
     }
+    /// Saves a key for one cloud provider, then switches to that provider and connects, so a pasted key is ready to use.
+    func saveAndUseKey(_ value: String, for kind: ProviderKind) async {
+        let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, kind != .ollama else { return }
+        do { try Keychain.save(key, account: kind.rawValue) } catch { modelSettingsError = error.localizedDescription; return }
+        apiKeys[kind] = key; modelSettingsError = nil
+        if provider == kind, activeCustom == nil { hasAPIKey = true; await connect() }
+        else { await switchProvider(kind) }
+    }
+    func removeAPIKey(for kind: ProviderKind) {
+        Keychain.delete(kind.rawValue); apiKeys[kind] = nil
+        if provider == kind, activeCustom == nil { hasAPIKey = false; connected = false; models = [] }
+    }
     func removeAPIKey() {
         Keychain.delete(provider.rawValue)
         apiKeys[provider] = nil; hasAPIKey = false; connected = false; models = []
@@ -318,5 +331,40 @@ extension AppModel {
         persistSettings()
         switchingModel = false
         await connect()
+    }
+}
+
+/// A default model for a cloud provider, chosen from the provider's own model list (never a hard-coded name).
+enum ModelDefaults {
+    static func pick(_ kind: ProviderKind, from models: [String]) -> String? {
+        func has(_ model: String, _ words: [String]) -> Bool { words.contains { model.lowercased().contains($0) } }
+        switch kind {
+        case .ollama: return nil
+        case .anthropic: // Listed newest first.
+            for family in ["sonnet", "opus", "haiku"] { if let model = models.first(where: { has($0, [family]) }) { return model } }
+            return models.first
+        case .openAI:
+            let chat = models.filter { $0.lowercased().hasPrefix("gpt-") && !has($0, ["audio", "realtime", "transcribe", "tts", "image", "search", "instruct", "embedding", "codex"]) }
+            return chat.filter { has($0, ["mini"]) && !has($0, ["nano"]) }.max() ?? chat.max() ?? models.first
+        case .gemini:
+            let usable = models.filter { !has($0, ["image", "tts", "live", "embedding", "audio", "exp"]) }
+            return usable.filter { has($0, ["flash"]) && !has($0, ["lite"]) }.max() ?? usable.filter { has($0, ["pro"]) }.max() ?? models.first
+        }
+    }
+    static func keyPage(_ kind: ProviderKind) -> URL? {
+        switch kind {
+        case .openAI: return URL(string: "https://platform.openai.com/api-keys")
+        case .anthropic: return URL(string: "https://console.anthropic.com/settings/keys")
+        case .gemini: return URL(string: "https://aistudio.google.com/apikey")
+        case .ollama: return nil
+        }
+    }
+    static func keyTitle(_ kind: ProviderKind) -> String {
+        switch kind {
+        case .openAI: return "OpenAI"
+        case .anthropic: return "Anthropic (Claude)"
+        case .gemini: return "Google Gemini"
+        case .ollama: return "Ollama"
+        }
     }
 }

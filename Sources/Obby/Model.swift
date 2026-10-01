@@ -10,6 +10,7 @@ import CoreServices
     @Published var skipCurrentNoteOnce = false
     @Published var text = "" { didSet { if !loading && !text.utf8.elementsEqual(oldValue.utf8) { dirty = true; scheduleSave() } } }
     @Published var editorReadOnly = false
+    @Published var aiEditingNote = false // The AI is writing into the open note: the editor shows it live and is locked.
     @Published var dirty = false
     @Published var status = ""
     @Published var error: String?
@@ -39,6 +40,7 @@ import CoreServices
     var ollamaLaunch: Task<Bool, Never>?
     var usedOllamaModels: Set<String> = [] // Ollama models this Obby session sent chat requests to.
     var requestOverride: ((String, [String: Any]?) async throws -> [String: Any])?
+    var spellIssuesOverride: ((String) -> [SpellFix.Issue])? // Tests: spelling issues without the system spell checker.
     var lastWorkPrompt = "" // The last request that was real work; short follow-ups ("yes", "try again") reuse its tools.
 
     @Published var endpoint: String = UserDefaults.standard.string(forKey: "ollamaURL") ?? "http://localhost:11434"
@@ -51,6 +53,7 @@ import CoreServices
     @Published var toolsAvailable = true
     @Published var hasAPIKey = false
     var toolSupport: [String: Bool] = [:] // Session cache: provider/model -> native tool calling
+    var settingsStartTab: String? // Set before showing Settings to open a specific tab (for example "AI").
     var apiKeys: [ProviderKind: String] = [:] // In-memory copy of Keychain values; never persisted elsewhere
     @Published var temperature = UserDefaults.standard.object(forKey: "temperature") as? Double ?? 0.3
     @Published var contextWindow = ContextWindow.stored
@@ -314,7 +317,7 @@ import CoreServices
         }
         updateBacklinks()
     }
-    private func loadEditorSource(_ source: NoteSource) {
+    func loadEditorSource(_ source: NoteSource) {
         loading = true; text = source.text; loading = false
         diskText = source.text; diskBytes = source.bytes; dirty = false
         editorReadOnly = source.isReadOnly
@@ -387,6 +390,10 @@ import CoreServices
             + "\n\nLater steps of this request run without asking again. You can undo the whole task from the chat afterwards."
         alert.addButton(withTitle: "Apply"); alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
+    }
+    /// Shows AI text in the open note without marking it changed or saving it (the AI's result is saved separately).
+    func showInEditor(_ preview: String) {
+        loading = true; text = preview; loading = false
     }
     func scheduleSave() {
         saveTask?.cancel()

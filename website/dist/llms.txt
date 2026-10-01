@@ -1,18 +1,19 @@
 # Obby
 
-> Obby is an open-source native notes app for macOS. It stores notes as ordinary Markdown files in folders and supports attachments, local Ollama models, and compatible cloud AI providers.
+> An open-source native macOS notes app built with Swift and SwiftUI. Notes are ordinary Markdown files in a user-selected folder, with normal folders and attachments. AI is optional.
 
-## Official links
+## Product principles
+- Normal files: the notes folder is the source of truth, not a proprietary note database.
+- Controlled AI actions: search, read, create, edit and organise notes inside the chosen folder. Deletion requires confirmation. Available actions depend on model capabilities.
+- Model choice: local Ollama, Anthropic, Google Gemini or OpenAI-compatible services. Cloud requests may include relevant notes and attachments.
+- Requires macOS 13 or later; the current release targets Apple silicon.
+- Apache License 2.0.
 
-- [Website](https://vivaansurti-jpg.github.io/Obby/): Product overview and macOS download.
-- [Source repository](https://github.com/vivaansurti-jpg/Obby): Source code, build instructions, documentation, and Apache 2.0 license.
-- [Latest macOS download](https://github.com/vivaansurti-jpg/Obby/releases/latest/download/Obby.dmg): Current Apple Silicon DMG release.
-- [Releases](https://github.com/vivaansurti-jpg/Obby/releases): Release history and downloadable assets.
+## Resources
+- [Website](https://vivaansurti-jpg.github.io/Obby/): Overview, product principles and download.
+- [Source and documentation](https://github.com/vivaansurti-jpg/Obby): README, build instructions and application source.
+- [Download for macOS](https://github.com/vivaansurti-jpg/Obby/releases/latest/download/Obby.dmg): Latest release asset.
+- [Releases](https://github.com/vivaansurti-jpg/Obby/releases): Release history.
+- [Technical report section](https://vivaansurti-jpg.github.io/Obby/#report): “Simplicity and Beyond”. The report file/link is not yet available on the website.
 
-## Product facts
-
-- Platform: macOS 13 or later. The current release supports Apple Silicon Macs.
-- Notes: Standard UTF-8 Markdown files stored in a user-selected folder.
-- Features: folders, search, attachments, native Markdown editing, and optional AI assistance.
-- AI: local Ollama models or compatible cloud providers. AI setup is optional.
-- License: Apache License 2.0.
+The website is a single page. Product screenshots are explicitly marked placeholders.
